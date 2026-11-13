@@ -9127,6 +9127,60 @@ fn clippy_identity_follows_version_config_and_lint_arguments() {
 }
 
 #[test]
+fn clippy_manifest_digest_follows_only_the_lint_tables() {
+    let base = "[workspace]\nmembers = [\"a\"]\n\n[workspace.dependencies]\na = { path = \"a\" }\n\n[workspace.lints.clippy]\nunwrap_used = \"deny\"\n";
+    let digest = clippy_manifest_lint_digest(base).unwrap();
+
+    // Member and dependency edits leave Clippy's view of the manifest alone.
+    let members = base.replace("members = [\"a\"]", "members = [\"a\", \"b\"]");
+    let dependencies = base.replace(
+        "a = { path = \"a\" }",
+        "a = { path = \"a\" }\nb = { path = \"b\" }",
+    );
+    assert_eq!(clippy_manifest_lint_digest(&members).unwrap(), digest);
+    assert_eq!(clippy_manifest_lint_digest(&dependencies).unwrap(), digest);
+
+    // Workspace and package lint tables are what `lint_groups_priority` reads.
+    let workspace_lints = base.replace("\"deny\"", "\"warn\"");
+    assert_ne!(clippy_manifest_lint_digest(&workspace_lints).unwrap(), digest);
+    let package_lints = format!("{base}\n[lints.rust]\nunsafe_code = \"forbid\"\n");
+    assert_ne!(clippy_manifest_lint_digest(&package_lints).unwrap(), digest);
+
+    // A manifest that does not parse keeps the caller's whole-file hash.
+    assert_eq!(clippy_manifest_lint_digest("[workspace\n"), None);
+}
+
+#[test]
+fn only_the_bare_relative_manifest_is_clippys() {
+    assert!(is_clippy_tracked_manifest(Path::new("Cargo.toml")));
+    assert!(!is_clippy_tracked_manifest(Path::new("/ws/Cargo.toml")));
+    assert!(!is_clippy_tracked_manifest(Path::new("member/Cargo.toml")));
+}
+
+#[cfg(unix)]
+#[test]
+fn clippy_identity_follows_the_msrv() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let driver = dir.path().join("clippy-driver");
+    kache_fs::testutil::write_executable(
+        &driver,
+        "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+    );
+    let identity = |msrv: Option<&str>| {
+        let msrv = msrv.map(std::ffi::OsString::from);
+        clippy_identity_in(
+            &driver,
+            move |name: &str| (name == "CARGO_PKG_RUST_VERSION").then(|| msrv.clone()).flatten(),
+            None,
+        )
+        .unwrap()
+    };
+    assert!(identity(None).contains("CARGO_PKG_RUST_VERSION unset"));
+    assert_ne!(identity(Some("1.80")), identity(Some("1.85")));
+}
+
+#[test]
 fn tool_version_cache_path_is_a_named_file_in_the_cache_dir() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();

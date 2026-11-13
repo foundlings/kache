@@ -20,6 +20,7 @@ pub(crate) const KEY_ENV_VARS: &[&str] = &[
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_MANIFEST_DIR",
     "CARGO_PKG_NAME",
+    "CARGO_PKG_RUST_VERSION",
     "CARGO_PKG_VERSION",
     "CLIPPY_ARGS",
     "CLIPPY_CONF_DIR",

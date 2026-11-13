@@ -3537,10 +3537,14 @@ fn compute_key_into(
         // stable sentinels for relocation (#201); unmatched paths stay local
         // rather than risk a false hit.
         let mut hashed: Vec<(Vec<u8>, String)> = Vec::with_capacity(dep_info.source_files.len());
+        let clippy = args.is_clippy_chain();
         for file in &dep_info.source_files {
-            let file_hash = file_hasher
-                .hash(file)
-                .with_context(|| format!("hashing source identity {}", file.display()))?;
+            let file_hash = if clippy && is_clippy_tracked_manifest(file) {
+                file_hasher.hash_clippy_manifest(file)
+            } else {
+                file_hasher.hash(file)
+            }
+            .with_context(|| format!("hashing source identity {}", file.display()))?;
             let normalized_path = source_path_identity(file, path_normalizer)?;
             hashed.push((normalized_path, file_hash));
         }
@@ -8975,6 +8979,25 @@ impl<'db> FileHasher<'db> {
         self.hash_and_record(path).map(|recent| recent.hash)
     }
 
+    /// Key the manifest Clippy lists in its dep-info by the tables Clippy reads.
+    ///
+    /// Clippy tracks `Cargo.toml` relative to its working directory, which
+    /// Cargo sets to the workspace root, so every member's dep-info names the
+    /// workspace manifest. Clippy reads only its `lints` and `workspace.lints`
+    /// tables (`lint_groups_priority`); the package manifest is keyed through
+    /// [`clippy_identity`] and MSRV through `CARGO_PKG_RUST_VERSION`. Keying
+    /// the whole file made every member or dependency edit miss every Clippy
+    /// unit with byte-identical output. An unreadable or unparsable manifest
+    /// keeps the whole-file hash.
+    pub fn hash_clippy_manifest(&self, path: &Path) -> Result<String> {
+        let whole = self.hash(path)?;
+        let resolved = self.resolve_path(path)?;
+        Ok(std::fs::read_to_string(&resolved)
+            .ok()
+            .and_then(|content| clippy_manifest_lint_digest(&content))
+            .unwrap_or(whole))
+    }
+
     fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
@@ -10571,13 +10594,46 @@ fn clippy_identity_with_version(
         }
         None => identity.push_str("config:none\n"),
     }
-    for name in ["CLIPPY_ARGS", "CLIPPY_DISABLE_DOCS_LINKS"] {
+    // Clippy reads its MSRV from `CARGO_PKG_RUST_VERSION`, which a member
+    // inheriting `rust-version` gets from the workspace manifest.
+    for name in [
+        "CARGO_PKG_RUST_VERSION",
+        "CLIPPY_ARGS",
+        "CLIPPY_DISABLE_DOCS_LINKS",
+    ] {
         match env(name) {
             Some(value) => identity.push_str(&format!("{name}={}\n", value.to_string_lossy())),
             None => identity.push_str(&format!("{name} unset\n")),
         }
     }
     Ok(identity)
+}
+
+/// The dep-info entry Clippy adds for the manifest: the bare relative
+/// `Cargo.toml`. A manifest a crate reads itself (`include_str!`) is recorded
+/// by absolute path and keeps its whole-file hash.
+pub(crate) fn is_clippy_tracked_manifest(file: &Path) -> bool {
+    file == Path::new("Cargo.toml")
+}
+
+/// A digest of a manifest's `lints` and `workspace.lints` tables, the only
+/// parts of the tracked manifest Clippy reads; `None` when it does not parse.
+pub(crate) fn clippy_manifest_lint_digest(content: &str) -> Option<String> {
+    let manifest: toml::Table = content.parse().ok()?;
+    let mut kept = toml::Table::new();
+    if let Some(lints) = manifest.get("lints") {
+        kept.insert("lints".to_owned(), lints.clone());
+    }
+    if let Some(lints) = manifest.get("workspace").and_then(|workspace| workspace.get("lints")) {
+        let mut workspace = toml::Table::new();
+        workspace.insert("lints".to_owned(), lints.clone());
+        kept.insert("workspace".to_owned(), toml::Value::Table(workspace));
+    }
+    let canonical = toml::to_string(&kept).ok()?;
+    Some(format!(
+        "clippy-lints.v1:{}",
+        blake3::hash(canonical.as_bytes()).to_hex()
+    ))
 }
 
 /// The configuration file Clippy loads: the first `.clippy.toml` or
