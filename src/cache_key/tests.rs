@@ -22383,10 +22383,10 @@ fn a_package_scoped_guard_ignores_checkout_local_dot_directories_but_not_sqlx() 
     let ancestors = |root: &Path, dot_dirs| {
         vendored_package_digest(&root.join("kt"), None, root, dot_dirs, &hasher).unwrap()
     };
-    assert_eq!(
+    assert_ne!(
         ancestors(&first, DotDirs::Data),
-        ancestors(&first, DotDirs::All)
+        ancestors(&first, DotDirs::All),
+        "a vendored package reads `.jj` too"
     );
-    write_file(&first.join(".jj/op_log"), "changed");
     assert_ne!(ancestors(&first, DotDirs::All), ancestors(&second, DotDirs::All));
 }
