@@ -22390,3 +22390,33 @@ fn a_package_scoped_guard_ignores_checkout_local_dot_directories_but_not_sqlx() 
     );
     assert_ne!(ancestors(&first, DotDirs::All), ancestors(&second, DotDirs::All));
 }
+
+/// Every unit below a directory reads the same top level of its ancestors, so
+/// the package guard memoises that digest under the directory's stamp: a
+/// second read is the same digest, a top-level file edit still moves it, and a
+/// directory holding `.sqlx` is never memoised.
+#[test]
+fn an_ancestor_top_level_digest_is_memoised_by_stamp_and_follows_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for name in ["Cargo.toml", "kt/Cargo.toml"] {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let hasher = FileHasher::new();
+    let digest = |dot_dirs| ancestor_top_digest(&root, dot_dirs, &hasher).unwrap();
+    let first = digest(DotDirs::Data);
+    assert_eq!(digest(DotDirs::Data), first, "a memoised read");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n# edited\n");
+    assert_ne!(digest(DotDirs::Data), first, "an edit moves the stamp");
+    write_file(&root.join(".sqlx/q.json"), "1");
+    let with_sqlx = digest(DotDirs::Data);
+    write_file(&root.join(".sqlx/q.json"), "2");
+    assert_ne!(digest(DotDirs::Data), with_sqlx, "`.sqlx` is read every time");
+}

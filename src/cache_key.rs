@@ -3025,16 +3025,40 @@ fn ancestor_top_digest(
         },
     };
     let stamp = stamp_root(&top, CRATE_TREE_MAX_ENTRIES)?;
+    // The digest of the same top level is the same for every unit below this
+    // directory, and the stamp shows when any of its entries moved. A data
+    // dot-directory is a tree of its own that the stamp does not cover, so a
+    // directory holding one is read each time.
+    let memo = (matches!(dot_dirs, DotDirs::Data)
+        && !DATA_DOT_DIRS
+            .iter()
+            .any(|data| std::fs::symlink_metadata(directory.join(data)).is_ok()))
+    .then(|| {
+        let memo_dir = crate::config::probe_memo_dir_for(&file_hasher.invocation_env).ok()?;
+        let root = TreeRoot::new(directory.to_path_buf(), b"ancestor_top_data", &[]);
+        Some(tree_digest_memo(&memo_dir, &root))
+    })
+    .flatten();
+    let walk = GuardWalk {
+        root: top,
+        max_entries: CRATE_TREE_MAX_ENTRIES,
+        stamp: stamp.digest.clone(),
+    };
+    if let Some(digest) = memo
+        .as_deref()
+        .and_then(|memo| crate::tree_stamp::memoised_digest(memo, stamp.memo_key()))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        crate::phase_trace::decision("ancestor_memo", "hit");
+        file_hasher.note_tree_walk(walk);
+        return Some(digest);
+    }
     let mut entries: Vec<_> = std::fs::read_dir(directory)
         .ok()?
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
-    file_hasher.note_tree_walk(GuardWalk {
-        root: top,
-        max_entries: CRATE_TREE_MAX_ENTRIES,
-        stamp: stamp.digest,
-    });
+    file_hasher.note_tree_walk(walk.clone());
     let own = own_dirs_within(directory, &file_hasher.own_dirs);
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
@@ -3090,7 +3114,11 @@ fn ancestor_top_digest(
         fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
         fold_field(&mut hasher, b"entry:", content.as_bytes());
     }
-    Some(hasher.finalize().to_hex().to_string())
+    let digest = hasher.finalize().to_hex().to_string();
+    if let Some(memo) = &memo {
+        memoise_tree_digest(memo, &walk, &stamp, &digest, std::time::SystemTime::now());
+    }
+    Some(digest)
 }
 
 /// [`workspace_tree_digest`] with its entry budget supplied.
