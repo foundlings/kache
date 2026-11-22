@@ -22420,3 +22420,35 @@ fn an_ancestor_top_level_digest_is_memoised_by_stamp_and_follows_edits() {
     write_file(&root.join(".sqlx/q.json"), "2");
     assert_ne!(digest(DotDirs::Data), with_sqlx, "`.sqlx` is read every time");
 }
+
+/// An in-place edit that keeps the size and restores the modification time
+/// still moves the ancestor digest: the stamp holds the change time, which no
+/// write can restore.
+#[cfg(unix)]
+#[test]
+fn an_in_place_same_size_edit_with_restored_mtime_moves_the_ancestor_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let set_old = |name: &str| {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    };
+    for name in ["Cargo.toml", "kt/Cargo.toml"] {
+        set_old(name);
+    }
+    write_file(&root.join("clippy.toml"), "msrv = \"1.80\"\n");
+    set_old("clippy.toml");
+    let hasher = FileHasher::new();
+    let digest = || ancestor_top_digest(&root, DotDirs::Data, &hasher).unwrap();
+    let first = digest();
+    assert_eq!(digest(), first);
+    write_file(&root.join("clippy.toml"), "msrv = \"1.81\"\n");
+    set_old("clippy.toml");
+    assert_ne!(digest(), first, "same size, same mtime, different bytes");
+}
