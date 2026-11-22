@@ -9729,7 +9729,10 @@ fn clippy_manifest_digest_follows_only_the_lint_tables() {
 
     // Workspace and package lint tables are what `lint_groups_priority` reads.
     let workspace_lints = base.replace("\"deny\"", "\"warn\"");
-    assert_ne!(clippy_manifest_lint_digest(&workspace_lints).unwrap(), digest);
+    assert_ne!(
+        clippy_manifest_lint_digest(&workspace_lints).unwrap(),
+        digest
+    );
     let package_lints = format!("{base}\n[lints.rust]\nunsafe_code = \"forbid\"\n");
     assert_ne!(clippy_manifest_lint_digest(&package_lints).unwrap(), digest);
 
@@ -9758,7 +9761,11 @@ fn clippy_identity_follows_the_msrv() {
         let msrv = msrv.map(std::ffi::OsString::from);
         clippy_identity_in(
             &driver,
-            move |name: &str| (name == "CARGO_PKG_RUST_VERSION").then(|| msrv.clone()).flatten(),
+            move |name: &str| {
+                (name == "CARGO_PKG_RUST_VERSION")
+                    .then(|| msrv.clone())
+                    .flatten()
+            },
             None,
         )
         .unwrap()
@@ -23548,11 +23555,7 @@ fn a_package_scoped_guard_ignores_siblings_but_not_the_package_or_its_ancestors(
     package_scope_workspace(&root);
     let hasher = FileHasher::new();
     let package = |root: &Path| {
-        workspace_tree_digest(
-            &package_scope_roots(root, GuardScope::Package),
-            &hasher,
-        )
-        .unwrap()
+        workspace_tree_digest(&package_scope_roots(root, GuardScope::Package), &hasher).unwrap()
     };
     let whole = |root: &Path| {
         workspace_tree_digest(
@@ -23673,7 +23676,10 @@ fn a_package_scoped_guard_ignores_checkout_local_dot_directories_but_not_sqlx() 
         ancestors(&first, DotDirs::All),
         "a vendored package reads `.jj` too"
     );
-    assert_ne!(ancestors(&first, DotDirs::All), ancestors(&second, DotDirs::All));
+    assert_ne!(
+        ancestors(&first, DotDirs::All),
+        ancestors(&second, DotDirs::All)
+    );
 }
 
 /// Every unit below a directory reads the same top level of its ancestors, so
@@ -23703,7 +23709,11 @@ fn an_ancestor_top_level_digest_is_memoised_by_stamp_and_follows_edits() {
     write_file(&root.join(".sqlx/q.json"), "1");
     let with_sqlx = digest(DotDirs::Data);
     write_file(&root.join(".sqlx/q.json"), "2");
-    assert_ne!(digest(DotDirs::Data), with_sqlx, "`.sqlx` is read every time");
+    assert_ne!(
+        digest(DotDirs::Data),
+        with_sqlx,
+        "`.sqlx` is read every time"
+    );
 }
 
 /// An in-place edit that keeps the size and restores the modification time

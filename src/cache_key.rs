@@ -3429,7 +3429,6 @@ fn guard_scope_of(
     }
 }
 
-
 impl WorkspaceRoots {
     /// Where this invocation puts a record's relative entries.
     fn places(&self) -> Option<Places<'_>> {
@@ -11882,7 +11881,10 @@ pub(crate) fn clippy_manifest_lint_digest(content: &str) -> Option<String> {
     if let Some(lints) = manifest.get("lints") {
         kept.insert("lints".to_owned(), lints.clone());
     }
-    if let Some(lints) = manifest.get("workspace").and_then(|workspace| workspace.get("lints")) {
+    if let Some(lints) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("lints"))
+    {
         let mut workspace = toml::Table::new();
         workspace.insert("lints".to_owned(), lints.clone());
         kept.insert("workspace".to_owned(), toml::Value::Table(workspace));
