@@ -2668,6 +2668,41 @@ pub(crate) struct WorkspaceRoots {
     /// The package directory, for a vendored package ([`is_vendored_package`]):
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
+    /// How much of the tree the unit's record guard digests.
+    pub(crate) guard: GuardScope,
+}
+
+/// What a workspace unit's tree guard digests ([`TREE_GUARD_SCOPE_ENV`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GuardScope {
+    /// The whole workspace. Any edit anywhere moves every unit's guard, so
+    /// a checkout that differs from the recorder's in one file predicts
+    /// nothing and every unit runs the dep-info pre-pass.
+    Workspace,
+    /// The unit's package directory, its `OUT_DIR`, and the top-level files
+    /// of each directory between the package and the workspace root, as for
+    /// a vendored package ([`vendored_package_digest`]). Sound for macros
+    /// that read the package, `OUT_DIR` or those files. A macro that lists
+    /// a directory outside them holding none of the closure's files is not
+    /// seen: that is why this scope is opt-in.
+    Package(PathBuf),
+}
+
+/// Set to `package` to guard a workspace unit by [`GuardScope::Package`].
+/// Any other value, or none, keeps [`GuardScope::Workspace`].
+pub(crate) const TREE_GUARD_SCOPE_ENV: &str = "KACHE_TREE_GUARD_SCOPE";
+
+fn guard_scope_of(
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    manifest_dir: &Path,
+    root: &Path,
+) -> GuardScope {
+    let package = env_var_in(vars, TREE_GUARD_SCOPE_ENV).is_some_and(|value| value == "package");
+    if package && manifest_dir.starts_with(root) {
+        GuardScope::Package(manifest_dir.to_path_buf())
+    } else {
+        GuardScope::Workspace
+    }
 }
 
 impl WorkspaceRoots {
@@ -2746,7 +2781,9 @@ fn workspace_roots_in(
         let canonical_cwd = std::fs::canonicalize(current_dir).ok()?;
         suffix_within(canonical_cwd.as_os_str(), &canonical_root, 0)
     })?;
+    let guard = guard_scope_of(vars, manifest_dir, &root);
     Some(WorkspaceRoots {
+        guard,
         cwd,
         canonical_root,
         canonical_target: std::fs::canonicalize(&target).ok()?,
@@ -2832,6 +2869,14 @@ fn workspace_tree_digest(
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
     if let Some(package) = &workspace.vendored_package {
+        return vendored_package_digest(
+            package,
+            workspace.out_dir.as_deref(),
+            &workspace.root,
+            file_hasher,
+        );
+    }
+    if let GuardScope::Package(package) = &workspace.guard {
         return vendored_package_digest(
             package,
             workspace.out_dir.as_deref(),
@@ -7113,7 +7158,44 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
     sources.iter().all(|source| {
         guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
             walk_reaches(root, &below, skips_build_dirs, &mut entered)
+                && package_scope_sees(root, &below, workspace)
         })
+    })
+}
+
+/// Under [`GuardScope::Package`], does the guard see the file `below` `root`?
+/// It sees a file under the package, one under `OUT_DIR`, and a file directly
+/// in a directory between the package and the workspace root. Any other
+/// source leaves the unit on the pre-pass. Always true for
+/// [`GuardScope::Workspace`], whose walk [`walk_reaches`] already checked.
+fn package_scope_sees(root: &Path, below: &str, workspace: &WorkspaceRoots) -> bool {
+    let GuardScope::Package(package) = &workspace.guard else {
+        return true;
+    };
+    if workspace
+        .out_dir
+        .as_deref()
+        .is_some_and(|out_dir| root == out_dir)
+    {
+        return true;
+    }
+    let mut path = root.to_path_buf();
+    for component in Path::new(below).components() {
+        match component {
+            std::path::Component::Normal(name) => path.push(name),
+            std::path::Component::ParentDir => {
+                if !path.pop() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if path.starts_with(package) {
+        return true;
+    }
+    path.parent().is_some_and(|directory| {
+        directory.starts_with(&workspace.root) && package.starts_with(directory)
     })
 }
 
