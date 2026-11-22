@@ -2668,6 +2668,41 @@ pub(crate) struct WorkspaceRoots {
     /// The package directory, for a vendored package ([`is_vendored_package`]):
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
+    /// How much of the tree the unit's record guard digests.
+    pub(crate) guard: GuardScope,
+}
+
+/// What a workspace unit's tree guard digests ([`TREE_GUARD_SCOPE_ENV`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GuardScope {
+    /// The whole workspace. Any edit anywhere moves every unit's guard, so
+    /// a checkout that differs from the recorder's in one file predicts
+    /// nothing and every unit runs the dep-info pre-pass.
+    Workspace,
+    /// The unit's package directory, its `OUT_DIR`, and the top-level files
+    /// of each directory between the package and the workspace root, as for
+    /// a vendored package ([`vendored_package_digest`]). Sound for macros
+    /// that read the package, `OUT_DIR` or those files. A macro that lists
+    /// a directory outside them holding none of the closure's files is not
+    /// seen: that is why this scope is opt-in.
+    Package(PathBuf),
+}
+
+/// Set to `package` to guard a workspace unit by [`GuardScope::Package`].
+/// Any other value, or none, keeps [`GuardScope::Workspace`].
+pub(crate) const TREE_GUARD_SCOPE_ENV: &str = "KACHE_TREE_GUARD_SCOPE";
+
+fn guard_scope_of(
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    manifest_dir: &Path,
+    root: &Path,
+) -> GuardScope {
+    let package = env_var_in(vars, TREE_GUARD_SCOPE_ENV).is_some_and(|value| value == "package");
+    if package && manifest_dir.starts_with(root) {
+        GuardScope::Package(manifest_dir.to_path_buf())
+    } else {
+        GuardScope::Workspace
+    }
 }
 
 impl WorkspaceRoots {
@@ -2746,7 +2781,9 @@ fn workspace_roots_in(
         let canonical_cwd = std::fs::canonicalize(current_dir).ok()?;
         suffix_within(canonical_cwd.as_os_str(), &canonical_root, 0)
     })?;
+    let guard = guard_scope_of(vars, manifest_dir, &root);
     Some(WorkspaceRoots {
+        guard,
         cwd,
         canonical_root,
         canonical_target: std::fs::canonicalize(&target).ok()?,
@@ -2836,6 +2873,16 @@ fn workspace_tree_digest(
             package,
             workspace.out_dir.as_deref(),
             &workspace.root,
+            DotDirs::All,
+            file_hasher,
+        );
+    }
+    if let GuardScope::Package(package) = &workspace.guard {
+        return vendored_package_digest(
+            package,
+            workspace.out_dir.as_deref(),
+            &workspace.root,
+            DotDirs::Data,
             file_hasher,
         );
     }
@@ -2899,6 +2946,7 @@ fn vendored_package_digest(
     package: &Path,
     out_dir: Option<&Path>,
     workspace_root: &Path,
+    dot_dirs: DotDirs,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
     let mut roots = vec![TreeRoot::new(
@@ -2918,17 +2966,47 @@ fn vendored_package_digest(
         fold_field(
             &mut hasher,
             b"ancestor:",
-            ancestor_top_digest(directory, file_hasher)?.as_bytes(),
+            ancestor_top_digest(directory, dot_dirs, file_hasher)?.as_bytes(),
         );
         ancestor = directory.parent();
     }
     Some(hasher.finalize().to_hex().to_string())
 }
 
+/// Which dot-directories at the top of an ancestor a guard digests.
+#[derive(Clone, Copy)]
+enum DotDirs {
+    /// All of them: a vendored package's lookups can land in any.
+    All,
+    /// Only the data directories a macro reads by convention. A workspace
+    /// root's other dot-directories (`.jj`, `.claude`, tool caches) differ
+    /// between checkouts of one tree and are not macro input; digesting them
+    /// made every workspace unit's guard checkout-specific.
+    Data,
+}
+
+/// Dot-directories a macro reads by convention (`sqlx` offline data).
+const DATA_DOT_DIRS: &[&str] = &[".sqlx"];
+
+impl DotDirs {
+    fn reads(self, name: &std::ffi::OsStr) -> bool {
+        match self {
+            Self::All => true,
+            Self::Data => DATA_DOT_DIRS
+                .iter()
+                .any(|data| name == std::ffi::OsStr::new(data)),
+        }
+    }
+}
+
 /// The files, symlinks and dot-directories (less `.git`, of either kind) at the top of
 /// `directory`, by name and content. A symlink to a file counts by its
 /// target and by the content read through it.
-fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
+fn ancestor_top_digest(
+    directory: &Path,
+    dot_dirs: DotDirs,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
     // The guard's walk of the files and symlinks read here, and of the
     // directory's own times, taken before the listing: a name that appears
     // after the stamp, or comes and goes before the record is written, moves
@@ -2947,16 +3025,40 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         },
     };
     let stamp = stamp_root(&top, CRATE_TREE_MAX_ENTRIES)?;
+    // The digest of the same top level is the same for every unit below this
+    // directory, and the stamp shows when any of its entries moved. A data
+    // dot-directory is a tree of its own that the stamp does not cover, so a
+    // directory holding one is read each time.
+    let memo = (matches!(dot_dirs, DotDirs::Data)
+        && !DATA_DOT_DIRS
+            .iter()
+            .any(|data| std::fs::symlink_metadata(directory.join(data)).is_ok()))
+    .then(|| {
+        let memo_dir = crate::config::probe_memo_dir_for(&file_hasher.invocation_env).ok()?;
+        let root = TreeRoot::new(directory.to_path_buf(), b"ancestor_top_data", &[]);
+        Some(tree_digest_memo(&memo_dir, &root))
+    })
+    .flatten();
+    let walk = GuardWalk {
+        root: top,
+        max_entries: CRATE_TREE_MAX_ENTRIES,
+        stamp: stamp.digest.clone(),
+    };
+    if let Some(digest) = memo
+        .as_deref()
+        .and_then(|memo| crate::tree_stamp::memoised_digest(memo, stamp.memo_key()))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        crate::phase_trace::decision("ancestor_memo", "hit");
+        file_hasher.note_tree_walk(walk);
+        return Some(digest);
+    }
     let mut entries: Vec<_> = std::fs::read_dir(directory)
         .ok()?
         .collect::<std::io::Result<_>>()
         .ok()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
-    file_hasher.note_tree_walk(GuardWalk {
-        root: top,
-        max_entries: CRATE_TREE_MAX_ENTRIES,
-        stamp: stamp.digest,
-    });
+    file_hasher.note_tree_walk(walk.clone());
     let own = own_dirs_within(directory, &file_hasher.own_dirs);
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
@@ -2998,7 +3100,8 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             Ok(metadata)
                 if metadata.is_dir()
                     && name.as_encoded_bytes().starts_with(b".")
-                    && name != ".git" =>
+                    && name != ".git"
+                    && dot_dirs.reads(&name) =>
             {
                 let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
                 format!(
@@ -3011,7 +3114,11 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
         fold_field(&mut hasher, b"entry:", content.as_bytes());
     }
-    Some(hasher.finalize().to_hex().to_string())
+    let digest = hasher.finalize().to_hex().to_string();
+    if let Some(memo) = &memo {
+        memoise_tree_digest(memo, &walk, &stamp, &digest, std::time::SystemTime::now());
+    }
+    Some(digest)
 }
 
 /// [`workspace_tree_digest`] with its entry budget supplied.
@@ -7113,7 +7220,44 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
     sources.iter().all(|source| {
         guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
             walk_reaches(root, &below, skips_build_dirs, &mut entered)
+                && package_scope_sees(root, &below, workspace)
         })
+    })
+}
+
+/// Under [`GuardScope::Package`], does the guard see the file `below` `root`?
+/// It sees a file under the package, one under `OUT_DIR`, and a file directly
+/// in a directory between the package and the workspace root. Any other
+/// source leaves the unit on the pre-pass. Always true for
+/// [`GuardScope::Workspace`], whose walk [`walk_reaches`] already checked.
+fn package_scope_sees(root: &Path, below: &str, workspace: &WorkspaceRoots) -> bool {
+    let GuardScope::Package(package) = &workspace.guard else {
+        return true;
+    };
+    if workspace
+        .out_dir
+        .as_deref()
+        .is_some_and(|out_dir| root == out_dir)
+    {
+        return true;
+    }
+    let mut path = root.to_path_buf();
+    for component in Path::new(below).components() {
+        match component {
+            std::path::Component::Normal(name) => path.push(name),
+            std::path::Component::ParentDir => {
+                if !path.pop() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if path.starts_with(package) {
+        return true;
+    }
+    path.parent().is_some_and(|directory| {
+        directory.starts_with(&workspace.root) && package.starts_with(directory)
     })
 }
 

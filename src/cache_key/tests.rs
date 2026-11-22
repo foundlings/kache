@@ -6393,6 +6393,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         canonical_target: PathBuf::from("/private/w/target"),
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
         vendored_package: None,
+        guard: GuardScope::Workspace,
     }
 }
 
@@ -7265,6 +7266,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         target: root.join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        guard: GuardScope::Workspace,
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -7402,6 +7404,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
         vendored_package: None,
+        guard: GuardScope::Workspace,
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7456,6 +7459,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         canonical_target: dir.path().join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        guard: GuardScope::Workspace,
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -7499,6 +7503,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/foo-1/out")),
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard: GuardScope::Workspace,
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -7574,6 +7579,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard: GuardScope::Workspace,
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -7617,6 +7623,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard: GuardScope::Workspace,
     }
 }
 
@@ -7728,6 +7735,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard: GuardScope::Workspace,
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7836,6 +7844,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        guard: GuardScope::Workspace,
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -22221,4 +22230,193 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
         }),
         "a crate-relative dotted spelling stays as rustc recorded it"
     );
+}
+
+fn package_scope_roots(root: &Path, scope: fn(PathBuf) -> GuardScope) -> WorkspaceRoots {
+    WorkspaceRoots {
+        root: root.to_path_buf(),
+        cwd: String::new(),
+        canonical_root: root.to_path_buf(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        guard: scope(root.join("kt")),
+    }
+}
+
+fn package_scope_workspace(root: &Path) {
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("kt/Cargo.toml"), "[package]\n");
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    write_file(&root.join("other/src/lib.rs"), "pub fn b() {}\n");
+}
+
+/// A package-scoped guard ignores an edit in a sibling package, which is what
+/// lets another checkout of a different branch reuse a unit's record; a
+/// workspace-scoped guard does not. Content in the package, or in a file at
+/// the top of a directory above it, still moves the guard.
+#[test]
+fn a_package_scoped_guard_ignores_siblings_but_not_the_package_or_its_ancestors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    let hasher = FileHasher::new();
+    let package = |root: &Path| {
+        workspace_tree_digest(
+            &package_scope_roots(root, GuardScope::Package),
+            &hasher,
+        )
+        .unwrap()
+    };
+    let whole = |root: &Path| {
+        workspace_tree_digest(
+            &package_scope_roots(root, |_| GuardScope::Workspace),
+            &hasher,
+        )
+        .unwrap()
+    };
+    let (package_before, whole_before) = (package(&root), whole(&root));
+
+    write_file(&root.join("other/src/lib.rs"), "pub fn b() { 1; }\n");
+    write_file(&root.join("other/src/new.rs"), "");
+    assert_eq!(package(&root), package_before, "a sibling edit");
+    assert_ne!(whole(&root), whole_before, "the contrast: the whole tree");
+
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() { 1; }\n");
+    assert_ne!(package(&root), package_before, "the package's own file");
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    assert_eq!(package(&root), package_before);
+
+    write_file(&root.join("clippy.toml"), "msrv = \"1.80\"\n");
+    assert_ne!(package(&root), package_before, "a top-level file above it");
+}
+
+/// The same package at another path, beside a differing sibling, gets the
+/// same guard, so its record from the first checkout is used; a content
+/// change in the package does not.
+#[test]
+fn a_package_scoped_guard_matches_a_second_checkout_and_misses_a_changed_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("a/w"), dir.path().join("b/elsewhere"));
+    package_scope_workspace(&first);
+    package_scope_workspace(&second);
+    write_file(&second.join("other/src/lib.rs"), "pub fn b() { 2; }\n");
+    let hasher = FileHasher::new();
+    let digest = |root: &Path| {
+        workspace_tree_digest(&package_scope_roots(root, GuardScope::Package), &hasher).unwrap()
+    };
+    assert_eq!(digest(&first), digest(&second));
+    write_file(&second.join("kt/src/lib.rs"), "pub fn a() { 3; }\n");
+    assert_ne!(digest(&first), digest(&second));
+}
+
+/// Under the package scope a closure file the guard does not digest keeps
+/// the unit on the pre-pass: the package, the top-level files above it and
+/// `OUT_DIR` are seen, a sibling package is not.
+#[test]
+fn a_package_scoped_guard_covers_only_what_it_digests() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    let roots = package_scope_roots(&root, GuardScope::Package);
+    let whole = package_scope_roots(&root, |_| GuardScope::Workspace);
+    let covers = |sources: &[&str]| {
+        let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+        guard_covers(&sources, &roots)
+    };
+    assert!(covers(&["kt/src/lib.rs", "kt/Cargo.toml", "Cargo.toml"]));
+    assert!(!covers(&["kt/src/lib.rs", "other/src/lib.rs"]));
+    assert!(!covers(&["kt/../other/src/lib.rs"]));
+    assert!(guard_covers(&[PathBuf::from("other/src/lib.rs")], &whole));
+}
+
+#[test]
+fn only_the_package_value_selects_the_package_scope() {
+    let root = Path::new("/w");
+    let manifest = Path::new("/w/kt");
+    let vars = |value: &str| {
+        vec![(
+            std::ffi::OsString::from(TREE_GUARD_SCOPE_ENV),
+            std::ffi::OsString::from(value),
+        )]
+    };
+    assert_eq!(
+        guard_scope_of(&vars("package"), manifest, root),
+        GuardScope::Package(manifest.to_path_buf())
+    );
+    assert_eq!(
+        guard_scope_of(&vars("workspace"), manifest, root),
+        GuardScope::Workspace
+    );
+    assert_eq!(guard_scope_of(&[], manifest, root), GuardScope::Workspace);
+    assert_eq!(
+        guard_scope_of(&vars("package"), Path::new("/elsewhere/kt"), root),
+        GuardScope::Workspace,
+        "a package outside the workspace"
+    );
+}
+
+/// Dot-directories at a workspace root (`.jj`, `.claude`, tool caches) differ
+/// between checkouts of one tree and are not macro input: a package-scoped
+/// guard ignores them, so two checkouts agree. `.sqlx`, which a macro reads,
+/// still counts, and a vendored package keeps digesting every dot-directory.
+#[test]
+fn a_package_scoped_guard_ignores_checkout_local_dot_directories_but_not_sqlx() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("a/w"), dir.path().join("b/w"));
+    for root in [&first, &second] {
+        package_scope_workspace(root);
+    }
+    write_file(&first.join(".jj/op_log"), "one");
+    write_file(&second.join(".jj/op_log"), "two");
+    write_file(&second.join(".claude/worktrees/x"), "");
+    write_file(&second.join(".mypy_cache/c"), "");
+    let hasher = FileHasher::new();
+    let package = |root: &Path| {
+        workspace_tree_digest(&package_scope_roots(root, GuardScope::Package), &hasher).unwrap()
+    };
+    assert_eq!(package(&first), package(&second));
+    write_file(&second.join(".sqlx/query-1.json"), "{}");
+    assert_ne!(package(&first), package(&second), ".sqlx is macro input");
+
+    let ancestors = |root: &Path, dot_dirs| {
+        vendored_package_digest(&root.join("kt"), None, root, dot_dirs, &hasher).unwrap()
+    };
+    assert_ne!(
+        ancestors(&first, DotDirs::Data),
+        ancestors(&first, DotDirs::All),
+        "a vendored package reads `.jj` too"
+    );
+    assert_ne!(ancestors(&first, DotDirs::All), ancestors(&second, DotDirs::All));
+}
+
+/// Every unit below a directory reads the same top level of its ancestors, so
+/// the package guard memoises that digest under the directory's stamp: a
+/// second read is the same digest, a top-level file edit still moves it, and a
+/// directory holding `.sqlx` is never memoised.
+#[test]
+fn an_ancestor_top_level_digest_is_memoised_by_stamp_and_follows_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for name in ["Cargo.toml", "kt/Cargo.toml"] {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let hasher = FileHasher::new();
+    let digest = |dot_dirs| ancestor_top_digest(&root, dot_dirs, &hasher).unwrap();
+    let first = digest(DotDirs::Data);
+    assert_eq!(digest(DotDirs::Data), first, "a memoised read");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n# edited\n");
+    assert_ne!(digest(DotDirs::Data), first, "an edit moves the stamp");
+    write_file(&root.join(".sqlx/q.json"), "1");
+    let with_sqlx = digest(DotDirs::Data);
+    write_file(&root.join(".sqlx/q.json"), "2");
+    assert_ne!(digest(DotDirs::Data), with_sqlx, "`.sqlx` is read every time");
 }
