@@ -533,6 +533,17 @@ fn doctor_check_optionality_truth_table() {
     assert!(doctor_check_is_optional("Install path", false, false));
     // So is a build that could reuse another checkout with a setting changed.
     assert!(doctor_check_is_optional(OTHER_CHECKOUTS, false, false));
+    // Volumes and key time are performance advice.
+    assert!(doctor_check_is_optional(
+        doctor_keys::FILE_HASH_MEMO,
+        false,
+        false
+    ));
+    assert!(doctor_check_is_optional(
+        doctor_keys::KEY_TIME,
+        false,
+        false
+    ));
     // Daemon labels downgrade exactly when the daemon is optional.
     assert!(doctor_check_is_optional("Daemon version", true, false));
     assert!(!doctor_check_is_optional("Daemon version", false, false));
@@ -1473,9 +1484,7 @@ fn stats_rows_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
 
 fn lifetime_totals() -> crate::savings::Totals {
     crate::savings::Totals {
-        since: chrono::DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc),
+        since: kache_protocol::time::parse_rfc3339("2026-09-12T12:00:00Z").unwrap(),
         hits: 128_402,
         hit_compile_time_ms: 147_600_000,
         zero_copy_bytes: 3 << 30,
@@ -1486,7 +1495,7 @@ fn lifetime_totals() -> crate::savings::Totals {
 }
 
 fn lifetime_text(totals: Option<&crate::savings::Totals>) -> Vec<String> {
-    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    let today = jiff::civil::Date::new(2026, 10, 1).unwrap();
     lifetime_rows(totals, today)
         .into_iter()
         .map(row_text)
@@ -1548,7 +1557,7 @@ fn lifetime_rows_leave_out_zero_totals() {
 
 #[test]
 fn since_label_adds_the_year_only_for_another_year() {
-    let date = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    let date = |y, m, d| jiff::civil::Date::new(y, m, d).unwrap();
     assert_eq!(since_label(date(2026, 9, 2), date(2026, 10, 1)), "Sep 02");
     assert_eq!(
         since_label(date(2025, 9, 2), date(2026, 10, 1)),
@@ -2064,6 +2073,7 @@ fn a_hardlinked_artifact_records_its_link_group() {
 fn zero_event_stats() -> daemon::EventStatsResponse {
     daemon::EventStatsResponse {
         local_hits: 0,
+        readonly_hits: 0,
         prefetch_hits: 0,
         remote_hits: 0,
         dups: 0,
@@ -2182,16 +2192,18 @@ fn test_format_relative_time_invalid_passes_through() {
 
 #[test]
 fn test_format_relative_time_buckets() {
-    let now = chrono::Utc::now();
-    let fmt = |dt: chrono::DateTime<chrono::Utc>| {
-        format_relative_time(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
-    };
-    assert_eq!(fmt(now - chrono::Duration::seconds(10)), "just now");
-    assert_eq!(fmt(now - chrono::Duration::minutes(5)), "5m ago");
-    assert_eq!(fmt(now - chrono::Duration::hours(3)), "3h ago");
-    assert_eq!(fmt(now - chrono::Duration::days(2)), "2d ago");
+    let now = jiff::Timestamp::now();
+    let fmt =
+        |dt: jiff::Timestamp| format_relative_time(&dt.strftime("%Y-%m-%d %H:%M:%S").to_string());
+    assert_eq!(fmt(now - jiff::SignedDuration::from_secs(10)), "just now");
+    assert_eq!(fmt(now - jiff::SignedDuration::from_mins(5)), "5m ago");
+    assert_eq!(fmt(now - jiff::SignedDuration::from_hours(3)), "3h ago");
+    assert_eq!(
+        fmt(now - jiff::SignedDuration::from_hours(24 * 2)),
+        "2d ago"
+    );
     // A future timestamp clamps to "just now" (secs.max(0)).
-    assert_eq!(fmt(now + chrono::Duration::hours(1)), "just now");
+    assert_eq!(fmt(now + jiff::SignedDuration::from_hours(1)), "just now");
 }
 
 #[test]
@@ -3487,6 +3499,7 @@ struct BackendCalls {
     gets: Vec<String>,
     puts: Vec<String>,
     lists: Vec<String>,
+    heads: Vec<String>,
 }
 
 struct TestBackend {
@@ -3494,6 +3507,7 @@ struct TestBackend {
     calls: std::sync::Mutex<BackendCalls>,
     fail_put: bool,
     listing: Option<Arc<ControlledListing>>,
+    transfer_gate: Option<Arc<SyncTransferGate>>,
 }
 
 impl TestBackend {
@@ -3503,6 +3517,7 @@ impl TestBackend {
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: false,
             listing: None,
+            transfer_gate: None,
         })
     }
 
@@ -3512,6 +3527,7 @@ impl TestBackend {
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: true,
             listing: None,
+            transfer_gate: None,
         })
     }
 
@@ -3540,6 +3556,10 @@ impl TestBackend {
     fn list_calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().lists.clone()
     }
+
+    fn head_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().heads.clone()
+    }
 }
 
 fn as_remote_backend(backend: &Arc<TestBackend>) -> Arc<dyn crate::remote_backend::RemoteBackend> {
@@ -3556,6 +3576,7 @@ fn as_cache_remote(
 #[async_trait::async_trait]
 impl crate::remote_backend::RemoteBackend for TestBackend {
     async fn head(&self, key: &str) -> Result<bool> {
+        self.calls.lock().unwrap().heads.push(key.to_string());
         crate::remote_backend::RemoteBackend::head(&self.inner, key).await
     }
 
@@ -3565,6 +3586,18 @@ impl crate::remote_backend::RemoteBackend for TestBackend {
         max_bytes: Option<u64>,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         self.calls.lock().unwrap().gets.push(key.to_string());
+        if let Some(gate) = &self.transfer_gate {
+            let gate = gate.as_ref();
+            let active = gate
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            gate.peak
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            gate.entered.add_permits(1);
+            let _active = ActiveTransfer(gate);
+            gate.release.acquire().await.unwrap().forget();
+        }
         crate::remote_backend::RemoteBackend::get(&self.inner, key, max_bytes).await
     }
 
@@ -3605,6 +3638,25 @@ struct ControlledListing {
     started: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     fail: bool,
+}
+
+/// Blocks each GET until the test releases it, so a pull's in-flight count is
+/// observable.
+struct SyncTransferGate {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+struct ActiveTransfer<'a>(&'a SyncTransferGate);
+
+impl Drop for ActiveTransfer<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct ActiveListing<'a>(&'a ControlledListing);
@@ -3906,10 +3958,12 @@ fn save_manifest_config(
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4228,7 +4282,7 @@ fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     use crate::events::EventResult;
     let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
     let mut hit = build_event("dep", EventResult::LocalHit, 0, 1, 30, "fedcba9876543210");
-    hit.ts = miss.ts - chrono::Duration::seconds(5);
+    hit.ts = miss.ts - jiff::SignedDuration::from_secs(5);
     let meta = diff_meta("x86_64", "", &["a", "b"], &["lib"]);
     let rows = last_miss_rows(&miss, Some(&meta), Some(&hit), Some("salt"));
     let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
@@ -4248,7 +4302,7 @@ fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     let mut same = hit.clone();
     same.cache_key = miss.cache_key.clone();
     let mut later = hit.clone();
-    later.ts = miss.ts + chrono::Duration::seconds(5);
+    later.ts = miss.ts + jiff::SignedDuration::from_secs(5);
     let mut simultaneous = hit.clone();
     simultaneous.ts = miss.ts;
     for hit in [&same, &later, &simultaneous] {
@@ -5072,6 +5126,29 @@ fn stats_summary_shows_every_source_even_when_zero() {
 }
 
 #[test]
+fn stats_sources_name_the_read_only_share_of_local_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let mut snap = StatsSnapshot::default();
+    snap.event_stats.local_hits = 30;
+    snap.event_stats.readonly_hits = 12;
+    snap.event_stats.misses = 10;
+    let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&lines, "Sources").as_deref(),
+        Some(
+            "Sources | local 30 · prefetch 0 · remote 0 · dup 0 · miss 10 | \
+             12 of the local hits from the read-only store"
+        )
+    );
+    // Read-only hits are inside `local_hits`, not added to it.
+    assert_eq!(
+        stats_row(&lines, "Hit rate").as_deref(),
+        Some("Hit rate | 75.0% | 30 of 40 crates from cache")
+    );
+}
+
+#[test]
 fn hit_rate_row_adds_every_outcome() {
     let row = |local, prefetch, remote, dups, misses| {
         let dir = tempfile::tempdir().unwrap();
@@ -5811,7 +5888,7 @@ fn snapshot_from_direct_reads_reflects_store_and_events() {
 fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().join("cache"), None);
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut recent = build_event(
         "serde",
         crate::events::EventResult::LocalHit,
@@ -5820,7 +5897,7 @@ fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
         4096,
         "a",
     );
-    recent.ts = now - chrono::Duration::minutes(10);
+    recent.ts = now - jiff::SignedDuration::from_mins(10);
     let mut old = build_event(
         "tokio",
         crate::events::EventResult::Miss,
@@ -5829,7 +5906,7 @@ fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
         8192,
         "b",
     );
-    old.ts = now - chrono::Duration::hours(3);
+    old.ts = now - jiff::SignedDuration::from_hours(3);
     crate::events::log_event(&config.event_log_path(), &recent).unwrap();
     crate::events::log_event(&config.event_log_path(), &old).unwrap();
 
@@ -6221,7 +6298,7 @@ fn build_event(
     cache_key: &str,
 ) -> crate::events::BuildEvent {
     crate::events::BuildEvent {
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         session_id: String::new(),
         demands: Vec::new(),
         crate_name: crate_name.to_string(),
@@ -6272,6 +6349,7 @@ fn build_event(
         store_error: String::new(),
         store_handed_off: false,
         incremental_seed: String::new(),
+        incremental_seed_attempt: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -6292,6 +6370,7 @@ fn build_event(
         rebuilt_fingerprint: None,
         rebuilt_path: None,
         rebuilt_paths: Vec::new(),
+        readonly_store: false,
     }
 }
 
@@ -6690,8 +6769,8 @@ async fn sync_with_client_push_uploads_local_only_entry() {
 
 #[tokio::test]
 async fn sync_with_client_push_throttles_with_low_concurrency() {
-    // Two local entries with concurrency=1 force the push loop's
-    // max-concurrency wait branch (the second upload waits for the first).
+    // Two local entries still upload when the daemon pool is 1. Sync no longer
+    // uses that pool as its in-flight cap.
     let dir = tempfile::tempdir().unwrap();
     let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
     config.s3_concurrency = 1;
@@ -6974,10 +7053,10 @@ async fn sync_with_client_push_allows_partial_when_flag_set() {
 
 #[tokio::test]
 async fn sync_with_client_pull_throttles_with_low_concurrency() {
-    // Two remote-only keys with concurrency=1 force the pull loop's
-    // max-concurrency wait branch (the second download waits for the first
-    // to drain a slot). Packs are garbage so each download fails fast, but
-    // the throttle path is still exercised; with allow_partial, the sync completes Ok.
+    // Two remote-only keys still download when the daemon pool is 1. Packs are
+    // garbage so each download fails fast; with allow_partial, the sync
+    // completes Ok. The in-flight floor is covered by
+    // `sync_pull_plans_many_present_keys_without_one_head_each`.
     let dir = tempfile::tempdir().unwrap();
     let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
     config.s3_concurrency = 1;
@@ -7019,6 +7098,192 @@ async fn sync_with_client_pull_throttles_with_low_concurrency() {
     .await
     .expect("throttled pull sync should complete Ok with allow_partial");
     assert_eq!(backend.get_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_pull_plans_many_present_keys_without_one_head_each() {
+    // Independent of `SYNC_TRANSFER_JOBS`: a smaller daemon pool must not win,
+    // and a larger one must.
+    assert_eq!(sync_transfer_jobs(0), 32);
+    assert_eq!(sync_transfer_jobs(1), 32);
+    assert_eq!(sync_transfer_jobs(16), 32);
+    assert_eq!(sync_transfer_jobs(31), 32);
+    assert_eq!(sync_transfer_jobs(32), 32);
+    assert_eq!(sync_transfer_jobs(64), 64);
+
+    let present = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    config.s3_concurrency = 1;
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let gate = Arc::new(SyncTransferGate {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut backend = TestBackend::memory();
+    Arc::get_mut(&mut backend).unwrap().transfer_gate = Some(Arc::clone(&gate));
+    let mut present_keys = Vec::new();
+    for index in 0..present {
+        let key = sync_test_cache_key(&format!("present-{index}"));
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
+                b"not a pack".to_vec(),
+            )
+            .await;
+        present_keys.push(key);
+    }
+    let absent = sync_test_cache_key("absent");
+    let outside = sync_test_cache_key("outside-scope");
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/other/{outside}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    let crates = std::collections::HashSet::from(["serde".to_string()]);
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(
+            sync_with_client(
+                &cache_remote,
+                &config,
+                &store,
+                None,
+                true,
+                false,
+                false,
+                false,
+                Some(&crates),
+                false,
+                true,
+            ),
+            async {
+                gate.entered.acquire_many(32).await.unwrap().forget();
+                assert_eq!(
+                    gate.active.load(std::sync::atomic::Ordering::SeqCst),
+                    32,
+                    "a daemon pool of 1 must not keep the pull at one transfer"
+                );
+                gate.release.add_permits(present);
+            }
+        );
+        result.expect("partial pull of invalid packs should succeed");
+    })
+    .await
+    .expect("32 transfers should be in flight before the gate opens");
+    assert_eq!(gate.peak.load(std::sync::atomic::Ordering::SeqCst), 32);
+    let heads = backend.head_calls();
+    assert!(
+        heads.len() < present_keys.len(),
+        "planning {} present keys performed {} HEADs",
+        present_keys.len(),
+        heads.len()
+    );
+    assert_eq!(backend.list_calls(), vec!["prefix/v3/manifests/serde/"]);
+    let gets = backend.get_calls();
+    assert_eq!(gets.len(), present_keys.len());
+    for key in &present_keys {
+        assert!(
+            gets.iter()
+                .any(|call| call.ends_with(&format!("{key}.tar.zst"))),
+            "present key {key} was not downloaded"
+        );
+        assert!(
+            heads.iter().all(|call| !call.contains(key)),
+            "present key {key} was checked with HEAD"
+        );
+    }
+    assert!(
+        gets.iter().all(|call| !call.contains(&absent)),
+        "absent key was downloaded"
+    );
+    assert!(
+        gets.iter().all(|call| !call.contains(&outside)),
+        "key outside the listed prefix was downloaded"
+    );
+
+    // A store that already holds every listed artifact plans no download.
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let backend = TestBackend::memory();
+    let mut imported = Vec::new();
+    for index in 0..8 {
+        let key = sync_test_cache_key(&format!("imported-{index}"));
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
+                build_entry_pack(&key, "serde"),
+            )
+            .await;
+        imported.push(key);
+    }
+    let absent = sync_test_cache_key("still-absent");
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    let pull = |dry_run: bool| {
+        let cache_remote = &cache_remote;
+        let config = &config;
+        let store = &store;
+        let crates = &crates;
+        async move {
+            sync_with_client(
+                cache_remote,
+                config,
+                store,
+                None,
+                true,
+                false,
+                dry_run,
+                false,
+                Some(crates),
+                false,
+                false,
+            )
+            .await
+        }
+    };
+    pull(false)
+        .await
+        .expect("pull of present packs should succeed");
+    for key in &imported {
+        assert!(store.contains(key), "present key {key} was not imported");
+    }
+    assert!(!store.contains(&absent));
+    let gets = backend.get_calls();
+    assert_eq!(gets.len(), imported.len());
+    for key in &imported {
+        assert!(gets.iter().any(|call| call.contains(key)));
+    }
+    assert!(gets.iter().all(|call| !call.contains(&absent)));
+    assert!(
+        backend.head_calls().len() < imported.len(),
+        "planning {} present keys performed {} HEADs",
+        imported.len(),
+        backend.head_calls().len()
+    );
+    let gets_after_import = backend.get_calls().len();
+    let heads_after_import = backend.head_calls().len();
+    pull(false)
+        .await
+        .expect("second pull of a complete store should succeed");
+    assert_eq!(backend.get_calls().len(), gets_after_import);
+    assert_eq!(backend.head_calls().len(), heads_after_import);
 }
 
 /// Build a valid v3 entry pack (tar.zst) for `key`/`crate_name` from a
@@ -8975,7 +9240,7 @@ async fn save_manifest_skipped_when_remote_readonly() {
     let event_log = config.event_log_path();
     std::fs::create_dir_all(event_log.parent().unwrap()).unwrap();
     let event = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": kache_protocol::time::rfc3339(jiff::Timestamp::now()),
         "crate_name": "foo",
         "result": "Miss",
         "elapsed_ms": 100,
@@ -10459,7 +10724,7 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
 
 fn explain_event(result: events::EventResult, secs: i64, key: &str) -> events::BuildEvent {
     let mut event = events::BuildEvent::new_for_test("app", result);
-    event.ts = chrono::DateTime::from_timestamp(1_760_454_000 + secs, 0).unwrap();
+    event.ts = jiff::Timestamp::from_second(1_760_454_000 + secs).unwrap();
     event.cache_key = key.to_string();
     event.elapsed_ms = 1_989;
     event
@@ -11544,7 +11809,7 @@ fn direct_stats_include_rotated_events() {
     let log = config.event_log_path();
     let mut hit =
         crate::events::BuildEvent::new_for_test("archived", crate::events::EventResult::LocalHit);
-    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    hit.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
     for _ in 0..12 {
         crate::events::log_event(&log, &hit).unwrap();
     }
@@ -11662,4 +11927,19 @@ fn compact_stats_label_scheduler_evidence_as_recorded_history() {
     assert!(legacy.longest_scheduler_wait.is_none());
     assert_eq!(legacy.total_flight_wait_ms, 0);
     assert_eq!(legacy.total_permit_wait_ms, 0);
+}
+
+#[test]
+fn doctor_memo_roots_name_this_workspace_and_cargo_home() {
+    // Unit tests run from the package root, which is the workspace root.
+    let roots = doctor_memo_roots();
+    let names: Vec<_> = roots.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["workspace", "Cargo home", "target directory"]);
+    assert_eq!(
+        roots[0].1.canonicalize().unwrap(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(roots[1].1, cargo_home_dir());
 }

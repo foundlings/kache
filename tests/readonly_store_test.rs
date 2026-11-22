@@ -154,6 +154,10 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
         compile(&job, &job_config, &source, &out);
         let warm = last_event(&job);
         assert_eq!(warm["result"], "local_hit", "{rejection}: {warm}");
+        assert!(
+            warm.get("readonly_store").is_none(),
+            "a hit from the job's own store is not a read-only hit: {warm}"
+        );
         assert_eq!(std::fs::read(&metadata).unwrap(), original_metadata);
         drop(owner);
     }
@@ -176,8 +180,9 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
     let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
     let _job_daemon = common::DaemonGuard::new(kache_binary(), &job);
     let host_config = write_config(&host, None);
+    let published = common::cc_published_crate_name("readonly_probe.c");
     compile_cc(&work, &host, &host_config);
-    let cold = last_event_for(&host, "readonly_probe.c");
+    let cold = last_event_for(&host, &published);
     assert_eq!(cold["result"], "miss", "{cold}");
     assert_eq!(
         cold["preprocessor_runs"], 0,
@@ -195,13 +200,29 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
     assert!(host.join("index.db-shm").exists());
     let job_config = write_config(&job, Some(&host));
     compile_cc(&work, &job, &job_config);
-    let hit = last_event_for(&job, "readonly_probe.c");
+    let hit = last_event_for(&job, &published);
     assert_eq!(hit["cache_key"], cold["cache_key"]);
     assert_eq!(hit["result"], "local_hit", "{hit}");
+    assert_eq!(hit["readonly_store"], true, "{hit}");
     assert_eq!(hit["compiler_runs"], 0, "{hit}");
     assert_eq!(
         std::fs::read(work.join("readonly_probe.o")).unwrap(),
         expected_object
+    );
+    let stats = hermetic_command(kache_binary(), &job, Some(&job_config))
+        .args(["stats", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        stats.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(
+        (&stats["local_hits"], &stats["readonly_hits"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{stats}"
     );
     drop(owner);
 }
@@ -210,6 +231,7 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
 #[test]
 fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passthrough() {
     build_kache();
+    let published = common::cc_published_crate_name("readonly_probe.c");
     for read_only in [true, false] {
         let root = tempfile::tempdir().unwrap();
         let work = root.path().join("work");
@@ -223,7 +245,7 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
         let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
         let host_config = write_config(&host, None);
         let output = compile_cc(&work, &host, &host_config);
-        let seed = last_event_for(&host, "readonly_probe.c");
+        let seed = last_event_for(&host, &published);
         assert_eq!(
             seed["result"],
             "miss",
@@ -275,7 +297,7 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
             host_config
         };
         compile_cc(&work, &cache, &config);
-        let first = last_event_for(&cache, "readonly_probe.c");
+        let first = last_event_for(&cache, &published);
         assert_eq!(std::fs::read(&metadata).unwrap(), broken_metadata);
         assert!(object.is_file(), "restore rejection must still compile");
         if read_only {
@@ -314,7 +336,7 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
         }
         std::fs::remove_file(&object).unwrap();
         compile_cc(&work, &cache, &config);
-        let second = last_event_for(&cache, "readonly_probe.c");
+        let second = last_event_for(&cache, &published);
         if read_only {
             assert_eq!(second["result"], "local_hit", "{second}");
             assert_eq!(second["compiler_runs"], 0, "{second}");

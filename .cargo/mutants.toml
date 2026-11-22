@@ -290,9 +290,18 @@ exclude_re = [
     # windows_fingerprint_from_parts decoder and memo eligibility policy have
     # portable tests for all identity, size and timestamp decisions.
     "crates/kache-store/src/file_hash\\.rs:.*\\bwindows_fingerprint\\b",
+    # Off Windows memo_identity_problem always returns None, so replacing it
+    # with None changes nothing Linux can see. The Windows test lane checks a
+    # temporary NTFS directory passes; a kache-store test catches Some(...).
+    "crates/kache-store/src/file_hash\\.rs:.*\\bmemo_identity_problem -> Option<String> with None$",
     # This thread-local failure fixture and its restoration Drop exist only
     # on Windows; they contain no production fingerprint or admission logic.
     "crates/kache-store/src/file_hash\\.rs:.*\\bwith_weak_windows_fingerprints_for_tests(?:::<impl Drop for Restore>::drop)?(?: ->| with|$)",
+    # The Windows boot-time call is cfg(windows), so this Linux lane never
+    # compiles it. The check of what it reads, boot_secs_from_time_of_day,
+    # stays compiled and mutation-tested here; native Windows tests run the
+    # call itself against the machine's own boot.
+    "crates/kache-store/src/file_hash\\.rs:.*\\bwindows_boot_time_secs\\b",
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
     "src/invocation/unix_broker.rs:.*can_track_client",
     "src/fallback.rs:.*compiler_peer_may_delegate",
@@ -308,6 +317,15 @@ exclude_re = [
     # tests check client drive selection and invalid per-drive directories.
     # InvocationEnv's shared resolution and command policy stay in scope.
     "crates/kache-config/src/invocation.rs:.*InvocationEnv::resolve_drive_relative",
+    # A file named under two spellings is a Windows path question too:
+    # plain_spelling is cfg(windows), its stub elsewhere returns None, so
+    # hashed_under_another_spelling returns at its first line on this lane.
+    # Its decision, may_carry_over (settle rule, memo eligibility and the
+    # stamp comparison), is a pure function and stays in scope, as does
+    # hash_and_record. The Windows test
+    # a_windows_file_named_twice_in_one_closure_is_read_once covers the
+    # spellings natively.
+    "src/cache_key\\.rs:.*\\b(plain_spelling|hashed_under_another_spelling)\\b",
     # Like join_inflight_download's deadline: observing < versus <= needs
     # an exact Instant equality. The EOF/exit test covers an alive child
     # both before and beyond the deadline, including the true/== mutants.

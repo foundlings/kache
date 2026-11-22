@@ -345,6 +345,9 @@ struct WorkspaceConfigEnvelope {
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceExtraInputsConfig {
     extra_inputs: Vec<WorkspaceExtraInputsRule>,
+    /// Read by the prediction guard ([`crate::cache_key`]), not here.
+    #[serde(rename = "guard_exclude")]
+    _guard_exclude: Option<toml::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2111,31 +2114,13 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
         return false;
     };
     let base = Path::new(&glob_pattern[..=slash]);
-    // Unix: only absolute paths are rooted. Windows: `Path::is_absolute()` is
-    // false for a bare "/" (it expects a drive), but "/" is still the
-    // current-drive root and walks a huge tree — treat a leading RootDir as
-    // rooted there. Keeping the RootDir arm behind `cfg(windows)` makes the
-    // Linux mutation lane observe a single killable absolute check instead of
-    // an equivalent `||` / `&&` pair.
+    // On Windows a bare `/` would walk the root of the current drive.
     let rooted = path_base_is_rooted(base);
     rooted && base.parent().is_none()
 }
 
 fn path_base_is_rooted(base: &Path) -> bool {
-    if base.is_absolute() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        matches!(
-            base.components().next(),
-            Some(std::path::Component::RootDir)
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    base.has_root()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3148,6 +3133,31 @@ edition = "2021"
             .unwrap()
             .is_none(),
             "propagate_to_dependents=false preserves the direct consumer's legacy key"
+        );
+    }
+
+    #[test]
+    fn workspace_guard_exclude_beside_extra_inputs_parses() {
+        let _lock = crate::config::config_path_lock();
+        let (dir, provider, _, _) = workspace_fixture(false);
+        let config = dir.path().join(".kache.toml");
+        let _config = pin_config(&config);
+        let args = rustc_args(&provider, "macro_provider", None);
+        std::fs::write(&config, "[workspace]\nguard_exclude = ['node_modules']\n").unwrap();
+        assert!(
+            resolve_workspace_snapshot(&args, &FileHasher::new())
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(
+            &config,
+            "[workspace]\nguard_exclude = ['node_modules']\n[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['shared/value.txt']\n",
+        )
+        .unwrap();
+        assert!(
+            resolve_workspace_snapshot(&args, &FileHasher::new())
+                .unwrap()
+                .is_some()
         );
     }
 

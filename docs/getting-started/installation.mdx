@@ -162,6 +162,8 @@ Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rus
 
 Other Rust-supported targets may work through `cargo install`, but they are not release-tested targets.
 
+FreeBSD (x86_64) installs from source with `cargo install kache`. CI checks that it compiles, but there are no prebuilt binaries and the tests do not run on FreeBSD.
+
 ## Shell completions
 
 `kache init` installs completions for your login shell on Unix: Bash, Zsh, or Fish. Open a new terminal after setup. Run `kache init` again after an upgrade to refresh the scripts; `--check` previews changes and `--no-shell` skips them.
@@ -175,6 +177,32 @@ The official AUR packages also install completions for Elvish. For manual setup 
 Follow [Upgrading to v2](/docs/getting-started/upgrade-v2). Finish active builds,
 install the matching pair, keep the existing configuration, and restart the
 daemon. Custom installers and container images must include `kache-engine`.
+
+## Upgrading on Windows
+
+Windows cannot replace a program while it runs. Kache starts its daemon from a
+copy of `kache-engine.exe` in `%LOCALAPPDATA%\kache\daemon-engines`, so `cargo
+install kache` can replace the installed engine even when the build doing the
+install started the daemon.
+
+Some daemons still run the installed file:
+
+- a daemon started by Kache 2.1.1 or earlier
+- the login task that `kache daemon install` sets up
+- a daemon you run yourself with `kache daemon run`
+- a daemon started after copying the engine failed, for example on a full disk
+
+Any of these can make `cargo install` fail at the end with `Access is denied.
+(os error 5)`. Stop every Kache daemon that runs the installed engine, and build
+the upgrade without Kache. `kache daemon stop` stops the daemon for the current
+configuration; run it once for each cache you use.
+
+```powershell
+kache daemon stop
+$env:KACHE_DISABLED = "1"
+cargo install kache --locked
+Remove-Item Env:KACHE_DISABLED
+```
 
 ## Verify the install
 

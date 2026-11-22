@@ -381,7 +381,7 @@ fn probe_args_strip_terminal_formatting_and_preserve_operands() {
         ] {
             let parsed = CcArgs::parse(&s(&[driver, "-c", flag, "a.c", "-O2"])).unwrap();
             assert_eq!(parsed.probe_args(), s(&["-c", "a.c", "-O2"]));
-            assert_eq!(parsed.config_args(), s(&["-c", "-O2"]));
+            assert_eq!(parsed.config_args(), s(&["-c", "\0source-suffix=c", "-O2"]));
             assert!(parsed.rest.iter().any(|arg| arg == flag));
         }
     }
@@ -414,6 +414,66 @@ fn probe_args_strip_terminal_formatting_and_preserve_operands() {
             "-Xclang",
         ])
     );
+}
+
+/// #1981: the `cc -###` record is keyed by `config_args`, and without `-x`
+/// the driver picks the language from the source suffix. A `.S` file and a
+/// `.c` file with the same flags must not share one record.
+#[test]
+fn config_args_separate_sources_of_different_languages() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_eq!(config("t.c"), s(&["-c", "\0source-suffix=c", "-O2"]));
+    assert_eq!(config("t.S"), s(&["-c", "\0source-suffix=S", "-O2"]));
+    assert_ne!(config("t.c"), config("t.S"));
+    // The marker stands where the source stood, so a `-x` keeps applying
+    // only to the inputs after it.
+    let config_of = |args: &[&str]| CcArgs::parse(&s(args)).unwrap().config_args();
+    assert_eq!(
+        config_of(&["cc", "-c", "-x", "c", "t.S"]),
+        s(&["-c", "-x", "c", "\0source-suffix=S"])
+    );
+    assert_eq!(
+        config_of(&["cc", "-c", "t.S", "-x", "c"]),
+        s(&["-c", "\0source-suffix=S", "-x", "c"])
+    );
+}
+
+/// The suffix is kept with its case: `.S` is assembly the preprocessor
+/// runs over, `.s` is plain assembly, `.C` is C++ and `.c` is C.
+#[test]
+fn config_args_keep_the_source_suffix_case() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_ne!(config("t.S"), config("t.s"));
+    assert_ne!(config("t.C"), config("t.c"));
+}
+
+/// One record still serves every TU of a language: only the suffix of a
+/// source path enters `config_args`.
+#[test]
+fn config_args_share_one_record_across_sources_of_one_language() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_eq!(config("a.c"), config("dir/b.c"));
+    assert_eq!(config("x.y/a.cpp"), config("b.cpp"));
+}
+
+/// The marker reads the extension the way `looks_like_source` does: a dot
+/// in a directory name is not a suffix.
+#[test]
+fn source_suffix_marker_keeps_only_the_file_extension() {
+    assert_eq!(source_suffix_marker("dir/t.S"), "\0source-suffix=S");
+    assert_eq!(source_suffix_marker("x.y/unit"), "\0source-suffix=");
 }
 
 #[cfg(unix)]
@@ -3124,7 +3184,7 @@ fn opt_in_link_response_files_are_refused_without_compiler_parsing() {
 }
 
 #[test]
-fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
+fn opt_in_link_keys_preserve_soname_bytes() {
     let _lock = crate::test_support::process_state_test_lock();
     let env = InvocationEnv::capture();
     let dir = tempfile::tempdir().unwrap();
@@ -3147,8 +3207,9 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
         extra_inputs_digest: None,
         build_script_inputs_digest: None,
     };
-    // Unicode 18 assigns U+1ADE a combining class that merges these names
-    // under NFC. The linker embeds their distinct raw SONAME bytes.
+    // The linker embeds the raw SONAME bytes, so canonically equivalent
+    // names must not share a key. Unicode 18 gives U+1ADE a combining class,
+    // which makes the second pair equivalent too.
     let key = |soname: &str| {
         let argv = vec![
             compiler_program.clone(),
@@ -3162,6 +3223,7 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
         assert!(compiler.refuse_reasons(&parsed).is_empty());
         compiler.cache_key(&parsed, &ctx).unwrap()
     };
+    assert_ne!(key("lib\u{00e9}.so"), key("libe\u{0301}.so"));
     assert_ne!(key("q\u{1ade}\u{0323}"), key("q\u{0323}\u{1ade}"));
 }
 
@@ -5543,6 +5605,11 @@ fn assembler_file_reads_and_macros_are_refused() {
     assert_eq!(found(".macro blob f\n.incbin \\f\n.endm"), Some(".incbin"));
     assert_eq!(found(".include \"macros.s\""), Some(".include"));
     assert_eq!(found(".include\"macros.s\""), Some(".include"));
+    // The assembler skips a comment before the operand.
+    assert_eq!(
+        found(r#"__asm__(".incbin/**/\"p.bin\"\n");"#),
+        Some(".incbin")
+    );
 
     assert_eq!(found("opts.include(\"x\");"), None);
     assert_eq!(found("cfg.include = \"x\";"), None);
@@ -5564,14 +5631,51 @@ fn assembler_file_reads_and_macros_are_refused() {
     assert_eq!(found(r#"__asm__(".macro emit\n.endm\n");"#), Some(".macro"));
     assert_eq!(found(".macros x"), None);
     assert_eq!(found("cfg.macro(x);"), None);
-    assert_eq!(found(".endm"), None);
 
     // `.rept` bodies take `\()`, which splits a directive name in two.
     assert_eq!(
         found(".rept 1\n.inc\\()bin \"p.bin\"\n.endr"),
         Some(".rept")
     );
-    assert_eq!(found(".inc\\()bin \"p.bin\""), Some(r"\()"));
+
+    // Openers have spellings the list above lacks, but every body needs its
+    // closing directive: `.irep` is GNU as for `.irp`, `.rep` is `.rept`,
+    // and a count may follow the name with no blank.
+    assert_eq!(
+        found(".irep op,incbin\n.\\op \"p.bin\"\n.endr"),
+        Some(".endr")
+    );
+    for opener in [
+        ".IREPC c,ab",
+        ".irp\"op\",x",
+        ".rept(1)",
+        ".rept-1+2",
+        ".rep~-2",
+        ".REP!0",
+    ] {
+        assert_eq!(
+            found(&format!("{opener}\n.endr")),
+            Some(".endr"),
+            "{opener}"
+        );
+    }
+    assert_eq!(
+        found(".rep(1)\n.rep(1)\n.inc\\\\()()bin \"p.bin\"\n.endr\n.endr"),
+        Some(".endr")
+    );
+    assert_eq!(found(".macro\"emit\"\n.endmacro"), Some(".endmacro"));
+    assert_eq!(found(".endm"), Some(".endm"));
+    // The opener may come from another file; the body still closes here.
+    assert_eq!(found("OPEN\\()bin \"p.bin\"\n.ENDR"), Some(".endr"));
+    assert_eq!(found(".endrx"), None);
+
+    // Outside a body the assembler rejects `\()`, so it is not refused on
+    // its own: libstdc++'s <regex> scanner spells it.
+    assert_eq!(found(".inc\\()bin \"p.bin\""), None);
+    assert_eq!(found(r#"const char* s = ".[\\()*+?{|^$";"#), None);
+    // zstd's sequence fields and comments.
+    assert_eq!(found("outSeqs[i].rep = 0;"), None);
+    assert_eq!(found(" * ZSTD_Sequence.rep is effectively unused."), None);
     assert_eq!(found(".altmacro\n"), Some(".altmacro"));
     assert_eq!(found(".altmacro_x"), None);
 
@@ -5585,6 +5689,28 @@ fn assembler_file_reads_and_macros_are_refused() {
         Some(".incbin")
     );
     assert_eq!(found("void f() { asm((text())); }"), Some("asm((...))"));
+}
+
+/// The compile-first path scans each file as written, before the
+/// preprocessor joins a line that ends in a backslash to the next one.
+#[test]
+fn raw_scan_reads_continued_lines_both_ways() {
+    let found = |text: &str| cc_raw_assembler_hidden_input(text.as_bytes());
+    assert_eq!(found(".inc\\\nbin \"p.bin\""), Some(".incbin"));
+    assert_eq!(found(".inc\\ \t\r\nbin \"p.bin\""), Some(".incbin"));
+    assert_eq!(found(".rep(1)\n.end\\\nr"), Some(".endr"));
+    assert_eq!(
+        found("__asm__(\".inc\\\nbin \\\"p.bin\\\"\");"),
+        Some(".incbin")
+    );
+    // A plain `.s` file is not preprocessed: `.endr` closes a body there.
+    assert_eq!(found(".endr\\\nx"), Some(".endr"));
+    assert_eq!(found("#define F(x) \\\n  ((x) + 1)\n"), None);
+
+    let join = |text: &str| cc_join_continued_lines(text.as_bytes()).map(String::from_utf8);
+    assert_eq!(join("a\\\nb\\ \t\r\nc\\\\\nd"), Some(Ok("abc\\d".into())));
+    assert_eq!(join(r"a\b \ c\"), None);
+    assert_eq!(join("a\\ \rb"), None);
 }
 
 /// C23 delimited escapes survive `-E` as written, so only the string
@@ -5748,6 +5874,14 @@ fn real_probe_refuses_sources_that_incbin_a_file() {
     let repeated = write("rept.S", ".rept 1\n.inc\\()bin \"payload.bin\"\n.endr\n");
     let refused = probe(repeated).unwrap_err().to_string();
     assert!(refused.contains(".rept"), "{refused}");
+
+    let counted = write("count.S", ".rept(1)\n.inc\\()bin \"payload.bin\"\n.endr\n");
+    let refused = probe(counted).unwrap_err().to_string();
+    assert!(refused.contains(".endr"), "{refused}");
+
+    // libstdc++'s <regex> scanner spells this string.
+    let regex = write("regex.c", "const char *special = \".[\\\\()*+?{|^$\";\n");
+    assert!(probe(regex).is_ok());
 
     let split = write(
         "split.c",
@@ -7955,6 +8089,66 @@ fn header_probe_scanner_refuses_conditionals_that_can_paste_an_operator_alias() 
     }
 }
 
+fn cc_header_paste_resolved(text: &[u8]) -> bool {
+    let scan = cc_header_probe_scan(text).unwrap();
+    let aliases = cc_header_probe_aliases(std::iter::once(&scan));
+    let macro_uses = cc_inline_macro_uses(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &macro_uses, &aliases).unwrap()
+}
+
+fn assert_indirect_paste_resolved(text: &str) {
+    assert!(
+        cc_header_paste_resolved(text.as_bytes()),
+        "{text}: paste was refused"
+    );
+    assert_eq!(cc_header_probes(text.as_bytes()), Some(vec![]), "{text}");
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, _) = probing_unit(temp.path(), text);
+    digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source))
+        .unwrap_or_else(|error| panic!("{text}: {error:#}"));
+}
+
+fn assert_indirect_paste_refused(text: &str) {
+    assert!(
+        !cc_header_paste_resolved(text.as_bytes()),
+        "{text}: paste was resolved"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, _) = probing_unit(temp.path(), text);
+    let error = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("token pasting may construct a header availability probe"),
+        "{text}: {error:#}"
+    );
+}
+
+#[test]
+fn header_probe_indirect_numeric_paste_is_not_a_probe_error() {
+    for text in [
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1, 0)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(a, b)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#define FEATURE(name) CAT(FEATURE_, name)\n#if !FEATURE(FOO)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\nint x = CAT(1, 0);\n",
+    ] {
+        assert_indirect_paste_resolved(text);
+    }
+}
+
+#[test]
+fn header_probe_indirect_paste_that_can_spell_has_include_is_refused() {
+    for text in [
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(__has_, include)(<stdint.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(__has_, include_next)(<stdint.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#define HAS(x) __has_include(x)\n#if CAT(H, AS)(<optional.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1, 0, extra)\n#endif\n",
+    ] {
+        assert_indirect_paste_refused(text);
+    }
+}
+
 #[test]
 fn header_probe_scanner_binds_constant_arguments_to_token_paste_helpers() {
     let text = b"#define JOIN3(a,b,c) a##b##c\n#define INT_MAX_FOR(n) JOIN3(INT,n,_MAX)\n#define INT64_MAX 1\n#define HAS(x) __has_include(x)\n#if INT_MAX_FOR(64) && HAS(<optional.h>)\n#endif\n";
@@ -8300,14 +8494,23 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     let temp = tempfile::tempdir().unwrap();
     let (parsed, source, include) =
         probing_unit(temp.path(), "#if __has_include(<optional.h>)\n#endif\n");
-    let target = temp.path().join("target");
+    // Outside every listed directory, so only the probe's own stamp can
+    // notice the target appearing.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("target");
     std::os::unix::fs::symlink(&target, include.join("optional.h")).unwrap();
+    for dir in [&include, &temp.path().to_path_buf()] {
+        settle(dir);
+    }
     let names =
         cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
     let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
     assert!(
-        stamps.is_none(),
-        "a directory stamp cannot prove symlink target availability"
+        stamps.as_ref().is_some_and(|stamps| stamps
+            .iter()
+            .any(|(_, stamp)| *stamp == CcListingStamp::Available(false))),
+        "settled directories vouch for a probed unit, with the probe stamped beside them"
     );
     let compiler = CcCompiler::new();
     compiler
@@ -8316,10 +8519,35 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
             digest,
             names: Some(names),
             stamps,
+            order: None,
         }));
     assert!(compiler.include_dir_names_still_match(&parsed));
     fs::write(&target, "int value;\n").unwrap();
     assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn an_availability_stamp_holds_only_while_the_answer_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("optional.h");
+    assert!(CcListingStamp::Available(false).holds(&candidate));
+    assert!(!CcListingStamp::Available(true).holds(&candidate));
+    fs::write(&candidate, "int x;\n").unwrap();
+    assert!(CcListingStamp::Available(true).holds(&candidate));
+    assert!(!CcListingStamp::Available(false).holds(&candidate));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_absent_stamp_breaks_when_a_dangling_symlink_appears() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let stamp = CcListingStamp::take(&missing).unwrap();
+    assert_eq!(stamp, CcListingStamp::Absent);
+    assert!(stamp.holds(&missing));
+    std::os::unix::fs::symlink(temp.path().join("nowhere"), &missing).unwrap();
+    assert!(!stamp.holds(&missing));
+    assert_eq!(CcListingStamp::take(&missing), None);
 }
 
 #[cfg(unix)]
@@ -9014,6 +9242,7 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
                 digest,
                 names: Some(names.clone()),
                 stamps,
+                order: None,
             }));
         stamped
     };
@@ -9996,6 +10225,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
         fingerprints: vec![input.clone()],
         prefix_maps: Vec::new(),
         captured,
+        shadowing: None,
     };
     let compiler = CcCompiler::new();
     assert!(compiler.captured_preprocess_memo().is_none());
@@ -10712,4 +10942,1271 @@ fn linker_selection_is_keyed_with_warning_outcome_gates() {
         assert_ne!(without_linker, lld_link);
         assert_ne!(lld_link, raw_flags(Some("-fuse-ld=lld")));
     }
+}
+
+#[test]
+fn paste_wildcards_agree_with_regex() {
+    let words = ["__has_include", "x+y", "a.b", "#", "-", "", "0x1ULL"];
+    let mut patterns = vec![
+        "^.*$".to_owned(),
+        "^$".to_owned(),
+        "^.*.*$".to_owned(),
+        "^__has_.*$".to_owned(),
+        "^.*_include$".to_owned(),
+        "^_.*_.*e$".to_owned(),
+        "^__has_include.*_next$".to_owned(),
+        "^aa.*aa$".to_owned(),
+        "^a.*b.*b$".to_owned(),
+    ];
+    for left in words {
+        for right in words {
+            patterns.push(format!(
+                "^{}.*{}$",
+                regex::escape(left),
+                regex::escape(right)
+            ));
+            patterns.push(format!("^{}{}$", regex::escape(left), regex::escape(right)));
+        }
+    }
+    let texts = [
+        "ab",
+        "abb",
+        "__has_include",
+        "__has_include_next",
+        "aa",
+        "aaa",
+        "aaaa",
+        "x+y",
+        "a.b",
+        "axb",
+        "#-",
+        "",
+        "0x1ULL",
+    ];
+    for pattern in &patterns {
+        let pieces = cc_paste_wildcards(pattern).expect("scanner-shaped pattern");
+        let regex = regex::Regex::new(pattern).unwrap();
+        for text in texts {
+            assert_eq!(
+                cc_paste_wildcards_match(&pieces, text),
+                regex.is_match(text),
+                "{pattern} against {text:?}"
+            );
+        }
+    }
+    for other in [
+        "^a+$", "^\\d$", "^\\<a$", "^\\☃$", "^a.b$", "^(a)$", "a.*", "^a|b$",
+    ] {
+        assert!(cc_paste_wildcards(other).is_none(), "{other}");
+    }
+}
+
+#[test]
+fn parsed_header_scans_are_shared_across_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = dir.path().join("probe.h");
+    // The path makes the bytes, and so the shared entry, unique to this test.
+    fs::write(
+        &header,
+        format!(
+            "// {}\n#if __has_include(<optional.h>)\n#endif\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let first = cc_parsed_header_scans(
+        std::slice::from_ref(&header),
+        &[],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    let probes = |scan: &CcParsedScan| {
+        cc_resolve_header_probes(
+            scan.as_ref().as_ref().unwrap(),
+            &cc_header_probe_aliases(std::iter::empty()),
+        )
+    };
+    assert_eq!(
+        probes(&first[0].1),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    let later = cc_parsed_header_scans(
+        &[header.clone(), header],
+        &[],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first[0].1, &later[0].1));
+    assert!(std::sync::Arc::ptr_eq(&later[0].1, &later[1].1));
+}
+
+#[test]
+fn a_stored_shadowing_derivation_is_reused_only_for_its_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    fs::create_dir_all(cwd.join("include")).unwrap();
+    fs::write(
+        cwd.join("include/probe.h"),
+        "#define HAS(x) __has_include(x)\n#if HAS(<optional.h>)\n#endif\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("include/plain.h"), "int plain;\n").unwrap();
+    fs::write(cwd.join("unit.c"), "#include <probe.h>\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        Vec::<(&str, &str)>::new(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let parsed = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let inputs = [
+        PathBuf::from("unit.c"),
+        cwd.join("include/probe.h"),
+        cwd.join("include/plain.h"),
+    ];
+    let (fresh, derived) = cc_shadowing_names_reusing(&parsed, &inputs, &hasher, None).unwrap();
+    let derived = derived.expect("computed without a stored value");
+    assert!(
+        fresh
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("optional.h"))
+    );
+    let digest = |names: &CcShadowingNames| digest_cc_shadowing_names(&parsed, names).unwrap();
+    // Listed in another order, the same bytes reuse it and agree.
+    let reordered = [inputs[2].clone(), inputs[0].clone(), inputs[1].clone()];
+    let (reused, again) =
+        cc_shadowing_names_reusing(&parsed, &reordered, &hasher, Some(&derived)).unwrap();
+    assert!(again.is_none(), "a matching derivation is reused");
+    assert_eq!(digest(&reused), digest(&fresh));
+    assert_eq!(reused.probes.len(), fresh.probes.len());
+    // Different bytes do not.
+    fs::write(
+        cwd.join("include/plain.h"),
+        "#if __has_include(<other.h>)\n#endif\n",
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let (changed, recomputed) =
+        cc_shadowing_names_reusing(&parsed, &inputs, &hasher, Some(&derived)).unwrap();
+    assert!(
+        recomputed.is_some(),
+        "a derivation for other bytes is ignored"
+    );
+    assert!(
+        changed
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("other.h"))
+    );
+    // Nor do different definitions.
+    let defined = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-DX=1", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let (_, redone) =
+        cc_shadowing_names_reusing(&defined, &inputs, &hasher, recomputed.as_deref()).unwrap();
+    assert!(redone.is_some());
+}
+
+#[test]
+fn parsed_scan_cache_stays_within_its_limit() {
+    let scan = || CcParsedScan::new(None);
+    let mut cache = CcParsedScans::default();
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert!(cache.admit("b".into(), scan(), 6, 10).is_none());
+    assert_eq!(cache.weight, 10, "filling exactly to the limit keeps both");
+    // Held already: no double count, nothing evicted.
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert_eq!(cache.weight, 10);
+    // Larger than the whole limit: never held.
+    assert!(cache.admit("huge".into(), scan(), 11, 10).is_none());
+    assert!(!cache.scans.contains_key("huge"));
+    // One more byte starts over with only the newcomer.
+    let evicted = cache.admit("c".into(), scan(), 1, 10).unwrap();
+    assert_eq!(evicted.scans.len(), 2);
+    assert_eq!(cache.weight, 1);
+    assert!(cache.scans.contains_key("c") && cache.scans.len() == 1);
+    // A scan weighing exactly the whole limit still fits.
+    let mut whole = CcParsedScans::default();
+    assert!(whole.admit("w".into(), scan(), 10, 10).is_none());
+    assert!(whole.scans.contains_key("w"));
+}
+
+#[test]
+fn parsed_scan_weight_counts_key_text_and_overhead() {
+    assert_eq!(cc_parsed_scan_weight("", "", 0), 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz", 0), 2 + 2 * 3 + 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz", 5), 2 + 2 * (3 + 5) + 128);
+    assert_eq!(
+        cc_stored_macros_len(&[("AB".into(), "wxyz".into()), ("C".into(), "[]".into())]),
+        2 + 4 + 1 + 2
+    );
+    assert_eq!(
+        CcMacrosMissing(vec!["a".into(), "b".into()]).to_string(),
+        "cc: stored macro definitions of 2 header scans are missing"
+    );
+}
+
+#[test]
+fn a_newline_alias_keeps_regex_semantics() {
+    let macros = std::collections::HashMap::new();
+    let pastes = std::collections::HashMap::new();
+    // Verdicts are remembered for one alias set, so each set gets its own.
+    let spells = |alias: &str| {
+        CcPasteForwarding {
+            macros: &macros,
+            pastes: &pastes,
+            verdicts: Default::default(),
+        }
+        .spells_alias("^a.*b$", &HashSet::from([alias.to_owned()]))
+        .unwrap()
+    };
+    // `.` stops at a newline in a regex; a wildcard would not.
+    assert!(!spells("a\nb"));
+    assert!(spells("axb"));
+}
+
+#[test]
+fn header_scans_keep_one_bare_use_per_name_and_every_probe() {
+    let text = b"#if PREFIX\n#endif\n#if PREFIX\n#endif\n#if PREFIX\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n#if defined(Z) && Z\n#endif\n#if defined(Z) && Z\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n";
+    let scan = cc_header_probe_scan(text).unwrap();
+    let bare = |name: &str| {
+        scan.uses
+            .iter()
+            .filter(|(used, probe)| used == name && probe.is_none())
+            .count()
+    };
+    assert_eq!(bare("PREFIX"), 1);
+    assert_eq!(bare("if"), 1);
+    assert_eq!(
+        scan.conditionals.iter().filter(|c| c.name == "Z").count(),
+        1
+    );
+    // Both probes stay, in order: they are what a unit's resolution folds.
+    let probes = cc_resolve_header_probes(&scan, &cc_header_probe_aliases(std::iter::empty()));
+    let x = CcHeaderProbe {
+        name: "x.h".into(),
+        quoted: false,
+    };
+    assert_eq!(probes, Some(vec![x.clone(), x]));
+}
+
+/// Stored scans keep macro definitions apart. A unit loads the ones its
+/// conditionals reach, across headers, and none of a symbol table nothing
+/// tests.
+#[test]
+fn stored_scans_load_only_the_macros_a_conditional_reaches() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    fs::create_dir_all(cwd.join("include")).unwrap();
+    // Unique text: the process-wide cache must not already hold these.
+    let tag = format!("{:x}", std::process::id()) + &format!("{:?}", std::time::Instant::now());
+    let tag: String = tag.chars().filter(char::is_ascii_alphanumeric).collect();
+    let mut table = format!("#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n// {tag}\n");
+    for n in 0..50 {
+        table.push_str(&format!("#define SYM_{n} CAT(PREFIX_, SYM_{n})\n"));
+    }
+    fs::write(cwd.join("include/table.h"), &table).unwrap();
+    fs::write(
+        cwd.join("include/benign.h"),
+        format!("// {tag}\n#if CAT(1, 0)\n#endif\n"),
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("include/probe.h"),
+        format!("// {tag}\n#if CAT(__has_, include)(<stdint.h>)\n#endif\n"),
+    )
+    .unwrap();
+    fs::write(cwd.join("unit.c"), "int unit;\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        Vec::<(&str, &str)>::new(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let parsed = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let db = root.path().join("index.sqlite");
+    let inputs = |header: &str| {
+        [
+            PathBuf::from("unit.c"),
+            cwd.join("include/table.h"),
+            cwd.join("include").join(header),
+        ]
+    };
+    // Scan once so the store holds them, then forget the parsed scans.
+    for header in ["benign.h", "probe.h"] {
+        let hasher = crate::cache_key::FileHasher::persistent(&db);
+        let _ = cc_shadowing_names_reusing(&parsed, &inputs(header), &hasher, None);
+    }
+    for path in inputs("benign.h").iter().chain(&inputs("probe.h")[2..]) {
+        let content = blake3::hash(&fs::read(cwd.join(path)).unwrap())
+            .to_hex()
+            .to_string();
+        cc_parsed_scans().scans.remove(&content);
+    }
+
+    // The unit's own source was scanned, never stored.
+    let hash_of = |path: &Path| {
+        blake3::hash(&fs::read(cwd.join(path)).unwrap())
+            .to_hex()
+            .to_string()
+    };
+    let (source, table) = (
+        hash_of(Path::new("unit.c")),
+        hash_of(Path::new("include/table.h")),
+    );
+    let stored = kache_store::file_hash::FileHashCache::open(&db)
+        .unwrap()
+        .get_cc_header_scans(CC_HEADER_SCAN_VERSION, &[&source, &table])
+        .unwrap();
+    assert!(!stored.contains_key(&source) && stored.contains_key(&table));
+    let hasher = crate::cache_key::FileHasher::persistent(&db);
+    let absolute = inputs("benign.h").map(|path| cwd.join(path));
+    let scans = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
+    assert!(
+        scans[1..]
+            .iter()
+            .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart)),
+        "headers read back from the store"
+    );
+    let reached = cc_reached_macro_uses(&scans, &CcHeaderProbeScan::default(), &hasher)
+        .unwrap()
+        .unwrap();
+    let mut names: Vec<_> = reached.keys().map(|(_, name)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["CAT", "CAT_"], "the symbol table is never loaded");
+    cc_shadowing_names_reusing(&parsed, &inputs("benign.h"), &hasher, None).unwrap();
+
+    // The constructor lives in another header than the conditional.
+    let refused = |hasher: &crate::cache_key::FileHasher<'_>| {
+        let error = cc_shadowing_names_reusing(&parsed, &inputs("probe.h"), hasher, None)
+            .err()
+            .expect("a pasted probe must be refused from stored scans");
+        assert!(
+            format!("{error:#}")
+                .contains("token pasting may construct a header availability probe"),
+            "{error:#}"
+        );
+    };
+    refused(&hasher);
+
+    // Cores this process holds outlive the rows they were read with: once
+    // pruned, the proof must not run without the definitions.
+    let absolute = inputs("probe.h").map(|path| cwd.join(path));
+    let held = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
+    assert!(
+        held[1..]
+            .iter()
+            .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart))
+    );
+    kache_store::file_hash::FileHashCache::open(&db)
+        .unwrap()
+        .prune_cc_preprocess_memos()
+        .unwrap();
+    let reached = cc_reached_macro_uses(&held, &CcHeaderProbeScan::default(), &hasher);
+    assert!(matches!(reached, Ok(Err(CcMacrosMissing(_)))));
+    refused(&hasher);
+}
+
+/// Nothing a unit records about its own source helps another unit, so a
+/// captured read set records its headers only.
+#[test]
+fn a_captured_read_set_records_its_headers_but_not_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    // A canonical Windows path starts with `\\?\`. The depfile parser treats
+    // `\\` as one backslash, so that spelling does not name the written file.
+    let root = dir.path();
+    let source = root.join("unit.c");
+    let header = root.join("shared.h");
+    // Above the size the file-hash memo keeps rows for.
+    std::fs::write(&source, vec![b' '; 70_000]).unwrap();
+    std::fs::write(&header, vec![b'\n'; 70_000]).unwrap();
+    let depfile = root.join("unit.d");
+    let make = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
+    std::fs::write(
+        &depfile,
+        format!("unit.o: {} {}\n", make(&source), make(&header)),
+    )
+    .unwrap();
+    let map = format!("-ffile-prefix-map={}=.", root.display());
+    let source_arg = source.to_string_lossy().into_owned();
+    let parsed = CcArgs::parse(&s(&["cc", &map, "-c", &source_arg])).unwrap();
+    let db = root.join("index.db");
+    let file_hasher = crate::cache_key::FileHasher::persistent(&db);
+    let inputs = CcCompiler::new()
+        .captured_inputs(&parsed, &depfile, &file_hasher)
+        .expect("keyed from its read set");
+    file_hasher.flush_memo_as_if_settled();
+    let content = |path: &Path| {
+        inputs
+            .iter()
+            .find(|input| Path::new(input.local_path()).file_name() == path.file_name())
+            .map(|input| input.content.clone())
+            .unwrap()
+    };
+    let (source_content, header_content) = (content(&source), content(&header));
+    let cache = kache_store::file_hash::FileHashCache::open(&db).unwrap();
+    let asm = cache
+        .get_cc_asm_scans(&[&source_content, &header_content])
+        .unwrap();
+    assert!(asm.contains_key(&header_content) && !asm.contains_key(&source_content));
+    let maps = cc_prefix_maps_key(&cc_prefix_maps(&parsed, &[]));
+    let mapped = cache
+        .get_cc_mapped_hashes(&maps, &[&source_content, &header_content])
+        .unwrap();
+    assert!(mapped.contains_key(&header_content) && !mapped.contains_key(&source_content));
+    let next = crate::cache_key::FileHasher::persistent(&db);
+    // Windows memoises a hash only with a file identity it may not have.
+    if cfg!(not(windows)) {
+        next.hash(&header).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the header's hash was memoised");
+        next.hash(&source).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the source's was not");
+    }
+}
+
+/// Keys `unit.c` under the `-I` operands `dirs` and then `extra` (what
+/// precedes a `--` in `extra` goes before the run), from a
+/// captured read set, with a fixture compiler whose resolved invocation
+/// echoes its argv.
+#[cfg(unix)]
+fn key_with_include_order(
+    root: &Path,
+    dirs: &[&str],
+    extra: &[&str],
+    read: &[&str],
+) -> (String, CcCompiler, CcArgs) {
+    let (before, extra) = match extra.iter().position(|arg| *arg == "--") {
+        Some(split) => (&extra[..split], &extra[split + 1..]),
+        None => (&[][..], extra),
+    };
+    let program = root.join("cc");
+    if !program.exists() {
+        kache_fs::testutil::write_executable(
+            &program,
+            r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) shift; printf '"cc1"' >&2; for arg do printf ' "%s"' "$arg" >&2; done; printf '\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+        );
+    }
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let mut argv = vec![program.to_string_lossy().into_owned(), "-c".into()];
+    argv.extend(before.iter().map(|arg| arg.to_string()));
+    argv.extend(dirs.iter().map(|dir| format!("-I{dir}")));
+    argv.extend(extra.iter().map(|arg| arg.to_string()));
+    argv.extend(["unit.c".into(), "-o".into(), "unit.o".into()]);
+    let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let fingerprints = hasher
+        .cc_preprocess_fingerprints(
+            &read
+                .iter()
+                .map(|path| {
+                    let path = root.join(path);
+                    (cc_mapped_path(&path, &maps), path)
+                })
+                .collect::<Vec<_>>(),
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let compiler = CcCompiler::new().with_invocation_env(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    // Outside `root`, so keying leaves its listings settled.
+    let cache = tempfile::tempdir().unwrap();
+    let outcome = compiler
+        .cache_key_with(
+            &parsed,
+            &KeyCtx {
+                invocation_env: &env,
+                file_hasher: &hasher,
+                path_normalizer: &normalizer,
+                cache_dir: cache.path(),
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            CcKeyDiscovery::Captured(CcCapturedInputs {
+                fingerprints,
+                path_bound: false,
+                inputs_changed: false,
+            }),
+        )
+        .unwrap();
+    let key = match outcome {
+        CcKeyOutcome::Key(key) => key,
+        CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+    };
+    (key, compiler, parsed)
+}
+
+#[cfg(unix)]
+#[test]
+fn reordered_include_dirs_share_a_key_only_when_order_cannot_matter() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // (case, files, read set, extra args, order can matter)
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [&'a str],
+        &'a [&'a str],
+        bool,
+    );
+    let cases: &[Case] = &[
+        (
+            "distinct names",
+            &[("unit.c", "#include <a.h>\n#include <b.h>\n")],
+            &["unit.c", "a/a.h", "b/b.h"],
+            &[],
+            false,
+        ),
+        (
+            "a looked-up name in two run directories",
+            &[("unit.c", "#include <a.h>\n"), ("b/a.h", "int b;\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a nested name in two run directories",
+            &[
+                ("unit.c", "#include <sub/x.h>\n"),
+                ("a/sub/x.h", "int a;\n"),
+                ("b/sub/x.h", "int b;\n"),
+            ],
+            &["unit.c", "a/sub/x.h"],
+            &[],
+            true,
+        ),
+        (
+            "a nested name only one run directory has in full",
+            &[
+                ("unit.c", "#include <sub/x.h>\n"),
+                ("a/sub/x.h", "int a;\n"),
+                ("b/sub/y.h", "int b;\n"),
+            ],
+            &["unit.c", "a/sub/x.h"],
+            &[],
+            false,
+        ),
+        (
+            "a duplicate only included beside its includer",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include \"p.h\"\n#include \"./q.h\"\n"),
+                ("a/p.h", "int a;\n"),
+                ("b/p.h", "int b;\n"),
+                ("a/q.h", "int a;\n"),
+                ("b/q.h", "int b;\n"),
+            ],
+            &["unit.c", "a/a.h", "a/p.h", "a/q.h"],
+            &[],
+            false,
+        ),
+        (
+            "a quoted duplicate not found beside its includer",
+            &[
+                ("unit.c", "#include \"p.h\"\n"),
+                ("a/p.h", "int a;\n"),
+                ("b/p.h", "int b;\n"),
+            ],
+            &["unit.c", "a/p.h"],
+            &[],
+            true,
+        ),
+        (
+            "#include_next in a run directory",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include_next <b.h>\n"),
+            ],
+            &["unit.c", "a/a.h", "b/b.h"],
+            &[],
+            true,
+        ),
+        (
+            "__has_include_next in a run directory",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#if __has_include_next(<b.h>)\n#endif\n"),
+            ],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "#include_next outside every user directory",
+            &[
+                ("unit.c", "#include <s.h>\n#include <a.h>\n"),
+                ("s/s.h", "#include_next <s.h>\n"),
+            ],
+            &["unit.c", "s/s.h", "a/a.h"],
+            &["-isystem", "s"],
+            false,
+        ),
+        (
+            "a plain command-line definition",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-DPLAIN=1"],
+            false,
+        ),
+        (
+            "__has_include_next in a command-line definition",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-DNEXT=__has_include_next"],
+            true,
+        ),
+        (
+            "a quoted #include_next ahead of the run",
+            &[
+                ("unit.c", "#include <w.h>\n"),
+                ("p/w.h", "#include \"x.h\"\n#include_next \"x.h\"\n"),
+                ("p/x.h", "\n"),
+                ("a/x.h", "int a;\n"),
+                ("b/x.h", "int b;\n"),
+            ],
+            &["unit.c", "p/w.h", "p/x.h", "a/x.h"],
+            &["-Ip", "-DSEP=1", "--"],
+            true,
+        ),
+        (
+            "a ./ operand two run directories provide",
+            &[("unit.c", "#include <./a.h>\n"), ("b/a.h", "int b;\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a computed include",
+            &[("unit.c", "#define H <a.h>\n#include H\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a parent-directory operand",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include \"../c/c.h\"\n"),
+            ],
+            &["unit.c", "a/a.h", "c/c.h"],
+            &[],
+            true,
+        ),
+        (
+            "an absolute operand",
+            &[("unit.c", "#include <a.h>\n#include \"/nonexistent/p.h\"\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            false,
+        ),
+        (
+            "an absent run directory",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Id"],
+            false,
+        ),
+        (
+            "a run directory below a file",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Ia/a.h/sub"],
+            true,
+        ),
+    ];
+    for (case, files, read, extra, order_matters) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for (path, content) in [
+            ("a/a.h", "int a;\n"),
+            ("b/b.h", "int b;\n"),
+            ("c/c.h", "int c;\n"),
+        ]
+        .iter()
+        .chain(files.iter())
+        {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let key = |dirs: &[&str]| key_with_include_order(&root, dirs, extra, read).0;
+        let sorted = key(&["a", "b", "c"]);
+        assert_eq!(key(&["a", "b", "c"]), sorted, "{case}: unstable key");
+        assert_eq!(
+            key(&["b", "a", "c"]) != sorted,
+            *order_matters,
+            "{case}: order_matters={order_matters}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn include_order_keys_track_the_search_path_itself() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <a.h>\n"),
+        ("a/a.h", "int a;\n"),
+        ("b/b.h", "int b;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let read = ["unit.c", "a/a.h"];
+    let key = |dirs: &[&str]| key_with_include_order(&root, dirs, &[], &read).0;
+    // Two directories are the smallest run; a repeat is searched once.
+    assert_eq!(key(&["b", "a"]), key(&["a", "b"]));
+    assert_eq!(key(&["a", "b", "a"]), key(&["b", "a", "a"]));
+    // A different set of directories is a different search path.
+    assert_ne!(key(&["a"]), key(&["a", "b"]));
+    // The source's own directory in the run lists every subdirectory.
+    assert_eq!(key(&[".", "a"]), key(&["a", "."]));
+
+    // A symlinked run directory can stand for another one.
+    std::os::unix::fs::symlink(root.join("a"), root.join("l")).unwrap();
+    assert_ne!(key(&["l", "b"]), key(&["b", "l"]));
+    // So can a file operand, such as a header map.
+    fs::write(root.join("m"), "map").unwrap();
+    assert_ne!(key(&["m", "b"]), key(&["b", "m"]));
+
+    // A header appearing during the compile that would now shadow `a/a.h`
+    // under the argv order must stop the store.
+    let (_, compiler, parsed) = key_with_include_order(&root, &["b", "a"], &[], &read);
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(root.join("b/a.h"), "int shadow;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn include_order_sorts_only_adjacent_reorderable_operands() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let order = |args: &[&str]| {
+        let mut argv = vec!["cc", "-c"];
+        argv.extend(args);
+        argv.extend(["unit.c", "-o", "unit.o"]);
+        let parsed = CcArgs::parse_for(&s(&argv), &env).unwrap();
+        cc_include_order(&parsed, &cc_prefix_maps(&parsed, &[]))
+    };
+    let canonical = |args: &[&str]| {
+        let order = order(args).expect("reorderable");
+        (order.canonical.rest, order.canonical.includes)
+    };
+    let sorted = canonical(&["-Ia", "-Ib", "-DX", "-Ic"]);
+    assert_eq!(
+        sorted.0,
+        s(&["-c", "-Ia", "-Ib", "-DX", "-Ic", "unit.c", "-o", "unit.o"])
+    );
+    assert_eq!(sorted.1, ["a", "b", "c"].map(PathBuf::from));
+    assert_eq!(canonical(&["-Ib", "-Ia", "-DX", "-Ic"]), sorted);
+    let separate = canonical(&["-I", "b", "-I", "a"]);
+    assert_eq!(
+        separate.0,
+        s(&["-c", "-I", "a", "-I", "b", "unit.c", "-o", "unit.o"])
+    );
+    assert_eq!(separate.1, ["a", "b"].map(PathBuf::from));
+    assert_ne!(
+        order(&["-Ib", "-Ia"]).unwrap().argv_order,
+        order(&["-Ia", "-Ib"]).unwrap().argv_order
+    );
+    assert_eq!(order(&["-Ib", "-Ia", "-Ib"]).unwrap().run_dirs.len(), 2);
+    let spelled_twice = format!("-I{}", cwd.join("a").display());
+    for args in [
+        &["-Ia"][..],
+        &["-Ia", "-DX", "-Ib"],
+        &["-Ia", "-I../b"],
+        &["-Ia", "-I-"],
+        &["-Ia", "-Ib", "-isystem", "b"],
+        &["-Xclang", "-Ia", "-Ib"],
+        &["-Ia", &spelled_twice],
+        &["-Ia", "-I=b"],
+        &["-Ia", "-I$SYSROOT/b"],
+    ]
+    .into_iter()
+    // `/usr/include` is a system root only where it exists.
+    .chain(cfg!(unix).then_some(&["-Ia", "-I/usr/include"][..]))
+    {
+        assert!(order(args).is_none(), "{args:?} must keep its order");
+    }
+}
+
+#[test]
+fn include_operands_are_read_from_the_directive() {
+    let scan = |text: &str| cc_header_probe_scan(text.as_bytes()).unwrap();
+    let plain = scan("#include <a/b.h>\n# import \"c.h\" // note\n%:include \"d.h\"\n");
+    assert_eq!(
+        plain.includes,
+        [("a/b.h", false), ("c.h", true), ("d.h", true)].map(|(n, q)| (n.to_string(), q))
+    );
+    // `#include_next` never starts beside its includer.
+    assert_eq!(
+        scan("#include_next \"x.h\"\n").includes,
+        [("x.h".to_string(), false)]
+    );
+    assert!(!plain.searches_next && !plain.unplaced_include);
+    // Twice, so a toggled flag would read as unset.
+    assert!(scan("#include_next <a.h>\n#include_next <b.h>\n").searches_next);
+    assert!(
+        scan("#define N __has_include_next\n#if __has_include_next(<a.h>)\n#endif\n").searches_next
+    );
+    assert!(scan("#include H\n#include G\n").unplaced_include);
+    for unplaced in [
+        "#include H\n",
+        "#include <..\\a.h>\n",
+        "#include \"../a.h\"\n",
+        "#include <>\n",
+        "#include\n",
+    ] {
+        assert!(scan(unplaced).unplaced_include, "{unplaced:?}");
+    }
+}
+
+/// A memo recorded under one `-I` order answers the other, and only while
+/// the order cannot matter. The fixture compiler cannot preprocess, so a
+/// rejected memo fails the key.
+#[cfg(unix)]
+#[test]
+fn a_cc_memo_is_shared_across_include_orders_only_when_order_cannot_matter() {
+    use kache_store::file_hash::FileHashCache;
+
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <a.h>\n"),
+        ("a/a.h", "int a;\n"),
+        ("b/b.h", "int b;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let program = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) shift; printf '"cc1"' >&2; for arg do printf ' "%s"' "$arg" >&2; done; printf '\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let cache = FileHashCache::open(&root.join("index.db")).unwrap();
+    let hasher =
+        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(cache.db()), &env);
+    let parse = |dirs: &[&str]| {
+        let mut argv = vec![program.to_string_lossy().into_owned(), "-c".into()];
+        argv.extend(dirs.iter().map(|dir| format!("-I{dir}")));
+        argv.extend(["unit.c".into(), "-o".into(), "unit.o".into()]);
+        CcArgs::parse_for(&argv, &env).unwrap()
+    };
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key = |compiler: &CcCompiler, parsed: &CcArgs, discovery| -> Result<String> {
+        match compiler.cache_key_with(
+            parsed,
+            &KeyCtx {
+                invocation_env: &env,
+                file_hasher: &hasher(),
+                path_normalizer: &normalizer,
+                cache_dir: &root.join("cache"),
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            discovery,
+        )? {
+            CcKeyOutcome::Key(key) => Ok(key),
+            CcKeyOutcome::Deferred(_) => panic!("a recorded memo must produce a key"),
+        }
+    };
+    let recorded = parse(&["a", "b"]);
+    let maps = cc_prefix_maps(&recorded, &[]);
+    let fingerprints = hasher()
+        .cc_preprocess_fingerprints(
+            &["unit.c", "a/a.h"].map(|path| {
+                let path = root.join(path);
+                (cc_mapped_path(&path, &maps), path)
+            }),
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let compiler = CcCompiler::new().with_invocation_env(&env);
+    let captured = key(
+        &compiler,
+        &recorded,
+        CcKeyDiscovery::Captured(CcCapturedInputs {
+            fingerprints,
+            path_bound: false,
+            inputs_changed: false,
+        }),
+    )
+    .unwrap();
+    compiler.commit_preprocess_memo(&hasher());
+
+    let reordered = parse(&["b", "a"]);
+    let lookup = CcCompiler::new().with_invocation_env(&env);
+    assert_eq!(
+        key(&lookup, &reordered, CcKeyDiscovery::Expansion).unwrap(),
+        captured
+    );
+    // `b/a.h` would win for `<a.h>` under `-Ib -Ia`, so the memo recorded
+    // under `-Ia -Ib` must not answer it.
+    fs::write(root.join("b/a.h"), "int shadow;\n").unwrap();
+    assert!(key(&lookup, &reordered, CcKeyDiscovery::Expansion).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn include_order_names_carry_what_the_order_check_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <x.h>\n"),
+        ("a/sub/x.h", "#include_next <x.h>\n"),
+        ("b/y.h", "#include H\n"),
+        ("b/z.h", "#include G\n"),
+        ("b/w.h", "int w;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let parsed = |args: &[&str]| {
+        let mut argv = vec!["cc", "-c", "-Ia", "-Ia/sub", "-Ib"];
+        argv.extend(args);
+        argv.extend(["unit.c", "-o", "unit.o"]);
+        CcArgs::parse_for(&s(&argv), &env).unwrap()
+    };
+    let names = |parsed: &CcArgs, read: &[&str]| {
+        let read = read.iter().map(|path| root.join(path)).collect::<Vec<_>>();
+        cc_shadowing_names(parsed, &read, &crate::cache_key::FileHasher::new_for(&env)).unwrap()
+    };
+    let plain = parsed(&[]);
+    let clean = names(&plain, &["unit.c", "b/w.h"]);
+    assert!(!clean.unplaced && clean.searches_next.is_empty());
+    assert!(!clean.definitions_search_next);
+    let all = names(&plain, &["unit.c", "a/sub/x.h", "b/y.h", "b/z.h"]);
+    assert!(all.unplaced);
+    assert_eq!(all.searches_next, [root.join("a/sub/x.h")]);
+    for reached in ["sub/x.h", "x.h", "y.h", "a/sub/x.h"] {
+        assert!(all.reached_as.contains(Path::new(reached)), "{reached}");
+    }
+    assert_eq!(all.read_inputs.len(), 4);
+    let defined = names(&parsed(&["-DN=__has_include_next"]), &["unit.c"]);
+    assert!(defined.definitions_search_next);
+
+    // The fast path answers from names alone: with the read inputs gone, the
+    // operand check could not run.
+    let order = cc_include_order(&plain, &cc_prefix_maps(&plain, &[])).unwrap();
+    let mut gone = clean.clone();
+    gone.read_inputs = vec![root.join("missing.h")];
+    let mut listings = CcDirectoryListings::default();
+    assert!(cc_include_order_free(&plain, &order, &gone, &mut listings, None).unwrap());
+    gone.unplaced = true;
+    assert!(cc_include_order_free(&plain, &order, &gone, &mut listings, None).is_err());
+}
+
+/// The store-time recheck trusts stamps only when they cover every directory
+/// the order check listed, nested ones included.
+#[cfg(unix)]
+#[test]
+fn include_order_stamps_cover_the_run_directories_it_listed() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <sub/x.h>\n"),
+        ("a/sub/x.h", "int a;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    fs::create_dir_all(root.join("b/sub")).unwrap();
+    let read = ["unit.c", "a/sub/x.h"];
+    key_with_include_order(&root, &["b", "a"], &[], &read);
+    for dir in ["", "a", "b", "a/sub", "b/sub"] {
+        settle(&root.join(dir));
+    }
+    let (_, compiler, parsed) = key_with_include_order(&root, &["b", "a"], &[], &read);
+    let stamped = |dir: &str| {
+        let pending = compiler.pending_include_dir_digest.borrow();
+        let stamps = pending.as_ref().unwrap().stamps.as_ref().expect("settled");
+        stamps.iter().any(|(stamped, _)| stamped == &root.join(dir))
+    };
+    assert!(stamped("b/sub"), "the order check listed `b/sub`");
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(root.join("b/sub/x.h"), "int b;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn only_the_nix_store_and_profiles_are_system_paths() {
+    for (path, system) in [
+        ("/nix/store/abc-clang/include/stddef.h", true),
+        ("/nix/var/nix/profiles/default/include/zlib.h", true),
+        ("/nix/var/nix/builds/nix-1-2/source/a/a.h", false),
+        ("/nix", false),
+        ("/usr/include/stdio.h", true),
+        ("/Users/me/src/a.h", false),
+    ] {
+        assert_eq!(cc_system_path(path), system, "{path}");
+    }
+}
+
+/// #1946: gcc's first cc1 line for `-c t.S` is the `-E -lang-asm`
+/// preprocess that `-E t.S` runs, so the resolved tokens match. The mode
+/// must still separate the keys: one entry holds an object, the other
+/// preprocessor output.
+#[cfg(unix)]
+#[test]
+fn preprocess_and_compile_of_one_source_never_share_a_key() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("t.S"), ".text\n").unwrap();
+    let program = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) printf '"cc1" "-E" "-lang-asm" "t.S"\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let cache = tempfile::tempdir().unwrap();
+    let key = |args: &[&str]| {
+        let mut argv = vec![program.to_string_lossy().into_owned()];
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let source = root.join("t.S");
+        let fingerprints = hasher
+            .cc_preprocess_fingerprints(
+                &[(cc_mapped_path(&source, &maps), source.clone())],
+                &cc_prefix_maps_key(&maps),
+                &|path| cc_mapped_content_hash(path, &maps),
+            )
+            .unwrap();
+        let outcome = CcCompiler::new()
+            .with_invocation_env(&env)
+            .cache_key_with(
+                &parsed,
+                &KeyCtx {
+                    invocation_env: &env,
+                    file_hasher: &hasher,
+                    path_normalizer: &normalizer,
+                    cache_dir: cache.path(),
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
+                },
+                CcKeyDiscovery::Captured(CcCapturedInputs {
+                    fingerprints,
+                    path_bound: false,
+                    inputs_changed: false,
+                }),
+            )
+            .unwrap();
+        match outcome {
+            CcKeyOutcome::Key(key) => key,
+            CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+        }
+    };
+    let compile = key(&["-c", "t.S", "-o", "t.o"]);
+    assert_eq!(compile, key(&["-c", "t.S", "-o", "t.o"]));
+    assert_ne!(key(&["-E", "t.S"]), compile);
+}
+
+/// #1981: the `cc -###` record used to be keyed without the source, so a
+/// store that had resolved `t.S` first served its `-lang-asm` line to a later
+/// `t.c` with the same flags. `t.c`'s key then depended on what the store had
+/// seen before. Each suffix now resolves its own record.
+#[cfg(unix)]
+#[test]
+fn a_c_compile_keys_alike_whatever_language_the_store_probed_first() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("t.S"), ".text\n").unwrap();
+    fs::write(root.join("t.c"), "int t;\n").unwrap();
+    let program = root.join("cc");
+    // The loop visits each argument once and every branch exits.
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###)
+        for arg in "$@"; do
+            case "$arg" in
+                *.S) printf '"cc1" "-E" "-lang-asm" "%s"\n' "$arg" >&2; exit 0 ;;
+                *.c) printf '"cc1" "-quiet" "%s"\n' "$arg" >&2; exit 0 ;;
+            esac
+        done
+        exit 1 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key = |cache: &Path, source: &str| {
+        let argv = s(&[&program.to_string_lossy(), "-c", source, "-o", "t.o"]);
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let source = root.join(source);
+        let fingerprints = hasher
+            .cc_preprocess_fingerprints(
+                &[(cc_mapped_path(&source, &maps), source.clone())],
+                &cc_prefix_maps_key(&maps),
+                &|path| cc_mapped_content_hash(path, &maps),
+            )
+            .unwrap();
+        let outcome = CcCompiler::new()
+            .with_invocation_env(&env)
+            .cache_key_with(
+                &parsed,
+                &KeyCtx {
+                    invocation_env: &env,
+                    file_hasher: &hasher,
+                    path_normalizer: &normalizer,
+                    cache_dir: cache,
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
+                },
+                CcKeyDiscovery::Captured(CcCapturedInputs {
+                    fingerprints,
+                    path_bound: false,
+                    inputs_changed: false,
+                }),
+            )
+            .unwrap();
+        match outcome {
+            CcKeyOutcome::Key(key) => key,
+            CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+        }
+    };
+    let c_only = tempfile::tempdir().unwrap();
+    let assembly_first = tempfile::tempdir().unwrap();
+    let fresh = key(c_only.path(), "t.c");
+    key(assembly_first.path(), "t.S");
+    assert_eq!(
+        key(assembly_first.path(), "t.c"),
+        fresh,
+        "t.c must not be keyed from the record t.S filled"
+    );
+
+    // If the fixture's `-###` lines stopped resolving, both records would
+    // hold no tokens and the keys above would agree on any code. Load each
+    // stored record with the request the cc key builds. A fresh accounting
+    // scope counts a probe that runs instead of loading.
+    let stored_tokens = |source: &str| {
+        let argv = s(&[&program.to_string_lossy(), "-c", source, "-o", "t.o"]);
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let _scope = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let record = crate::probe::probe_for(
+            assembly_first.path(),
+            &crate::probe::CcProber,
+            &crate::probe::ProbeRequest {
+                compiler: &parsed.program,
+                args: &parsed.probe_args(),
+                key_args: &parsed.config_args(),
+                per_tu_paths: &cc_resolved_per_tu_paths(&parsed),
+                windows_aware: true,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::opcounts::probe_runs(),
+            0,
+            "the {source} request must load the stored record"
+        );
+        record.resolved_tokens
+    };
+    let assembly = stored_tokens("t.S").expect("the t.S record holds resolved tokens");
+    assert!(
+        assembly.iter().any(|token| token == "-lang-asm"),
+        "the t.S record holds the assembler line: {assembly:?}"
+    );
+    let c = stored_tokens("t.c").expect("the t.c record holds resolved tokens");
+    assert!(
+        !c.iter().any(|token| token == "-lang-asm"),
+        "the t.c record holds its own line: {c:?}"
+    );
+    // `-quiet` is dropped from gnu cc1 lines, so only the blanked source
+    // survives.
+    assert_eq!(c, s(&["<path>"]));
 }

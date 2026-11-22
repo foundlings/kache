@@ -154,6 +154,9 @@ pub const DEFAULT_EVENT_ARCHIVE_MAX_SIZE: u64 = 512 << 20;
 /// Maximum bytes downloaded or unpacked for one restored entry or debug bundle.
 pub const DEFAULT_RESTORE_MAX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Default for [`Config::build_script_out_dir_max_size`].
+pub const DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE: u64 = 5 << 30;
+
 /// Default for [`Config::auto_clean_unused_units_days`].
 pub const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
 
@@ -646,6 +649,13 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// How many builds of each test binary, program, example or bench the
+    /// daemon keeps in a target directory still in use, newest first by when
+    /// each was built; older builds of the same executable, left behind when
+    /// features, dependencies or the toolchain changed, are removed. `0`, the
+    /// default, disables it. Set via `KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES`
+    /// or `[cache] auto_clean_superseded_executables`.
+    pub auto_clean_superseded_executables: u64,
     /// Copy another checkout's registry build units into a target directory
     /// Cargo has not built yet, before Cargo checks freshness. On by
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
@@ -662,6 +672,12 @@ pub struct Config {
     /// `KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME` or
     /// `[cache] build_script_omit_cargo_source_dir_mtime`.
     pub build_script_omit_cargo_source_dir_mtime: bool,
+    /// Largest build-script output kache stores: the regular files in
+    /// `OUT_DIR` plus the outputs it names outside it. A larger run is not
+    /// cached and runs again. 5 GiB by default.
+    /// `KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE` or
+    /// `[cache] build_script_out_dir_max_size`.
+    pub build_script_out_dir_max_size: u64,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
@@ -1047,12 +1063,17 @@ pub struct CacheFileConfig {
     pub scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::auto_clean_superseded_executables`].
+    pub auto_clean_superseded_executables: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
     pub build_script_hermetic: Option<bool>,
     /// See [`Config::build_script_omit_cargo_source_dir_mtime`].
     pub build_script_omit_cargo_source_dir_mtime: Option<bool>,
+    /// See [`Config::build_script_out_dir_max_size`].
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
+    pub build_script_out_dir_max_size: Option<String>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub gc_evict_shared: Option<bool>,
     /// Held bytes count toward `max_size`. See [`Config::held_bytes_budget`].
@@ -1504,9 +1525,11 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
     "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
+    "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
@@ -1661,11 +1684,19 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
     ),
+    (
+        "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES",
+        "cache.auto_clean_superseded_executables",
+    ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
     (
         "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
         "cache.build_script_omit_cargo_source_dir_mtime",
+    ),
+    (
+        "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE",
+        "cache.build_script_out_dir_max_size",
     ),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
@@ -2505,11 +2536,15 @@ impl Config {
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let auto_clean_superseded_executables =
+            Self::auto_clean_superseded_executables_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
         let build_script_omit_cargo_source_dir_mtime =
             Self::build_script_omit_cargo_source_dir_mtime_enabled_for(invocation, &file_config);
+        let build_script_out_dir_max_size =
+            Self::build_script_out_dir_max_size_for(invocation, &file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled_for(invocation, &file_config);
         let held_bytes_budget = Self::held_bytes_budget_for(invocation, &file_config);
         let storage_layout_advice =
@@ -2652,9 +2687,11 @@ impl Config {
             auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
+            auto_clean_superseded_executables,
             seed_new_targets,
             build_script_hermetic,
             build_script_omit_cargo_source_dir_mtime,
+            build_script_out_dir_max_size,
             gc_evict_shared,
             held_bytes_budget,
             storage_layout_advice,
@@ -3610,6 +3647,35 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Largest build-script output to store, 5 GiB by default.
+    /// `KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE` (env wins), else `[cache]
+    /// build_script_out_dir_max_size`. A malformed or zero value falls
+    /// through to the next source.
+    fn build_script_out_dir_max_size_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(
+            invocation,
+            "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| parse_positive_size(&value, "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE"))
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|config| config.cache.as_ref())
+                .and_then(|cache| cache.build_script_out_dir_max_size.as_deref())
+                .and_then(|value| {
+                    parse_positive_size(value, "[cache] build_script_out_dir_max_size")
+                })
+        })
+        .unwrap_or(DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE)
+    }
+
     /// Unused-unit cleanup age in days, `30` by default.
     /// `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` (env wins), else `[cache]
     /// auto_clean_unused_units_days`.
@@ -3629,6 +3695,31 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Builds kept per executable, `0` (off) by default.
+    /// `KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES` (env wins), else `[cache]
+    /// auto_clean_superseded_executables`.
+    fn auto_clean_superseded_executables_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(
+            invocation,
+            "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.cache.as_ref())
+                .and_then(|c| c.auto_clean_superseded_executables)
+        })
+        .unwrap_or(0)
     }
 
     /// Memory-pressure admission, on by default.
@@ -5330,6 +5421,15 @@ fn parse_restore_max_size(value: &str, source: &str) -> Option<u64> {
     let bytes = parse_size_checked(value, source)?;
     if bytes == 0 {
         tracing::warn!(%source, "restore size limit must be greater than zero; ignoring value");
+        return None;
+    }
+    Some(bytes)
+}
+
+fn parse_positive_size(value: &str, source: &str) -> Option<u64> {
+    let bytes = parse_size_checked(value, source)?;
+    if bytes == 0 {
+        tracing::warn!(%source, "size limit must be greater than zero; ignoring value");
         return None;
     }
     Some(bytes)

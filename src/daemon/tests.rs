@@ -1131,6 +1131,7 @@ fn compile_started_wire_tags_and_stats_default() {
         entries: None,
         events: EventStatsResponse {
             local_hits: 0,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 0,
             dups: 0,
@@ -1276,6 +1277,139 @@ async fn test_shutdown_request_sets_flag_and_stores_notify_permit() {
     tokio::time::timeout(Duration::from_secs(1), lifecycle.draining())
         .await
         .expect("stop request must wake a later drain observer");
+}
+
+const CONFIG_WATCH_TICK: Duration = Duration::from_millis(10);
+const CONFIG_WATCH_BOUND: Duration = Duration::from_secs(5);
+
+/// A config check that counts its calls and always answers `changed`.
+fn counted_config_check(calls: &Arc<AtomicUsize>, changed: bool) -> impl FnMut() -> bool + use<> {
+    let calls = Arc::clone(calls);
+    move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        changed
+    }
+}
+
+async fn wait_for_config_checks(calls: &AtomicUsize, at_least: usize) {
+    tokio::time::timeout(CONFIG_WATCH_BOUND, async {
+        while calls.load(Ordering::SeqCst) < at_least {
+            tokio::time::sleep(CONFIG_WATCH_TICK).await;
+        }
+    })
+    .await
+    .expect("the config watcher must keep checking the config file");
+}
+
+#[tokio::test]
+async fn config_change_restarts_only_after_running_requests_finish() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let compile = lifecycle.begin().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        counted_config_check(&calls, true),
+    ));
+
+    wait_for_config_checks(&calls, 1).await;
+    tokio::time::sleep(CONFIG_WATCH_TICK * 20).await;
+    assert!(
+        lifecycle.accepting_calls(),
+        "a config change must not drain the daemon while a request is running"
+    );
+    assert!(!watcher.is_finished());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a change already seen must not be checked again"
+    );
+
+    drop(compile);
+    tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+        .await
+        .expect("the daemon must restart once no request is running")
+        .unwrap();
+    assert!(!lifecycle.accepting_calls());
+}
+
+#[tokio::test]
+async fn config_change_restarts_an_idle_daemon() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        || true,
+    ));
+    tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+        .await
+        .expect("an idle daemon must restart on a config change")
+        .unwrap();
+    assert!(!lifecycle.accepting_calls());
+}
+
+#[tokio::test]
+async fn unchanged_config_keeps_the_daemon_running() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        counted_config_check(&calls, false),
+    ));
+
+    wait_for_config_checks(&calls, 20).await;
+    assert!(
+        lifecycle.accepting_calls(),
+        "an unchanged config must not drain the daemon"
+    );
+    assert!(!watcher.is_finished());
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn config_watcher_stops_when_the_daemon_drains_for_another_reason() {
+    for change in [false, true] {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let _compile = lifecycle.begin().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let watcher = tokio::spawn(reload_when_config_changes(
+            Arc::clone(&lifecycle),
+            CONFIG_WATCH_TICK,
+            counted_config_check(&calls, change),
+        ));
+
+        wait_for_config_checks(&calls, 1).await;
+        assert!(
+            lifecycle.start_drain(),
+            "the watcher must not drain while a request is running (change: {change})"
+        );
+        tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+            .await
+            .unwrap_or_else(|_| panic!("another drain must stop the watcher (change: {change})"))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn config_watcher_skips_its_first_tick() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        Duration::from_secs(3600),
+        counted_config_check(&calls, true),
+    ));
+
+    // Lets the watcher run until it waits for its next tick, an hour away.
+    tokio::time::sleep(CONFIG_WATCH_TICK * 5).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the config is first checked one interval after the daemon starts"
+    );
+    assert!(lifecycle.accepting_calls());
+    watcher.abort();
 }
 
 struct GatedMissBackend {
@@ -1601,9 +1735,11 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -3672,6 +3808,50 @@ fn a_gc_hint_leaves_bytes_held_by_target_directories_alone() {
     ));
 }
 
+/// An automatic sweep starts from the held figure the last sweep recorded,
+/// or from none: the first sweep, and every one once that figure is six
+/// hours old, is due on the store's full size. Its probe then measures the
+/// held bytes again: a store whose own part fits under `max_size` gives
+/// nothing back, however far the full size is over the trigger.
+#[test]
+fn a_sweep_due_without_a_recent_held_figure_evicts_nothing_from_a_store_that_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for i in 0..6 {
+        let key = format!("held_{i}");
+        put_upload_evict_entry(&store, dir.path(), &key, 100, false);
+        hold_in_target_dir(&store, dir.path(), &key);
+    }
+    put_upload_evict_entry(&store, dir.path(), "a", 500, false);
+    put_upload_evict_entry(&store, dir.path(), "b", 450, false);
+    // 1,550 bytes, 600 of them held: 950 of the store's own.
+    let size = store.physical_size().unwrap();
+    assert_eq!(size, 1550);
+    assert!(
+        crate::wrapper::auto_gc_sweep_due(&config, size),
+        "no held figure on record yet"
+    );
+
+    let daemon = Daemon::new(config.clone());
+    daemon.sweep_under_size_pressure().unwrap();
+    assert!(store.contains("a") && store.contains("b"), "first sweep");
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, size));
+
+    crate::wrapper::age_auto_gc_record_for_test(dir.path(), 6 * 3600 + 1);
+    assert!(
+        crate::wrapper::auto_gc_sweep_due(&config, size),
+        "the held figure has expired"
+    );
+    daemon.sweep_under_size_pressure().unwrap();
+    assert!(
+        store.contains("a") && store.contains("b"),
+        "after six hours"
+    );
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, size));
+}
+
 /// Every upload used to start another full sweep of a store the last
 /// sweep had already failed to bring under budget.
 #[test]
@@ -4733,6 +4913,7 @@ fn test_stats_response_serde() {
         entries: None,
         events: EventStatsResponse {
             local_hits: 10,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 2,
             dups: 1,
@@ -4821,6 +5002,7 @@ fn test_stats_response_with_entries() {
         ]),
         events: EventStatsResponse {
             local_hits: 0,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 0,
             dups: 0,
@@ -4910,11 +5092,11 @@ fn daemon_keeps_the_load_time_config_provenance_after_a_file_edit() {
 fn handle_stats_filters_on_event_secs_over_event_hours() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut recent = events::BuildEvent::new_for_test("serde", events::EventResult::LocalHit);
-    recent.ts = now - chrono::Duration::minutes(10);
+    recent.ts = now - jiff::SignedDuration::from_mins(10);
     let mut old = events::BuildEvent::new_for_test("tokio", events::EventResult::Miss);
-    old.ts = now - chrono::Duration::minutes(40);
+    old.ts = now - jiff::SignedDuration::from_mins(40);
     events::log_event(&config.event_log_path(), &recent).unwrap();
     events::log_event(&config.event_log_path(), &old).unwrap();
     let daemon = Daemon::new(config);
@@ -12515,6 +12697,48 @@ impl crate::remote_backend::RemoteBackend for StallingGetBackend {
     }
 }
 
+/// GET blocks the polling thread. An async `pending()` still lets the
+/// handler's deadline run; this one does not.
+struct BlockingGetBackend {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for BlockingGetBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        self.started.store(true, Ordering::SeqCst);
+        std::thread::sleep(BLOCKING_REMOTE_OP);
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self, key: &str) -> String {
+        format!("blocking://test/{key}")
+    }
+}
+
 /// Backend whose GET fails with the given error class on every call.
 struct FailingGetBackend {
     timeout: bool,
@@ -13232,6 +13456,58 @@ async fn configured_demand_timeout_returns_a_miss_and_keeps_the_remote_healthy()
     );
 }
 
+/// The handler budget already returned. A permit that shows up afterwards
+/// belongs to the next check, not to the GET still parked on the worker.
+/// Tokio's timeout polls that GET before the deadline, which is the Windows
+/// miss in `configured_demand_timeout_returns_a_miss_and_keeps_the_remote_healthy`.
+#[tokio::test]
+async fn abandoned_compile_download_does_not_take_a_later_permit() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let consumed = Arc::new(AtomicBool::new(false));
+    let release_worker = Arc::clone(&release);
+    let entered_worker = Arc::clone(&entered);
+    let consumed_worker = Arc::clone(&consumed);
+    let pending = tokio::spawn(async move {
+        finish_compile_remote_download(RemoteDeadline::from_millis(1_000), async move {
+            entered_worker.add_permits(1);
+            release_worker
+                .acquire()
+                .await
+                .expect("release semaphore stays open")
+                .forget();
+            consumed_worker.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("the download must reach the parked GET")
+        .expect("entered semaphore stays open")
+        .forget();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .expect("the handler budget must answer while the GET stays parked")
+        .expect("download task");
+    assert!(
+        result.is_err(),
+        "an elapsed budget is a miss for that request"
+    );
+
+    release.add_permits(1);
+    let next = tokio::time::timeout(Duration::from_secs(2), release.acquire()).await;
+    assert!(
+        next.is_ok(),
+        "a permit released after the budget belongs to the next check"
+    );
+    assert!(
+        !consumed.load(Ordering::SeqCst),
+        "the abandoned GET must not finish"
+    );
+}
+
 #[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();
@@ -13309,6 +13585,231 @@ async fn test_restore_deadline_returns_miss_instead_of_hanging() {
         0,
         "a timeout is never negative-cached"
     );
+}
+
+/// A compile-path remote op that does not yield is abandoned with the
+/// handler's budget. The client gets a miss (local compile), stats is not
+/// stuck behind that handler, and shutdown does not wait the op out.
+const BLOCKING_REMOTE_OP: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
+    let shutdown = CONNECTION_HANDLER_DRAIN_TIMEOUT
+        + PREFETCH_SHUTDOWN_TIMEOUT
+        + UPLOAD_PIPELINE_DRAIN_TIMEOUT
+        + RUNTIME_SHUTDOWN_TIMEOUT;
+    assert!(
+        shutdown < Duration::from_secs(35),
+        "restart waits 35s for the run lock, shutdown took {shutdown:?}"
+    );
+    assert_eq!(shutdown, Duration::from_secs(12 + 5 + 8 + 1));
+    assert_blocked_handler_is_abandoned_at_the_drain();
+
+    let skipped = Arc::new(AtomicBool::new(false));
+    let skipped_flag = Arc::clone(&skipped);
+    let already_elapsed = RemoteDeadline::from_millis_at(
+        Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("elapsed budget fits"),
+        1,
+    );
+    let skipped_download = finish_compile_remote_download(already_elapsed, async move {
+        skipped_flag.store(true, Ordering::SeqCst);
+        std::thread::sleep(BLOCKING_REMOTE_OP);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    assert!(
+        skipped_download.is_err(),
+        "an elapsed budget is a remote miss"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !skipped.load(Ordering::SeqCst),
+        "an elapsed budget must not start the remote op"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(BlockingGetBackend {
+        started: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+    });
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.remote_restore_timeout_secs = 1;
+    config.demand_timeout_secs = 1;
+    let daemon = Arc::new(Daemon::new(config));
+    daemon.signal_warming_complete();
+    assert!(
+        daemon
+            .remote_backend
+            .set(backend.clone() as Arc<dyn crate::remote_backend::RemoteBackend>)
+            .is_ok()
+    );
+    let mut check = check_request(dir.path(), "blocking-remote-op");
+    check.deadline_ms = Some(800);
+    daemon
+        .key_cache
+        .populate(HashMap::from([(check.key.clone(), "serde".to_string())]))
+        .await;
+
+    let socket_path = daemon.config.socket_path();
+    let listener = bind_listener(&socket_path);
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let server_daemon = Arc::clone(&daemon);
+    let server_limiter = Arc::clone(&limiter);
+    let server = tokio::spawn(async move {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mut handlers = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let stream = listener.accept().await.expect("accept");
+            let daemon = Arc::clone(&server_daemon);
+            let limiter = Arc::clone(&server_limiter);
+            let lifecycle = Arc::clone(&lifecycle);
+            let started_at = Instant::now();
+            handlers.spawn(async move {
+                handle_connection_after_queue(stream, &daemon, &lifecycle, limiter, started_at)
+                    .await
+                    .expect("connection handler");
+            });
+        }
+        while handlers.join_next().await.is_some() {}
+    });
+
+    let request = Request::RemoteCheck(check);
+    let remote_socket = socket_path.clone();
+    let started = Instant::now();
+    let remote_client =
+        tokio::spawn(async move { client_roundtrip(&remote_socket, &request).await });
+
+    let backend_for_wait = Arc::clone(&backend);
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        while !backend_for_wait.started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the remote op must start");
+
+    let stats_socket = socket_path.clone();
+    let stats_client = tokio::spawn(async move {
+        client_roundtrip(
+            &stats_socket,
+            &Request::Stats(StatsRequest {
+                include_entries: false,
+                include_summaries: false,
+                sort_by: None,
+                event_hours: None,
+                event_secs: None,
+                client_epoch: 0,
+                client_version: None,
+            }),
+        )
+        .await
+    });
+
+    let remote_response = remote_client.await.expect("remote client");
+    let stats_response = stats_client.await.expect("stats client");
+    let elapsed = started.elapsed();
+    server.await.expect("server");
+
+    assert!(remote_response.ok);
+    assert_eq!(remote_response.found, Some(false));
+    assert!(
+        remote_response.error.is_none(),
+        "a remote failure is a miss the client compiles locally, got {remote_response:?}"
+    );
+    assert!(stats_response.ok, "stats must answer: {stats_response:?}");
+    assert!(stats_response.stats.is_some());
+    assert!(
+        !backend.finished.load(Ordering::SeqCst),
+        "the handler waited for the remote op to finish"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "handler and stats must return at the 800ms budget, not after the {BLOCKING_REMOTE_OP:?} op, took {elapsed:?}"
+    );
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_failed
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(daemon.negative_keys.len(), 0);
+    assert!(!daemon.remote_breaker.is_degraded());
+}
+
+fn assert_blocked_handler_is_abandoned_at_the_drain() {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("kache-drain-probe".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("drain probe runtime");
+            let measured = runtime.block_on(async {
+                let aborted = Arc::new(AtomicBool::new(false));
+                let entered = Arc::new(AtomicBool::new(false));
+                let mut handlers = tokio::task::JoinSet::new();
+                let flag = Arc::clone(&aborted);
+                handlers.spawn(async move {
+                    let _observed = AbortObserved(flag);
+                    std::future::pending::<()>().await;
+                });
+                let entered_flag = Arc::clone(&entered);
+                handlers.spawn(async move {
+                    entered_flag.store(true, Ordering::SeqCst);
+                    std::thread::sleep(BLOCKING_REMOTE_OP);
+                });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !entered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("blocked handler was polled");
+                let started_at = Instant::now();
+                let abandoned =
+                    drain_connection_handlers(&mut handlers, Duration::from_millis(20)).await;
+                (
+                    abandoned,
+                    started_at.elapsed(),
+                    handlers.is_empty(),
+                    aborted.load(Ordering::SeqCst),
+                )
+            });
+            let _ = tx.send(measured);
+            runtime.shutdown_timeout(Duration::from_millis(20));
+        })
+        .expect("spawn drain probe");
+    let (abandoned, elapsed, empty, aborted) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or((
+        false,
+        BLOCKING_REMOTE_OP,
+        false,
+        false,
+    ));
+    drop(worker);
+    assert!(
+        abandoned,
+        "a drained handler that does not finish is abandoned"
+    );
+    assert!(empty, "abandoned handlers leave the drain set");
+    assert!(aborted, "abort must drop a parked handler");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drain joined a handler blocked in the remote op, took {elapsed:?}"
+    );
+}
+
+struct AbortObserved(Arc<AtomicBool>);
+
+impl Drop for AbortObserved {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 #[tokio::test]
@@ -16646,11 +17147,6 @@ async fn write_breaker_deferrals_do_not_spend_the_upload_attempt_limit() {
     let mut daemon = resilience_test_daemon(dir.path(), backend.clone());
     daemon.config.remote_upload_max_attempts = 1;
     daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(1)));
-    daemon
-        .remote_breaker
-        .try_acquire(RemoteOperation::UploadPut)
-        .unwrap()
-        .failure(RemoteErrorClass::Transient, "test outage");
     let daemon = Arc::new(daemon);
     let key = test_cache_key("breaker-defers-upload");
     seed_store_entry(&daemon.config, &key, "serde", dir.path());
@@ -16666,6 +17162,14 @@ async fn write_breaker_deferrals_do_not_spend_the_upload_attempt_limit() {
     )
     .unwrap();
     daemon.pending_uploads.write().await.insert(key.clone());
+    // Open the breaker only now: its one-second cooldown starts here, so a
+    // setup slowed by a loaded machine (the store's first open) cannot use
+    // it up before the worker first asks for a permit.
+    daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::UploadPut)
+        .unwrap()
+        .failure(RemoteErrorClass::Transient, "test outage");
     let task_daemon = daemon.clone();
     let mut worker =
         tokio::spawn(
@@ -17375,7 +17879,7 @@ fn daemon_stats_include_rotated_events() {
     let config = test_config(dir.path());
     let log = config.event_log_path();
     let mut hit = events::BuildEvent::new_for_test("archived", events::EventResult::LocalHit);
-    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    hit.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
     for _ in 0..12 {
         events::log_event(&log, &hit).unwrap();
     }

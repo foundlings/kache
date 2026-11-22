@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 
 /// A digest of every entry a [`Stamper`] walked: name, kind, size,
 /// modification and change time, and the link text of a symlink.
+#[derive(Clone)]
 pub(crate) struct TreeStamp {
     pub(crate) digest: String,
     /// [`Self::digest`] without the roots' own metadata
     /// ([`StampRules::root_metadata`]): the same where none was stamped.
     pub(crate) entries: String,
+    /// How many directories the walk could not list and entries it could not
+    /// stat ([`StampRules::unreadable_entries`]). A content digest that met
+    /// more or fewer met a failure this stamp does not show.
+    pub(crate) unreadable: usize,
     /// The newest modification time seen in the walk.
     newest: std::time::SystemTime,
 }
@@ -43,7 +48,7 @@ impl TreeStamp {
 }
 
 /// How a stamp walk treats symlinks and Cargo's build directories.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct StampRules {
     /// Fold a symlink's text instead of refusing the tree. Only for a digest
     /// that does not read through a link either: one that does could change
@@ -87,6 +92,7 @@ pub(crate) struct Stamper {
     hasher: blake3::Hasher,
     /// The roots' own metadata, kept apart from the entries.
     roots: Option<blake3::Hasher>,
+    unreadable: usize,
     newest: std::time::SystemTime,
 }
 
@@ -95,6 +101,7 @@ impl Stamper {
         Self {
             hasher: blake3::Hasher::new(),
             roots: None,
+            unreadable: 0,
             newest: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -122,6 +129,7 @@ impl Stamper {
     /// per entry. After folding a non-directory entry, give its owned path
     /// and the metadata already read to the observer. Directories are queued
     /// for traversal instead; exclusions and the budget precede either use.
+    #[cfg(test)]
     pub(crate) fn walk_observing(
         &mut self,
         root: &Path,
@@ -155,7 +163,9 @@ impl Stamper {
         self.walk_skipping_observing(root, skips, rules, budget, &mut |_, _| {})
     }
 
-    fn walk_skipping_observing(
+    /// Walk, leaving out every entry `skips` names, and give each
+    /// non-directory entry to `observe` after folding it.
+    pub(crate) fn walk_skipping_observing(
         &mut self,
         root: &Path,
         skips: &dyn Fn(&Path, &std::fs::DirEntry) -> bool,
@@ -188,6 +198,7 @@ impl Stamper {
                         "unlisted",
                         relative.as_os_str().as_encoded_bytes(),
                     );
+                    self.unreadable += 1;
                     continue;
                 }
                 Err(error)
@@ -233,6 +244,7 @@ impl Stamper {
                             "unreadable",
                             relative.as_os_str().as_encoded_bytes(),
                         );
+                        self.unreadable += 1;
                         continue;
                     }
                     Err(_) => return WalkOutcome::Unreadable,
@@ -294,6 +306,7 @@ impl Stamper {
         TreeStamp {
             digest: digest.to_hex().to_string(),
             entries: entries.to_hex().to_string(),
+            unreadable: self.unreadable,
             newest: self.newest,
         }
     }
@@ -381,9 +394,26 @@ pub(crate) fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::f
     }
 }
 
-/// The digest recorded at `memo`, when it was recorded under `stamp`.
+/// The digest recorded at `memo`, when it was recorded under `stamp` in this
+/// boot. A hard stop can lose the last writes to a tree's files while their
+/// stamps survive, so a memo written before the boot
+/// ([`kache_store::file_hash::memo_rows_valid_since`], by its modification
+/// time) is not served: the tree is read again, and the memo recorded then
+/// is.
 pub(crate) fn memoised_digest(memo: &Path, stamp: &str) -> Option<String> {
-    let memo = std::fs::read_to_string(memo).ok()?;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(memo).ok()?;
+    let recorded = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
+    if recorded < kache_store::file_hash::memo_rows_valid_since() {
+        return None;
+    }
+    let mut memo = String::new();
+    file.read_to_string(&mut memo).ok()?;
     let (recorded_stamp, digest) = memo.trim_end().split_once('\n')?;
     (recorded_stamp == stamp).then(|| digest.to_string())
 }
@@ -422,6 +452,41 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    /// A hard stop can lose the last writes to a tree's files while their
+    /// stamps survive, so a digest memoised before the boot is not served.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_digest_memoised_before_this_boot_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("memo");
+        record_digest(&memo, "stamp", "digest");
+        assert_eq!(memoised_digest(&memo, "stamp").as_deref(), Some("digest"));
+        let boot = kache_store::file_hash::memo_rows_valid_since();
+        assert!(boot > 0, "/proc/stat names the boot time");
+        let recorded_at = |secs: i64| {
+            filetime::set_file_mtime(&memo, filetime::FileTime::from_unix_time(secs, 0)).unwrap();
+        };
+        recorded_at(boot - 1);
+        assert_eq!(
+            memoised_digest(&memo, "stamp"),
+            None,
+            "a memo from before the boot is not served"
+        );
+        recorded_at(boot);
+        assert_eq!(
+            memoised_digest(&memo, "stamp").as_deref(),
+            Some("digest"),
+            "a memo written in the boot second is from this boot"
+        );
+        recorded_at(boot - 1);
+        record_digest(&memo, "stamp", "read again");
+        assert_eq!(
+            memoised_digest(&memo, "stamp").as_deref(),
+            Some("read again"),
+            "the memo recorded after the boot is served"
+        );
     }
 
     #[test]
@@ -519,6 +584,7 @@ mod tests {
         let stamp = TreeStamp {
             digest: String::new(),
             entries: String::new(),
+            unreadable: 0,
             newest,
         };
         assert!(stamp.settled_at(newest + TreeStamp::SETTLE));
@@ -662,7 +728,8 @@ mod tests {
     }
 
     /// A directory that cannot be listed, or an entry that cannot be stat'ed,
-    /// refuses the tree unless the rules stamp it as unreadable.
+    /// refuses the tree unless the rules stamp it as unreadable. The stamp
+    /// then counts it.
     #[cfg(unix)]
     #[test]
     fn what_cannot_be_read_is_stamped_as_unreadable_or_refuses_the_tree() {
@@ -688,6 +755,11 @@ mod tests {
             unreadable_entries: true,
             ..StampRules::default()
         };
+        let counted = || {
+            let mut stamper = Stamper::new();
+            stamper.walk(dir.path(), &[], unreadable, &mut 10);
+            stamper.finish().unreadable
+        };
         assert_eq!(
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Unreadable
@@ -698,6 +770,7 @@ mod tests {
             (WalkOutcome::Fits, 3),
             "`src`, its file, `data`"
         );
+        assert_eq!(counted(), 1, "`data`");
 
         // Listed, but its entries cannot be stat'ed.
         mode(0o444).unwrap();
@@ -708,11 +781,13 @@ mod tests {
         let (outcome, unstated, spent) = walk(dir.path(), unreadable, 10);
         assert_eq!((outcome, spent), (WalkOutcome::Fits, 4));
         assert_ne!(unstated, unlisted);
+        assert_eq!(counted(), 1, "`PG_VERSION`");
 
         mode(0o755).unwrap();
         let (outcome, readable, _) = walk(dir.path(), unreadable, 10);
         assert_eq!(outcome, WalkOutcome::Fits);
         assert_ne!(readable, unstated);
+        assert_eq!(counted(), 0);
         assert_eq!(
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Fits

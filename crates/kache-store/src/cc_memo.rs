@@ -1,7 +1,7 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
 use crate::file_hash::{FileFingerprint, FileHashCache, file_hash_memo_eligible, stamp_is_settled};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
@@ -50,6 +50,16 @@ pub const UNPROVEN_SIZE: i64 = -1;
 ///    content hash.
 pub const CC_MEMO_RULE: i64 = 1;
 
+/// The prefix on a content hash keying an assembler verdict, one per set of
+/// scan rules. A release reads only its own set: rules differ in both
+/// directions, so a verdict from another set can refuse a file this set
+/// keeps or keep one it refuses.
+///
+/// `asm2:`: a closing `.endr`, `.endm` or `.endmacro` refuses a file, `\()`
+/// alone no longer does, a comment may open an operand, and continued lines
+/// are joined. Releases before it key on the bare hash.
+const CC_ASM_SCAN_KEY: &str = "asm2:";
+
 /// What an input row's `proof` holds for `stamp` under [`CC_MEMO_RULE`].
 ///
 /// An older release records the same bytes under the same name by
@@ -86,8 +96,9 @@ fn unproven(path: String) -> FileFingerprint {
 pub struct CcPreprocessMemo {
     pub preprocessed_hash: String,
     pub inputs: Vec<CcPreprocessMemoInput>,
-    /// Content-addressed header scans, in the same order as `inputs`.
-    pub header_scans: Vec<Option<(i64, String)>>,
+    /// What the compiler derived from the inputs' header scans, opaque here.
+    /// The value carries its own proof of which inputs it describes.
+    pub shadowing: Option<String>,
     pub needs_touch: bool,
 }
 
@@ -100,7 +111,7 @@ fn has_current_schema(db: &Connection) -> rusqlite::Result<bool> {
 
 pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     if has_current_schema(db)? {
-        return Ok(());
+        return ensure_shadowing_column(db);
     }
     // Recheck after acquiring the writer lock: concurrent wrappers may have
     // observed the legacy table before the first migration committed.
@@ -113,7 +124,8 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
                 memo_key TEXT NOT NULL UNIQUE,
                 preprocessed_hash TEXT NOT NULL,
                 input_count INTEGER NOT NULL,
-                last_used INTEGER NOT NULL DEFAULT (unixepoch())
+                last_used INTEGER NOT NULL DEFAULT (unixepoch()),
+                shadowing TEXT
              );
              CREATE INDEX cc_preprocess_memos_last_used ON cc_preprocess_memos(last_used);
              CREATE TABLE cc_memo_inputs (
@@ -137,7 +149,39 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
              CREATE INDEX cc_memo_input_refs_input ON cc_memo_input_refs(input_id);",
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    ensure_shadowing_column(db)
+}
+
+/// Whether memo rows can carry the include-shadowing derivation.
+pub(crate) fn has_shadowing_column(db: &Connection) -> rusqlite::Result<bool> {
+    has_column(db, "cc_preprocess_memos", "shadowing")
+}
+
+/// Add `cc_preprocess_memos.shadowing` to a table from before it. Rows keep
+/// no value, and the first hit on each computes one.
+fn ensure_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
+    if has_shadowing_column(db)? {
+        return Ok(());
+    }
+    add_shadowing_column(db)
+}
+
+/// Whether header scans can keep their macro definitions apart.
+pub(crate) fn has_header_macros_table(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cc_header_macros')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Another process may add the column between the look and the `ALTER`.
+fn add_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
+    match db.execute_batch("ALTER TABLE cc_preprocess_memos ADD COLUMN shadowing TEXT") {
+        Err(error) if !error.to_string().contains("duplicate column name") => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// The mapped-content memo: what a file's bytes hash to once the prefix maps
@@ -162,7 +206,15 @@ pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()>
             content TEXT PRIMARY KEY,
             scan TEXT NOT NULL,
             version INTEGER NOT NULL
-         ) WITHOUT ROWID;",
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS cc_header_macros (
+            name TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            bodies TEXT NOT NULL,
+            PRIMARY KEY(name, version, content)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS cc_header_macros_content ON cc_header_macros(content);",
     )
 }
 
@@ -238,9 +290,14 @@ fn purge(db: &Connection) -> rusqlite::Result<()> {
          DELETE FROM cc_memo_inputs;
          DELETE FROM cc_mapped_hashes;
          DELETE FROM cc_asm_scans;
-         DELETE FROM cc_header_scans;",
+         DELETE FROM cc_header_scans;
+         DELETE FROM cc_header_macros;",
     )
 }
+
+/// A header scan to record: its content hash, the scan, and its macro
+/// definitions as `(name, bodies)`.
+pub type CcHeaderScanRow = (String, String, Vec<(String, String)>);
 
 /// Headers looked up per statement. Far below SQLite's bound on bound
 /// parameters, and a round number of prepared-statement shapes to cache.
@@ -282,7 +339,22 @@ impl FileHashCache<'_> {
         version: i64,
         pairs: &[(String, String)],
     ) -> rusqlite::Result<()> {
-        if pairs.is_empty() {
+        let rows: Vec<_> = pairs
+            .iter()
+            .map(|(content, scan)| (content.clone(), scan.clone(), Vec::new()))
+            .collect();
+        self.put_cc_header_scans_with_macros(version, &rows)
+    }
+
+    /// Record each `(content, scan, macros)`, where `macros` holds the
+    /// header's macro definitions as `(name, bodies)`. They are written with
+    /// the scan, and replaced with it when the version changes.
+    pub fn put_cc_header_scans_with_macros(
+        &self,
+        version: i64,
+        rows: &[CcHeaderScanRow],
+    ) -> rusqlite::Result<()> {
+        if rows.is_empty() {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
@@ -292,11 +364,63 @@ impl FileHashCache<'_> {
                  ON CONFLICT(content) DO UPDATE SET scan = excluded.scan, version = excluded.version
                  WHERE cc_header_scans.version != excluded.version",
             )?;
-            for (content, scan) in pairs {
-                put.execute(params![content, scan, version])?;
+            let mut clear = tx.prepare_cached("DELETE FROM cc_header_macros WHERE content = ?1")?;
+            let mut define = tx.prepare_cached(
+                "INSERT INTO cc_header_macros(name, version, content, bodies) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (content, scan, macros) in rows {
+                // Unchanged when this version is already recorded, macros too.
+                if put.execute(params![content, scan, version])? == 0 {
+                    continue;
+                }
+                clear.execute(params![content])?;
+                for (name, bodies) in macros {
+                    define.execute(params![name, version, content, bodies])?;
+                }
             }
         }
         tx.commit()
+    }
+
+    /// The recorded macro definitions named `names` in any of `contents`,
+    /// as `(content, name, bodies)`. Every chunk reads one snapshot, so a
+    /// marker row found by one chunk vouches for what the others found.
+    pub fn get_cc_header_macros(
+        &self,
+        version: i64,
+        contents: &[&str],
+        names: &[&str],
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let wanted: std::collections::HashSet<&str> = contents.iter().copied().collect();
+        let mut found = Vec::new();
+        let snapshot = Transaction::new_unchecked(self.db(), TransactionBehavior::Deferred)?;
+        for chunk in names.chunks(MEMO_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = snapshot.prepare_cached(&format!(
+                "SELECT content, name, bodies FROM cc_header_macros
+                 WHERE version = ?1 AND name IN ({placeholders})"
+            ))?;
+            let args = std::iter::once(rusqlite::types::Value::Integer(version)).chain(
+                chunk
+                    .iter()
+                    .map(|name| rusqlite::types::Value::Text((*name).into())),
+            );
+            let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let row = row?;
+                if wanted.contains(row.0.as_str()) {
+                    found.push(row);
+                }
+            }
+        }
+        snapshot.finish()?;
+        Ok(found)
     }
 
     /// Memoised mapped hashes for `contents` under the map set `maps`,
@@ -342,13 +466,17 @@ impl FileHashCache<'_> {
                 "SELECT content, construct FROM cc_asm_scans
                  WHERE content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
+            let keys = chunk
+                .iter()
+                .map(|content| format!("{CC_ASM_SCAN_KEY}{content}"));
+            let rows = stmt.query_map(rusqlite::params_from_iter(keys), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                let (content, construct) = row?;
-                found.insert(content, construct);
+                let (key, construct) = row?;
+                if let Some(content) = key.strip_prefix(CC_ASM_SCAN_KEY) {
+                    found.insert(content.to_string(), construct);
+                }
             }
         }
         Ok(found)
@@ -369,7 +497,7 @@ impl FileHashCache<'_> {
                  WHERE cc_asm_scans.rule < excluded.rule"
             ))?;
             for (content, construct) in pairs {
-                put.execute(params![content, construct])?;
+                put.execute(params![format!("{CC_ASM_SCAN_KEY}{content}"), construct])?;
             }
         }
         tx.commit()
@@ -412,12 +540,10 @@ impl FileHashCache<'_> {
         let mut stmt = self.db().prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
-                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof,
-                    s.version, s.scan
+                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
              FROM cc_preprocess_memos m
              LEFT JOIN cc_memo_input_refs r ON r.memo_id = m.id
              LEFT JOIN cc_memo_inputs i ON i.id = r.input_id
-             LEFT JOIN cc_header_scans s ON s.content = i.content
              WHERE m.memo_key = ?1 ORDER BY i.name, r.input_id",
         )?;
         let mut rows = stmt.query([memo_key])?;
@@ -432,7 +558,7 @@ impl FileHashCache<'_> {
                 result = Some(CcPreprocessMemo {
                     preprocessed_hash: row.get(0)?,
                     inputs: Vec::new(),
-                    header_scans: Vec::new(),
+                    shadowing: None,
                     needs_touch: row.get(2)?,
                 });
             }
@@ -444,11 +570,6 @@ impl FileHashCache<'_> {
                 inode: row.get(11)?,
             };
             let proven = row.get::<_, Option<i64>>(12)? == Some(stamp_proof(&stamp));
-            result.as_mut().unwrap().header_scans.push(
-                row.get::<_, Option<i64>>(13)?
-                    .map(|version| row.get(14).map(|scan| (version, scan)))
-                    .transpose()?,
-            );
             result.as_mut().unwrap().inputs.push(CcPreprocessMemoInput {
                 name: row.get(4)?,
                 content: row.get(5)?,
@@ -458,7 +579,20 @@ impl FileHashCache<'_> {
             });
         }
         // A damaged/incomplete reference set cannot stand in for the full closure.
-        Ok(result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count))
+        let Some(mut memo) =
+            result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count)
+        else {
+            return Ok(None);
+        };
+        // Apart from the rows above: the sort would copy it into every one.
+        // A value from a newer row is harmless, since it names its inputs.
+        memo.shadowing = self
+            .db()
+            .prepare_cached("SELECT shadowing FROM cc_preprocess_memos WHERE memo_key = ?1")?
+            .query_row([memo_key], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(Some(memo))
     }
 
     /// Record `inputs` as the read set behind `preprocessed_hash`.
@@ -479,7 +613,8 @@ impl FileHashCache<'_> {
         let id: i64 = tx.query_row(
             "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
              VALUES (?1, ?2, 0) ON CONFLICT(memo_key) DO UPDATE SET
-             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch(),
+             shadowing = NULL
              RETURNING id",
             params![memo_key, preprocessed_hash],
             |row| row.get(0),
@@ -558,6 +693,22 @@ impl FileHashCache<'_> {
         self.put_cc_preprocess_memo_inputs(memo_key, hash, &inputs)
     }
 
+    /// Attach the compiler's include-shadowing derivation to the memo row
+    /// that still records `preprocessed_hash`. A row replaced since keeps
+    /// whatever it has.
+    pub fn set_cc_preprocess_memo_shadowing(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        shadowing: &str,
+    ) -> rusqlite::Result<usize> {
+        self.db().execute(
+            "UPDATE cc_preprocess_memos SET shadowing = ?3
+             WHERE memo_key = ?1 AND preprocessed_hash = ?2",
+            params![memo_key, preprocessed_hash, shadowing],
+        )
+    }
+
     /// Called after a successful validation and only when the read marked it
     /// due. The SQL guard also bounds updates by competing processes.
     pub fn touch_cc_preprocess_memo(&self, memo_key: &str) -> rusqlite::Result<usize> {
@@ -587,6 +738,11 @@ impl FileHashCache<'_> {
         tx.execute(
             "DELETE FROM cc_header_scans WHERE content NOT IN
              (SELECT content FROM cc_memo_inputs)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM cc_header_macros WHERE content NOT IN
+             (SELECT content FROM cc_header_scans)",
             [],
         )?;
         tx.commit()?;
@@ -656,25 +812,59 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(id_order, ["z.h", "a.h"]);
-        cache
-            .put_cc_header_scans(
-                6,
-                &[
-                    ("first".into(), "first scan".into()),
-                    ("last".into(), "last scan".into()),
-                ],
-            )
-            .unwrap();
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
+    }
+
+    #[test]
+    fn an_index_from_before_the_shadowing_column_gains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .db()
+            .execute_batch("ALTER TABLE cc_preprocess_memos DROP COLUMN shadowing")
+            .unwrap();
+        assert!(!has_shadowing_column(cache.db()).unwrap());
+        ensure_schema(cache.db()).unwrap();
+        assert!(has_shadowing_column(cache.db()).unwrap());
+        // A racing process that added it first is not an error; anything
+        // else is.
+        add_shadowing_column(cache.db()).unwrap();
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(add_shadowing_column(&bare).is_err());
+    }
+
+    #[test]
+    fn shadowing_stays_with_the_row_it_was_derived_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let shadowing = |cache: &FileHashCache| {
+            cache
+                .get_cc_preprocess_memo("unit")
+                .unwrap()
+                .unwrap()
+                .shadowing
+        };
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "first", &[input("a.h", "a")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None);
         assert_eq!(
-            memo.header_scans,
-            [
-                Some((6, "first scan".into())),
-                Some((6, "last scan".into()))
-            ]
+            cache
+                .set_cc_preprocess_memo_shadowing("unit", "other", "stale")
+                .unwrap(),
+            0
         );
+        cache
+            .set_cc_preprocess_memo_shadowing("unit", "first", "derived")
+            .unwrap();
+        assert_eq!(shadowing(&cache).as_deref(), Some("derived"));
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "second", &[input("b.h", "b")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None, "a replaced row drops it");
     }
 
     #[test]
@@ -710,19 +900,108 @@ mod tests {
         cache
             .put_cc_preprocess_memo_inputs("live", "hash", &[input("a.h", "content-0")])
             .unwrap();
-        assert_eq!(
-            cache
-                .get_cc_preprocess_memo("live")
-                .unwrap()
-                .unwrap()
-                .header_scans,
-            [Some((2, "new".into()))]
-        );
         cache.prune_cc_preprocess_memos().unwrap();
         assert_eq!(count(&cache, "cc_header_scans"), 1);
         assert_eq!(
             cache.get_cc_header_scans(2, &["content-0"]).unwrap()["content-0"],
             "new"
+        );
+    }
+
+    #[test]
+    fn header_macros_follow_their_scan_and_are_read_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let macros = |names: &[&str]| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|name| (name.to_string(), format!("body-{name}")))
+                .collect()
+        };
+        cache
+            .put_cc_header_scans_with_macros(
+                1,
+                &[
+                    ("a".into(), "scan-a".into(), macros(&["CAT", "SYM"])),
+                    ("b".into(), "scan-b".into(), macros(&["CAT"])),
+                ],
+            )
+            .unwrap();
+        let mut found = cache
+            .get_cc_header_macros(1, &["a", "b"], &["CAT"])
+            .unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("a".into(), "CAT".into(), "body-CAT".into()),
+                ("b".into(), "CAT".into(), "body-CAT".into())
+            ]
+        );
+        assert_eq!(
+            cache
+                .get_cc_header_macros(1, &["b"], &["CAT", "SYM"])
+                .unwrap(),
+            [("b".into(), "CAT".into(), "body-CAT".into())],
+            "only the contents asked for"
+        );
+        assert!(
+            cache
+                .get_cc_header_macros(2, &["a"], &["CAT"])
+                .unwrap()
+                .is_empty()
+        );
+        // Recording the same version again keeps what is there.
+        cache
+            .put_cc_header_scans_with_macros(1, &[("a".into(), "scan-a".into(), macros(&[]))])
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_cc_header_macros(1, &["a"], &["SYM"])
+                .unwrap()
+                .len(),
+            1
+        );
+        // A new version replaces the scan and every definition with it.
+        cache
+            .put_cc_header_scans_with_macros(2, &[("a".into(), "scan-a2".into(), macros(&["NEW"]))])
+            .unwrap();
+        assert!(
+            cache
+                .get_cc_header_macros(1, &["a"], &["SYM", "CAT"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cache
+                .get_cc_header_macros(2, &["a"], &["NEW"])
+                .unwrap()
+                .len(),
+            1
+        );
+        // Pruned with the scan once no memo reads the content.
+        cache.prune_cc_preprocess_memos().unwrap();
+        assert_eq!(count(&cache, "cc_header_macros"), 0);
+    }
+
+    #[test]
+    fn header_macros_are_read_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let names: Vec<String> = (0..MEMO_LOOKUP_CHUNK * 2 + 1)
+            .map(|n| format!("M{n}"))
+            .collect();
+        let macros = names
+            .iter()
+            .map(|name| (name.clone(), "[]".to_owned()))
+            .collect();
+        cache
+            .put_cc_header_scans_with_macros(1, &[("a".into(), "scan".into(), macros)])
+            .unwrap();
+        let asked: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            cache.get_cc_header_macros(1, &["a"], &asked).unwrap().len(),
+            names.len()
         );
     }
 
@@ -1093,6 +1372,40 @@ mod tests {
         assert_eq!(mapped.get("c").map(String::as_str), Some("current"));
         let verdicts = cache.get_cc_asm_scans(&["c"]).unwrap();
         assert_eq!(verdicts.get("c").map(String::as_str), Some(""));
+    }
+
+    /// Verdicts under other scan rules are kept apart in both directions: an
+    /// older release's `\()` refusal is scanned again, and it never reads a
+    /// verdict this release records.
+    #[test]
+    fn assembler_verdicts_from_other_scan_rules_are_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let older = |cache: &FileHashCache<'_>| -> Option<String> {
+            cache
+                .db()
+                .query_row(
+                    "SELECT construct FROM cc_asm_scans WHERE content = 'c' AND rule >= 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+        };
+        cache
+            .db()
+            .execute(
+                "INSERT INTO cc_asm_scans(content, construct, rule) VALUES ('c', ?1, 1)",
+                [r"\()"],
+            )
+            .unwrap();
+        assert!(cache.get_cc_asm_scans(&["c"]).unwrap().is_empty());
+
+        cache
+            .put_cc_asm_scans(&[("c".into(), String::new())])
+            .unwrap();
+        let verdicts = cache.get_cc_asm_scans(&["c"]).unwrap();
+        assert_eq!(verdicts.get("c").map(String::as_str), Some(""));
+        assert_eq!(older(&cache).as_deref(), Some(r"\()"));
     }
 
     #[test]

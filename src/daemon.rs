@@ -26,6 +26,9 @@ mod execution;
 #[cfg(windows)]
 #[path = "daemon_execution_windows.rs"]
 mod execution;
+#[cfg(any(windows, test))]
+#[path = "daemon_image.rs"]
+mod image;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -3179,7 +3182,7 @@ impl Daemon {
             Err(error) => return Response::err(format!("store open failed: {error}")),
         };
 
-        let since = stats_window(req).cutoff(chrono::Utc::now());
+        let since = stats_window(req).cutoff(jiff::Timestamp::now());
         let es =
             events::event_stats_since(&self.config.event_log_path(), since).unwrap_or_default();
         let recent_summaries = if req.include_summaries {
@@ -3220,6 +3223,7 @@ impl Daemon {
             stores: inventory.stores,
             events: EventStatsResponse {
                 local_hits: es.local_hits,
+                readonly_hits: es.readonly_hits,
                 prefetch_hits: es.prefetch_hits,
                 remote_hits: es.remote_hits,
                 dups: es.dups,
@@ -4385,12 +4389,16 @@ impl Daemon {
         self.transfer_counters
             .remote_check_roundtrips
             .fetch_add(1, Ordering::Relaxed);
-        let download_result = deadline
-            .run(
-                "demand GET and extraction",
-                remote_cache.download_entry(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
-            )
-            .await;
+        let key = req.key.clone();
+        let crate_name = cn.to_string();
+        let deadline_at = deadline.at();
+        let remote_cache = Arc::clone(&remote_cache);
+        let download_result = finish_compile_remote_download(deadline, async move {
+            remote_cache
+                .download_entry(&key, &crate_name, &entry_dir, &blobs_dir, deadline_at)
+                .await
+        })
+        .await;
         drop(semaphore_permit);
 
         match download_result {
@@ -6067,7 +6075,7 @@ impl Daemon {
         let used_bytes = plan.used_bytes();
         let downloaded_bytes: u64 = plan.downloaded.values().sum();
         let event = crate::events::BuildSummaryEvent {
-            ts: chrono::Utc::now(),
+            ts: jiff::Timestamp::now(),
             schema: 2,
             incomplete,
             session_id: plan.session_id.clone(),
@@ -6747,6 +6755,10 @@ impl Daemon {
                         crate::report::format_bytes(handoffs.bytes_reclaimed)
                     );
                 }
+                let trash_removed = store.sweep_evicted_trash();
+                if trash_removed > 0 {
+                    tracing::info!("removed {trash_removed} items left in the eviction trash");
+                }
                 if staging_stats.removed > 0 {
                     tracing::info!(
                         "swept {} stale staging files ({})",
@@ -6960,6 +6972,8 @@ pub fn run_server(
         .enable_all()
         .build()?;
 
+    // Here and not in `server_main`, which tests run inside a shared process.
+    crate::memo_writer::enable();
     run_daemon_runtime(
         rt,
         server_main(
@@ -6982,7 +6996,7 @@ fn run_daemon_runtime(
     // GC or migration does not cancel its spawn_blocking work: dropping the
     // runtime would wait forever and keep the daemon run lock held. This is
     // the foreground daemon's exit path; the process ends after we return.
-    runtime.shutdown_timeout(Duration::from_secs(1));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
 }
 
@@ -7143,6 +7157,54 @@ pub(crate) async fn drain_publications_then_close_uploads(
     daemon.close_upload_queue();
 }
 
+/// Close admission once the config file has changed and no request is running,
+/// so the daemon exits and its next start loads the new config. Returns as soon
+/// as admission closes for another reason. `changed` is called once per
+/// `interval`, starting one interval in, until it first returns true. Kept out
+/// of `server_main` so tests can drive it.
+async fn reload_when_config_changes(
+    lifecycle: Arc<Lifecycle>,
+    interval: Duration,
+    mut changed: impl FnMut() -> bool,
+) {
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticks.tick().await;
+    let mut change_seen = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = lifecycle.draining() => return,
+            _ = ticks.tick() => {}
+        }
+        if !change_seen {
+            if !changed() {
+                continue;
+            }
+            change_seen = true;
+            tracing::info!(
+                active = lifecycle.snapshot().active,
+                "config file changed on disk, restarting to reload it once running requests finish"
+            );
+        }
+        // A drain aborts handlers that outlive the drain timeout, and that
+        // fails a compile the daemon has already accepted (#1987), so wait
+        // until no request is running. `Lifecycle` cannot check and close
+        // admission in one step, so a request can still be admitted between
+        // the check and `start_drain`, and it is handled as any drain handles
+        // it. A short request finishes within the drain timeout. On Unix a
+        // compile admitted then is normally sent back to compile locally
+        // before `Prepared`; on Windows the daemon sends `Prepared` before it
+        // looks at the drain, so that compile can fail.
+        if lifecycle.snapshot().active == 0 {
+            if lifecycle.start_drain() {
+                tracing::info!("no request running, restarting to reload the changed config");
+            }
+            return;
+        }
+    }
+}
+
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -7283,6 +7345,12 @@ async fn server_main(
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
+    // The index's pages, back in the page cache while the machine has room
+    // for them (`index_residency`): a hit reads them before anything else,
+    // and an evicted page waits for a busy disk.
+    #[cfg(target_os = "linux")]
+    crate::index_residency::spawn(&daemon.config.index_db_path());
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -7404,31 +7472,17 @@ async fn server_main(
     // Config watchdog: the daemon loads its config once at startup, so an edit
     // to the config file (e.g. `local_max_size`) would otherwise require a
     // manual `kache daemon stop`. Periodically re-fingerprint the active config
-    // file; on a change, schedule a graceful restart so the service manager (or
-    // the next build's auto-spawn) brings the daemon back up with the new
-    // config. This watches only the file the daemon itself resolved — it sends
-    // no per-client signal, so it can't thrash across projects.
+    // file; on a change, wait until no request is running, then schedule a
+    // graceful restart so the service manager (or the next build's auto-spawn)
+    // brings the daemon back up with the new config. A compile that is running
+    // finishes first. This watches only the file the daemon itself resolved and
+    // sends no per-client signal, so it can't thrash across projects.
     let config_provenance = provenance.clone();
-    let config_watch_lifecycle = Arc::clone(&lifecycle);
-
-    let config_watch_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DAEMON_CONFIG_WATCH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = config_watch_lifecycle.draining() => break,
-                _ = interval.tick() => {}
-            }
-            if crate::config::config_file_has_changed(&config_provenance) {
-                tracing::info!("config file changed on disk, scheduling restart to reload it");
-                config_watch_lifecycle.start_drain();
-
-                break;
-            }
-        }
-    });
+    let config_watch_handle = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        DAEMON_CONFIG_WATCH_INTERVAL,
+        move || crate::config::config_file_has_changed(&config_provenance),
+    ));
 
     // Idle watchdog: exit if no connections received for this duration.
     // Prevents zombie daemons from accumulating when the user isn't building.
@@ -7459,7 +7513,7 @@ async fn server_main(
         let _ = handle.await;
     }
     if daemon
-        .finish_prefetch_shutdown(Duration::from_secs(5))
+        .finish_prefetch_shutdown(PREFETCH_SHUTDOWN_TIMEOUT)
         .await
     {
         tracing::warn!(
@@ -7471,7 +7525,13 @@ async fn server_main(
 
     drain_publications_then_close_uploads(&daemon, publish_done).await;
     drop(daemon);
-    if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
+    if drain_upload_pipeline(
+        enqueue_handle,
+        upload_handles,
+        UPLOAD_PIPELINE_DRAIN_TIMEOUT,
+    )
+    .await
+    {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
 
@@ -7549,11 +7609,16 @@ fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
     None
 }
 
-/// Maximum time to let accepted IPC handlers finish their current response
-/// during shutdown. A bounded drain preserves in-flight replies (including the
-/// shutdown acknowledgement) without letting a silent client hold the daemon
-/// open forever.
-const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// `kache daemon restart` waits 35s for this process to drop the run lock.
+/// Handler drain, prefetch shutdown, upload drain, and runtime shutdown are
+/// that wait. A compile whose remote op is still running is already a miss.
+const PREFETCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(12);
+const UPLOAD_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+/// After abort, a handler parked on an await joins immediately. One still
+/// inside a call that does not yield is detached so the drain can return.
+const HANDLER_ABORT_JOIN_GRACE: Duration = Duration::from_millis(200);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
 /// download of the same key before giving up and reporting a remote miss
@@ -7905,6 +7970,99 @@ fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinE
     false
 }
 
+/// Poll a compile-path download on a thread the handler does not share.
+///
+/// `RemoteDeadline::run` is polled on the handler task. A GET that blocks
+/// inside `poll` (a silent read, a credential helper) never returns to that
+/// poll, so the deadline, the connection permit, and stats all wait with it.
+/// The worker thread owns that poll and is detached when `spawn` returns.
+/// An elapsed budget answers from the handler; process exit reaps the thread.
+///
+/// The wait future owns the cancel sender. Dropping that wait (the budget
+/// elapsed) closes the sender. The worker checks it before every poll of the
+/// download. Tokio's timeout polls the inner future first, so a permit that
+/// arrives after the budget would otherwise finish this GET. That completion
+/// is this request's miss only: it must not stay joinable for the next check.
+async fn finish_compile_remote_download<T, F>(
+    deadline: RemoteDeadline,
+    download: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    if deadline.check("demand GET and extraction").is_err() {
+        return Err(compile_remote_download_abandoned());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    if let Err(error) = std::thread::Builder::new()
+        .name("kache-compile-remote".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("compile remote runtime")
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
+            let outcome = runtime.block_on(async move {
+                let mut download = std::pin::pin!(download);
+                let mut cancel = cancel_rx;
+                std::future::poll_fn(move |cx| {
+                    poll_compile_download(download.as_mut(), &mut cancel, cx)
+                })
+                .await
+            });
+            // Deliver the result before runtime shutdown. Shutdown only reaps
+            // this thread; the handler must already be free to answer.
+            let _ = tx.send(outcome);
+            runtime.shutdown_timeout(Duration::from_millis(50));
+        })
+    {
+        tracing::warn!("compile remote thread did not start: {error}");
+        return Err(compile_remote_download_abandoned());
+    }
+    deadline
+        .run("demand GET and extraction", async move {
+            // Dropped when the budget wins, which closes `cancel_rx` before
+            // this function returns to the caller.
+            let _cancel = cancel_tx;
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(compile_remote_download_abandoned()),
+            }
+        })
+        .await
+}
+
+fn compile_remote_download_abandoned() -> anyhow::Error {
+    anyhow::Error::new(crate::remote_resilience::RemoteDeadlineElapsed {
+        stage: "demand GET and extraction",
+    })
+}
+
+/// `cancel` is the handler's wait. Once that wait is gone, do not poll
+/// `download`: a later wake (the permit the next check needs) would complete
+/// the abandoned GET. Tokio timeout checks its future before its deadline.
+fn poll_compile_download<F, T>(
+    download: std::pin::Pin<&mut F>,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<anyhow::Result<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    if std::pin::Pin::new(cancel).poll(cx).is_ready() {
+        return std::task::Poll::Ready(Err(compile_remote_download_abandoned()));
+    }
+    download.poll(cx)
+}
+
 /// Drain all accepted connection handlers under one deadline. Returns true if
 /// unfinished handlers had to be aborted.
 async fn drain_connection_handlers(
@@ -7924,8 +8082,15 @@ async fn drain_connection_handlers(
     }
 
     handlers.abort_all();
-    while let Some(result) = handlers.join_next().await {
-        observe_connection_handler(result);
+    let joined = tokio::time::timeout(HANDLER_ABORT_JOIN_GRACE, async {
+        while let Some(result) = handlers.join_next().await {
+            observe_connection_handler(result);
+        }
+    })
+    .await
+    .is_ok();
+    if !joined {
+        handlers.detach_all();
     }
     true
 }
@@ -9915,7 +10080,58 @@ fn spawn_detached_daemon(
     exe: &Path,
     stderr_target: kunobi_daemon::launch::DaemonOutput,
 ) -> Result<kunobi_daemon::launch::DaemonChild> {
-    let mut command = daemon_run_command(exe);
+    spawn_detached(daemon_run_command(exe), stderr_target)
+}
+
+/// Start the daemon for the engine at `exe`, logging to what `stderr` opens.
+///
+/// On Windows the daemon runs from a copy of `exe` ([`image`]), so installing
+/// a new release can replace `exe`. When the copy cannot be made or started,
+/// the daemon runs from `exe`, as it did before.
+fn spawn_daemon(
+    exe: &Path,
+    deadline: Instant,
+    stderr: impl Fn() -> kunobi_daemon::launch::DaemonOutput,
+) -> Result<kunobi_daemon::launch::DaemonChild> {
+    #[cfg(windows)]
+    {
+        let root = image::root();
+        if let Ok(root) = &root
+            && exe.starts_with(root)
+        {
+            // A process the daemon started runs its copy already. That copy
+            // finds its frontend only through the envelope it was given.
+            let frontend =
+                crate::platform::frontend_executable().context("locating the Kache frontend")?;
+            return spawn_detached(image::command(exe, &frontend), stderr());
+        }
+        let wait = image::lock_deadline(Instant::now(), deadline);
+        let started = root.and_then(|root| {
+            let lock = image::lock(&root, wait)?;
+            let staged = image::stage(exe, &root, &lock)?;
+            spawn_detached(
+                image::command(&staged, &kache_shims::frontend_for(exe)),
+                stderr(),
+            )
+        });
+        match started {
+            Ok(child) => return Ok(child),
+            Err(error) => tracing::warn!(
+                "starting the daemon from a copy of {} failed, so it runs that file and an \
+                 upgrade cannot replace it until the daemon stops: {error:#}",
+                exe.display()
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = deadline;
+    spawn_detached_daemon(exe, stderr())
+}
+
+fn spawn_detached(
+    mut command: std::process::Command,
+    stderr_target: kunobi_daemon::launch::DaemonOutput,
+) -> Result<kunobi_daemon::launch::DaemonChild> {
     strip_ambient_remote_env(&mut command);
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();

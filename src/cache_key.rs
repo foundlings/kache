@@ -282,6 +282,13 @@ mod apple_install_name;
 // `-L native=` directory in its own `OUT_DIR` is keyed below the profile
 // directory instead of the target directory.
 //
+// No bump: a native Linux link through a driver other than the PATH's `cc`
+// also folds that driver's bytes (`link_driver` among the CRT objects), so a
+// wrapper script named by `-C linker` keys by its content, not only by the
+// banner it forwards. Links through `cc` keep their keys; those through
+// another driver change once. A native macOS link folds such a driver's bytes
+// the same way, after its SDK identity (#1966), also with no bump.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or an `OUT_DIR` the compile reads from
 // sits under it. Those are the paths rustc writes into the rmeta; `--out-dir`
@@ -289,6 +296,10 @@ mod apple_install_name;
 // `KACHE_RUSTC_PATH_NORMALIZE=0` still fold every prefix. Only the trybuild
 // `remap:none` bytes change, so a previous trybuild entry misses and every
 // other key stays valid.
+//
+// Keying adjacent cc `-I` operands in a canonical order needs no bump either.
+// A compile with such a run folds a new marker into its resolution digest, so
+// its earlier entries miss once; a compile without one keys as before.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -306,7 +317,7 @@ pub(crate) use kache_format::CACHE_KEY_VERSION;
 /// Order is preserved: `-Cfoo=a -Cfoo=b` and `-Cfoo=b -Cfoo=a` produce
 /// distinct strings because later flags override earlier ones in
 /// rustc's parser, so they MUST keep distinct keys.
-fn normalize_rustflags(rustflags: &str) -> String {
+pub(crate) fn normalize_rustflags(rustflags: &str) -> String {
     rustflags.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -329,7 +340,7 @@ const REMAP_FROM_SENTINEL: &str = "<REMAP_FROM>";
 /// adding/removing a remap or changing TO still diverges the key. This mirrors
 /// the cc recipe, which keys on the prefix-map `to` sentinel and scrubs the
 /// `from` build path ([`crate::compiler::cc`]).
-fn scrub_remap_from_prefixes<'a, I>(tokens: I) -> Vec<String>
+pub(crate) fn scrub_remap_from_prefixes<'a, I>(tokens: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -372,7 +383,10 @@ fn scrub_remap_value(value: &str) -> String {
 /// FROM side of a direct rustc remap. Unlike environment-provided build-system
 /// remaps, an arbitrary direct FROM may not match this invocation at all, so
 /// erasing it unconditionally would collide with a mapping that does match.
-fn normalize_direct_remap_value(value: &str, path_normalizer: &PathNormalizer) -> String {
+pub(crate) fn normalize_direct_remap_value(
+    value: &str,
+    path_normalizer: &PathNormalizer,
+) -> String {
     match value.rsplit_once('=') {
         Some((from, to)) => format!("{}={to}", path_normalizer.normalize(from)),
         None => value.to_string(),
@@ -647,7 +661,7 @@ fn env_text_key_bytes(text: &std::ffi::OsStr) -> Vec<u8> {
 /// `String` sort produced for every valid-UTF-8 environment. The
 /// lossless tiebreak pins two names that collide under U+FFFD to a
 /// deterministic order instead of platform iteration order.
-fn cargo_cfg_pairs(
+pub(crate) fn cargo_cfg_pairs(
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = vars
@@ -905,6 +919,18 @@ impl TreeGuard {
         crate::phase_trace::decision("tree_recheck", if held { "held" } else { "moved" });
         held
     }
+
+    /// What a discovery flight's holder notes about its tree: the digest,
+    /// then each root the guard walked, one per line
+    /// ([`crate::scheduler::is_another_tree`]).
+    pub(crate) fn flight_note(&self) -> String {
+        let mut note = self.digest.clone();
+        for walk in &self.walks {
+            note.push('\n');
+            note.push_str(&walk.root.path.to_string_lossy());
+        }
+        note
+    }
 }
 
 #[cfg(test)]
@@ -942,14 +968,45 @@ impl GuardWalk {
     }
 }
 
-/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk_observing`]
-/// takes it.
-#[derive(Debug, Clone)]
+/// One root of a [`GuardWalk`], as [`stamp_roots`] walks it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WalkedRoot {
     path: PathBuf,
     role: Vec<u8>,
     excluded: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root.
+    excluded_dirs: Vec<std::ffi::OsString>,
     rules: crate::tree_stamp::StampRules,
+}
+
+/// What a guard walk leaves out below its root: `paths`, and every
+/// directory named in `dir_names` ([`names_guard_excluded`]). A symlink is
+/// never a directory here.
+#[derive(Clone, Copy)]
+struct GuardSkips<'a> {
+    paths: &'a [PathBuf],
+    dir_names: &'a [std::ffi::OsString],
+}
+
+impl GuardSkips<'_> {
+    fn skips(&self, path: &Path, entry: &std::fs::DirEntry) -> bool {
+        self.paths
+            .iter()
+            .any(|skipped| skipped.file_name() == path.file_name() && skipped == path)
+            || (!self.dir_names.is_empty()
+                && names_guard_excluded(&entry.file_name(), self.dir_names)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    }
+}
+
+/// Is `name` one of `excluded`? Compared without ASCII case, as a
+/// case-insensitive filesystem would match it.
+fn names_guard_excluded(name: &OsStr, excluded: &[std::ffi::OsString]) -> bool {
+    excluded.iter().any(|excluded| {
+        excluded
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_encoded_bytes())
+    })
 }
 
 /// Why [`stamp_roots`] gave no stamps.
@@ -963,10 +1020,11 @@ enum StampRefusal {
     Unwalkable,
 }
 
+#[derive(Clone)]
 struct StampedRoot {
     stamp: crate::tree_stamp::TreeStamp,
     entries: usize,
-    small_files: Vec<FileFingerprint>,
+    small_files: std::sync::Arc<Vec<FileFingerprint>>,
 }
 
 // A weak identity can survive replacement while the containing tree changes.
@@ -988,7 +1046,6 @@ fn guard_file_memo_eligible(size: i64, inode: i64) -> bool {
 fn stamp_roots(
     roots: &[WalkedRoot],
     max_entries: usize,
-    collect_small_files: bool,
 ) -> std::result::Result<Vec<StampedRoot>, StampRefusal> {
     let mut stamps = Vec::with_capacity(roots.len());
     for (index, root) in roots.iter().enumerate() {
@@ -998,47 +1055,14 @@ fn stamp_roots(
                 hook(&root.path);
             }
         });
-        let mut stamper = crate::tree_stamp::Stamper::new();
-        let mut budget = max_entries;
-        stamper.label(&root.role);
-        let mut small_files = Vec::new();
-        let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
-            let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-            let inode = metadata_inode(metadata);
-            if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
-                // The memo stores UTF-8 paths. Lossy spellings could merge
-                // distinct names in the path-keyed batch result.
-                if !path.is_absolute() {
-                    return;
-                }
-                let Ok(path) = path.into_os_string().into_string() else {
-                    return;
-                };
-                small_files.push(FileFingerprint {
-                    path,
-                    size,
-                    mtime_ns: metadata_mtime_ns(metadata),
-                    ctime_ns: metadata_ctime_ns(metadata),
-                    inode,
-                });
+        match stamp_one_root(root, max_entries) {
+            Ok(stamped) => stamps.push(stamped),
+            Err(crate::tree_stamp::WalkOutcome::TooLarge) => {
+                return Err(StampRefusal::TooLarge(index));
             }
-        };
-        match stamper.walk_observing(
-            &root.path,
-            &root.excluded,
-            root.rules,
-            &mut budget,
-            &mut observe,
-        ) {
-            crate::tree_stamp::WalkOutcome::Fits => {
-                stamps.push(StampedRoot {
-                    stamp: stamper.finish(),
-                    entries: max_entries - budget,
-                    small_files,
-                });
-            }
-            crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
-            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
+            Err(
+                crate::tree_stamp::WalkOutcome::Unreadable | crate::tree_stamp::WalkOutcome::Fits,
+            ) => return Err(StampRefusal::Unwalkable),
         }
     }
     if stamps.iter().map(|root| root.entries).sum::<usize>() > max_entries {
@@ -1047,9 +1071,77 @@ fn stamp_roots(
     Ok(stamps)
 }
 
+/// Concurrent walks of one root, as units of one workspace stamp it and
+/// check the stamp a guard took ([`GuardWalk::holds`]).
+static STAMP_WALKS: std::sync::LazyLock<
+    crate::walk_flight::NextFlight<(WalkedRoot, usize), StampOutcome>,
+> = std::sync::LazyLock::new(crate::walk_flight::NextFlight::new);
+
+type StampOutcome = std::result::Result<StampedRoot, crate::tree_stamp::WalkOutcome>;
+
+/// The stamp of `root` from a walk that started after this call, shared with
+/// the units that asked for the same walk meanwhile ([`crate::walk_flight`]).
+fn stamp_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
+    let _trace = crate::phase_trace::phase("stamp_flight");
+    STAMP_WALKS.run(&(root.clone(), max_entries), || {
+        let _trace = crate::phase_trace::phase("stamp_walk");
+        walk_one_root(root, max_entries)
+    })
+}
+
+/// One walk of `root`: its stamp, and the small files a content fold looks
+/// up in the file-hash memo. Every walk lists them, though only a fold uses
+/// them: a guard's check then asks for the walk a unit stamping the root
+/// asks for, and the two share one.
+fn walk_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
+    let mut stamper = crate::tree_stamp::Stamper::new();
+    let mut budget = max_entries;
+    stamper.label(&root.role);
+    let mut small_files = Vec::new();
+    let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let inode = metadata_inode(metadata);
+        if metadata.is_file() && guard_file_memo_eligible(size, inode) {
+            // The memo stores UTF-8 paths. Lossy spellings could merge
+            // distinct names in the path-keyed batch result.
+            if !path.is_absolute() {
+                return;
+            }
+            let Ok(path) = path.into_os_string().into_string() else {
+                return;
+            };
+            small_files.push(FileFingerprint {
+                path,
+                size,
+                mtime_ns: metadata_mtime_ns(metadata),
+                ctime_ns: metadata_ctime_ns(metadata),
+                inode,
+            });
+        }
+    };
+    let skips = GuardSkips {
+        paths: &root.excluded,
+        dir_names: &root.excluded_dirs,
+    };
+    match stamper.walk_skipping_observing(
+        &root.path,
+        &|path, entry| skips.skips(path, entry),
+        root.rules,
+        &mut budget,
+        &mut observe,
+    ) {
+        crate::tree_stamp::WalkOutcome::Fits => Ok(StampedRoot {
+            stamp: stamper.finish(),
+            entries: max_entries - budget,
+            small_files: std::sync::Arc::new(small_files),
+        }),
+        outcome => Err(outcome),
+    }
+}
+
 /// [`stamp_roots`] for one root.
 fn stamp_root(root: &WalkedRoot, max_entries: usize) -> Option<crate::tree_stamp::TreeStamp> {
-    let stamped = stamp_roots(std::slice::from_ref(root), max_entries, false)
+    let stamped = stamp_roots(std::slice::from_ref(root), max_entries)
         .ok()?
         .pop()?;
     Some(stamped.stamp)
@@ -1201,6 +1293,9 @@ struct TreeRoot<'a> {
     /// Kache's own directories, and what Cargo writes in its home, below the
     /// root ([`own_dirs_within`]), left out wherever they lie.
     own: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root
+    /// ([`WorkspaceRoots::guard_excluded`]).
+    excluded_dirs: Vec<std::ffi::OsString>,
 }
 
 impl<'a> TreeRoot<'a> {
@@ -1211,12 +1306,20 @@ impl<'a> TreeRoot<'a> {
             skipped,
             skips_build_dirs: false,
             own: Vec::new(),
+            excluded_dirs: Vec::new(),
         }
     }
 
     fn skipping_build_dirs(self) -> Self {
         Self {
             skips_build_dirs: true,
+            ..self
+        }
+    }
+
+    fn excluding_dirs(self, names: &[std::ffi::OsString]) -> Self {
+        Self {
+            excluded_dirs: names.to_vec(),
             ..self
         }
     }
@@ -1248,6 +1351,7 @@ impl<'a> TreeRoot<'a> {
             path: self.path.clone(),
             role: self.role.to_vec(),
             excluded: self.excluded(),
+            excluded_dirs: self.excluded_dirs.clone(),
             rules: self.stamp_rules(),
         }
     }
@@ -1272,11 +1376,20 @@ fn tree_digest(
 /// pre-pass, so a stale answer costs a shortcut, never a wrong key.
 pub(crate) const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// The marker recording that `root` holds more than `max_entries` entries.
-fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
+/// The marker recording that `root` holds more than `max_entries` entries
+/// once the directories named in `excluded_dirs` are left out.
+fn oversized_tree_marker(
+    memo_dir: &Path,
+    root: &Path,
+    excluded_dirs: &[std::ffi::OsString],
+    max_entries: usize,
+) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(root.as_os_str().as_encoded_bytes());
     hasher.update(&max_entries.to_le_bytes());
+    for name in excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    }
     memo_dir
         .join("oversized-trees")
         .join(&hasher.finalize().to_hex()[..32])
@@ -1293,6 +1406,9 @@ fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: us
             b"root:",
             root.path.as_os_str().as_encoded_bytes(),
         );
+        for name in &root.excluded_dirs {
+            fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+        }
     }
     hasher.update(&max_entries.to_le_bytes());
     memo_dir
@@ -1354,7 +1470,7 @@ fn tree_digest_memoised(
     }
     if roots.iter().any(|root| {
         marked_recently(
-            &oversized_tree_marker(memo_dir, &root.path, max_entries),
+            &oversized_tree_marker(memo_dir, &root.path, &root.excluded_dirs, max_entries),
             now,
         )
     }) {
@@ -1365,12 +1481,13 @@ fn tree_digest_memoised(
     if marked_recently(&together, now) {
         return None;
     }
-    let stamps = match stamp_roots(&walked, max_entries, file_hasher.cache.is_some()) {
+    let stamps = match stamp_roots(&walked, max_entries) {
         Ok(stamps) => stamps,
         Err(StampRefusal::TooLarge(index)) => {
             write_marker(&oversized_tree_marker(
                 memo_dir,
                 &walked[index].path,
+                &walked[index].excluded_dirs,
                 max_entries,
             ));
             return None;
@@ -1423,51 +1540,109 @@ fn root_digest(
     root: &TreeRoot<'_>,
     walk: &GuardWalk,
     stamped: &StampedRoot,
-    mut budget: usize,
+    budget: usize,
     file_hasher: &FileHasher<'_>,
     memo_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<String> {
     let stamp = &stamped.stamp;
     let memo = tree_digest_memo(memo_dir, root);
-    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key())
+    let trace_lookup = crate::phase_trace::phase("tree_memo_lookup");
+    let memoised = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key());
+    drop(trace_lookup);
+    if let Some(digest) = memoised
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         crate::phase_trace::decision("tree_memo", "hit");
         return Some(digest);
     }
     crate::phase_trace::decision("tree_memo", "miss");
-    // A batch result is keyed by path; retain the exact queried fingerprint
-    // as well, so the later content walk cannot use a row for another stamp.
-    let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
-    let memoised: HashMap<FileFingerprint, String> = stamped
-        .small_files
-        .iter()
-        .filter_map(|stamp| hashes.remove(&stamp.path).map(|hash| (stamp.clone(), hash)))
-        .collect();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(TREE_DIGEST_VERSION);
-    fold_field(&mut hasher, b"root:", root.role);
-    let read_every_file = crate_tree_fold(
-        &root.path,
-        &root.path,
-        &root.excluded(),
-        root.skips_build_dirs,
-        &GuardFileHashes {
-            hasher: file_hasher,
-            memoised,
-        },
-        &mut hasher,
-        &mut budget,
-    )?;
-    let digest = hasher.finalize().to_hex().to_string();
-    // The stamp shows a directory becoming listable, but not a file becoming
-    // readable where there is no change time.
-    if read_every_file {
-        memoise_tree_digest(&memo, walk, stamp, &digest, now);
-    }
-    Some(digest)
+    let fold_key = (memo.clone(), stamp.memo_key().to_owned(), budget);
+    let fold = move || -> TreeFold {
+        let mut budget = budget;
+        // A batch result is keyed by path; retain the exact queried fingerprint
+        // as well, so the later content walk cannot use a row for another stamp.
+        let trace_batch = crate::phase_trace::phase("tree_memo_batch");
+        let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
+        drop(trace_batch);
+        let memoised: HashMap<FileFingerprint, String> = stamped
+            .small_files
+            .iter()
+            .filter_map(|stamp| hashes.remove(&stamp.path).map(|hash| (stamp.clone(), hash)))
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(TREE_DIGEST_VERSION);
+        fold_field(&mut hasher, b"root:", root.role);
+        // Only when set, so a tree without exclusions keeps its digest.
+        for name in &root.excluded_dirs {
+            fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+        }
+        let excluded = root.excluded();
+        let _trace_fold = crate::phase_trace::phase("tree_fold");
+        let Some(unread) = crate_tree_fold(
+            &root.path,
+            &root.path,
+            GuardSkips {
+                paths: &excluded,
+                dir_names: &root.excluded_dirs,
+            },
+            root.skips_build_dirs,
+            &GuardFileHashes {
+                hasher: file_hasher,
+                memoised,
+            },
+            &mut hasher,
+            &mut budget,
+        ) else {
+            return TreeFold {
+                digest: None,
+                recorded: false,
+            };
+        };
+        let digest = hasher.finalize().to_hex().to_string();
+        // The stamp counts what its walk could not list or stat, and changes
+        // once that can be read. It shows neither a failure the fold alone
+        // met, nor a file becoming readable where there is no change time.
+        let stamped = Unread {
+            entries: stamp.unreadable,
+            files: 0,
+        };
+        let recorded = unread == stamped && memoise_tree_digest(&memo, walk, stamp, &digest, now);
+        TreeFold {
+            digest: Some(digest),
+            recorded,
+        }
+    };
+    // Units of one workspace miss together when its tree changes, and each
+    // would fold the same bytes. A unit that arrives while another folds
+    // waits for that fold and takes its digest when the memo took it too: the
+    // memo would have answered the unit with the same digest a moment later.
+    // A fold the memo refused, of a tree that moved or of something the stamp
+    // walk had read and the fold could not, is its unit's alone, and the
+    // others fold as they always have.
+    let folded = if stamp.settled_at(now) {
+        TREE_FOLDS.run(&fold_key, fold, |folded| folded.recorded)
+    } else {
+        fold()
+    };
+    folded.digest
 }
+
+/// What one content fold of a root gave.
+#[derive(Clone)]
+struct TreeFold {
+    /// `None` when the root could not be listed or ran past its budget.
+    digest: Option<String>,
+    /// Whether the digest was one for the memo ([`memoise_tree_digest`]):
+    /// the fold read what the stamp walk had and every file, and the tree
+    /// kept its stamp meanwhile.
+    recorded: bool,
+}
+
+/// Content folds under way, keyed by memo file, stamp and entry budget.
+static TREE_FOLDS: std::sync::LazyLock<
+    crate::walk_flight::JoinFlight<(PathBuf, String, usize), TreeFold>,
+> = std::sync::LazyLock::new(crate::walk_flight::JoinFlight::new);
 
 /// Record `digest` at `memo` under the memo key of `stamp`, the stamp `walk`
 /// gave before the files were read. A tree written in the last moments could
@@ -1480,16 +1655,20 @@ fn root_digest(
 /// On Unix a lookup needs only the same entries. The root's own times also
 /// move when a name it leaves out, such as the target directory, is created
 /// or removed, and every entry the digest read stays as it was.
+///
+/// Returns whether the digest met that rule, and so was recorded.
 fn memoise_tree_digest(
     memo: &Path,
     walk: &GuardWalk,
     stamp: &crate::tree_stamp::TreeStamp,
     digest: &str,
     now: std::time::SystemTime,
-) {
-    if stamp.settled_at(now) && walk.holds() {
+) -> bool {
+    let recorded = stamp.settled_at(now) && walk.holds();
+    if recorded {
         crate::tree_stamp::record_digest(memo, stamp.memo_key(), digest);
     }
+    recorded
 }
 
 /// Where the digest of `root` is memoised: one file per root, so every unit
@@ -1505,6 +1684,9 @@ fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
     fold_field(&mut hasher, b"role:", root.role);
     for name in root.skipped {
         fold_field(&mut hasher, b"skipped:", name.as_bytes());
+    }
+    for name in &root.excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
     }
     fold_field(
         &mut hasher,
@@ -1566,29 +1748,42 @@ struct GuardFileHashes<'a, 'db> {
     memoised: HashMap<FileFingerprint, String>,
 }
 
+/// What a content fold of a tree could not read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Unread {
+    /// Directories it could not list and entries it could not stat, as the
+    /// stamp walk counts them ([`crate::tree_stamp::TreeStamp::unreadable`]).
+    entries: usize,
+    /// Files whose content it could not read. A stamp walk opens none.
+    files: usize,
+}
+
 /// Fold the entries under `directory` by path, kind and content. A symlink
 /// counts by its text and is not followed. With `skips_build_dirs`, a
 /// directory below `root` that Cargo tagged as its build directory counts by
 /// its tag alone. Below `root`, what cannot be read counts as unreadable: a
-/// proc macro this process starts cannot read it either. `Some(false)` when
-/// that includes a file: where there is no change time, a file that becomes
-/// readable keeps its stamp.
+/// proc macro this process starts cannot read it either. The fold says how
+/// much that was, and gives `None` for a root it could not list or a tree
+/// past `budget`.
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
-    excluded: &[PathBuf],
+    excluded: GuardSkips<'_>,
     skips_build_dirs: bool,
     files: &GuardFileHashes<'_, '_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
-) -> Option<bool> {
+) -> Option<Unread> {
     let listed = std::fs::read_dir(directory)
         .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
     let mut entries = match listed {
         Ok(entries) => entries,
         Err(_) if directory != root => {
             fold_field(hasher, b"unreadable:", b"");
-            return Some(true);
+            return Some(Unread {
+                entries: 1,
+                files: 0,
+            });
         }
         Err(_) => return None,
     };
@@ -1596,10 +1791,10 @@ fn crate_tree_fold(
     if skips_build_dirs && directory != root {
         crate::tree_stamp::keep_only_build_tag(&mut entries);
     }
-    let mut read_every_file = true;
+    let mut unread = Unread::default();
     for entry in entries {
         let path = entry.path();
-        if excluded.contains(&path) {
+        if excluded.skips(&path, &entry) {
             continue;
         }
         *budget = budget.checked_sub(1)?;
@@ -1608,20 +1803,26 @@ fn crate_tree_fold(
         // A memo row settles against the clock before this content walk's
         // fresh stat, never against metadata from the earlier stamp walk.
         let observed_ns = wall_clock_ns();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        // An entry's stat and link read fail as one, as the stamp walk counts
+        // them.
+        let read = std::fs::symlink_metadata(&path).and_then(|metadata| {
+            let link = metadata
+                .file_type()
+                .is_symlink()
+                .then(|| std::fs::read_link(&path))
+                .transpose()?;
+            Ok((metadata, link))
+        });
+        let Ok((metadata, link)) = read else {
             fold_field(hasher, b"unreadable:", b"");
+            unread.entries += 1;
             continue;
         };
-        if metadata.file_type().is_symlink() {
-            match std::fs::read_link(&path) {
-                Ok(target) => {
-                    fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
-                }
-                Err(_) => fold_field(hasher, b"unreadable:", b""),
-            }
+        if let Some(target) = link {
+            fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
         } else if metadata.is_dir() {
             fold_field(hasher, b"dir:", b"");
-            read_every_file &= crate_tree_fold(
+            let below = crate_tree_fold(
                 root,
                 &path,
                 excluded,
@@ -1630,6 +1831,8 @@ fn crate_tree_fold(
                 hasher,
                 budget,
             )?;
+            unread.entries += below.entries;
+            unread.files += below.files;
         } else if metadata.is_file() {
             match files.hasher.guard_file_hash_from_metadata(
                 &path,
@@ -1640,14 +1843,14 @@ fn crate_tree_fold(
                 Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
                 Err(_) => {
                     fold_field(hasher, b"unreadable:", b"");
-                    read_every_file = false;
+                    unread.files += 1;
                 }
             }
         } else {
             fold_field(hasher, b"other:", b"");
         }
     }
-    Some(read_every_file)
+    Some(unread)
 }
 
 thread_local! {
@@ -1670,6 +1873,7 @@ pub(crate) struct InvocationKeyScope {
     compile_while_keying: bool,
     provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
     remote_rows: Option<RemoteRows>,
+    compiled_remaps: Option<CompiledRemaps>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -1680,6 +1884,7 @@ impl InvocationKeyScope {
             compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
             provided_dep_info: PROVIDED_DEP_INFO.with(|cell| cell.replace(None)),
             remote_rows: REMOTE_ROWS.with(|cell| cell.replace(None)),
+            compiled_remaps: COMPILED_REMAPS.with(|cell| cell.replace(None)),
             _thread_bound: std::marker::PhantomData,
         }
     }
@@ -1692,6 +1897,7 @@ impl Drop for InvocationKeyScope {
         let discarded_dep_info =
             PROVIDED_DEP_INFO.with(|cell| cell.replace(self.provided_dep_info.take()));
         let discarded_remote = REMOTE_ROWS.with(|cell| cell.replace(self.remote_rows.take()));
+        COMPILED_REMAPS.with(|cell| *cell.borrow_mut() = self.compiled_remaps.take());
         // Release callback captures after every slot has been restored and
         // outside the RefCell borrow, so their destructors can observe it.
         drop((discarded_dep_info, discarded_remote));
@@ -1824,6 +2030,512 @@ pub(crate) fn source_path_identity(
     Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
 }
 
+/// One rustc unit's dependency closure, as far as a cross-host registry key
+/// needs to see it. Paths keep the spelling dep-info recorded.
+pub(crate) struct UnitClosure<'a> {
+    pub(crate) crate_name: Option<&'a str>,
+    pub(crate) crate_types: &'a [String],
+    pub(crate) externs: &'a [crate::args::ExternDep],
+    pub(crate) sources: &'a [PathBuf],
+    pub(crate) manifest_dir: Option<&'a Path>,
+    pub(crate) out_dir: Option<&'a Path>,
+    pub(crate) skip_remap: bool,
+}
+
+/// `registry/src` for a registry package whose closure can share a key across
+/// hosts. `None` keeps today's path identity: a build script, a proc-macro,
+/// an empty closure, or a source that is not a file inside an extracted
+/// package.
+pub(crate) fn host_neutral_registry_root(unit: &UnitClosure<'_>) -> Option<PathBuf> {
+    if unit.skip_remap || unit.out_dir.is_some() {
+        return None;
+    }
+    if unit.crate_name == Some("build_script_build") {
+        return None;
+    }
+    if unit.crate_types.iter().any(|ty| ty == "proc-macro") {
+        return None;
+    }
+    if has_dylib_extern(unit.externs) {
+        return None;
+    }
+    let manifest_dir = unit.manifest_dir?;
+    let registry = registry_src_root(manifest_dir)?.to_path_buf();
+    if unit.sources.is_empty() {
+        return None;
+    }
+    for source in unit.sources {
+        if source_carries_build_script(source)
+            || registry_relative_slash(source, &registry).is_none()
+        {
+            return None;
+        }
+    }
+    Some(registry)
+}
+
+/// Host-neutral only when the closure qualifies and this key can publish the
+/// remaps the compiler will actually apply. An emitted closure was compiled
+/// with the ordinary remap set.
+pub(crate) fn applicable_host_neutral_root(
+    emitted: bool,
+    names_unit: bool,
+    unit: &UnitClosure<'_>,
+) -> Option<PathBuf> {
+    if emitted || !names_unit {
+        return None;
+    }
+    host_neutral_registry_root(unit)
+}
+
+pub(crate) fn unit_can_publish_remaps(
+    crate_name: Option<&str>,
+    source_file: Option<&Path>,
+) -> bool {
+    crate_name.is_some() && source_file.is_some()
+}
+
+fn slash_form(path: &Path) -> Option<String> {
+    Some(path.to_str()?.replace('\\', "/"))
+}
+
+/// Slash-separated path of `file` under `registry_src` (`index/pkg/src/lib.rs`).
+/// `None` unless the path is a file at least one directory inside a package,
+/// with no `.`, `..`, or empty component. Separators in either spelling match.
+fn registry_relative_slash(file: &Path, registry_src: &Path) -> Option<String> {
+    let file = slash_form(file)?;
+    let mut root = slash_form(registry_src)?;
+    while root.ends_with('/') {
+        root.pop();
+    }
+    if root.is_empty() {
+        return None;
+    }
+    let rest = file.strip_prefix(&root)?;
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn source_carries_build_script(file: &Path) -> bool {
+    let Some(slash) = slash_form(file) else {
+        return false;
+    };
+    let parts: Vec<&str> = slash.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.last() == Some(&"build.rs") {
+        return true;
+    }
+    // `out` anywhere after a `build` directory, not that directory itself.
+    parts
+        .split(|part| *part == "build")
+        .skip(1)
+        .any(|tail| tail.contains(&"out"))
+}
+
+fn registry_source_key_material(file: &Path, registry_src: &Path) -> Option<Vec<u8>> {
+    let relative = registry_relative_slash(file, registry_src)?;
+    let mut material = b"registry-src/".to_vec();
+    material.extend_from_slice(relative.as_bytes());
+    Some(material)
+}
+
+/// Key material for one source. A registry unit that qualifies uses the slash
+/// path under `registry/src`. Anything else keeps [`source_path_identity`].
+pub(crate) fn keyed_source_path(
+    file: &Path,
+    registry_src: Option<&Path>,
+    normalizer: &PathNormalizer,
+) -> Result<Vec<u8>> {
+    if let Some(registry_src) = registry_src
+        && let Some(material) = registry_source_key_material(file, registry_src)
+    {
+        return Ok(material);
+    }
+    source_path_identity(file, normalizer)
+}
+
+/// `rustc -vV` text folded into the key. `drop_host` removes lines whose
+/// first non-space text is `host:`.
+pub(crate) fn rustc_version_key_text(version: &str, drop_host: bool) -> String {
+    if !drop_host {
+        return version.to_string();
+    }
+    let mut out = String::new();
+    for line in version.split_inclusive('\n') {
+        if line.trim_start().starts_with("host:") {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn hash_rustc_version_for_unit<H: KeyFold>(
+    hasher: &mut H,
+    version: &str,
+    drop_host: bool,
+    namespace: bool,
+) {
+    let text = rustc_version_key_text(version, drop_host);
+    hasher.update(b"rustc_version:");
+    hasher.update(text.as_bytes());
+    hasher.update(b"\n");
+    if namespace {
+        fold_field(hasher, b"host_neutral_sources.v2:", b"1");
+    }
+}
+
+/// `(drop host line, fold host_neutral_sources.v2)`. The namespace stays when
+/// remaps were already applied, even if this key does not drop the host line.
+pub(crate) fn host_neutral_version_flags(neutral: bool, provisional_remaps: bool) -> (bool, bool) {
+    (neutral, neutral || provisional_remaps)
+}
+
+/// `--remap-path-prefix` for every directory from `registry_src` down to each
+/// source's parent. `FROM` uses `host_sep` and ends with it. `TO` is
+/// `/kache/.cargo/registry/src/.../`, the shape the base remaps give a
+/// registry path, so the matched separator is consumed. Longest last.
+pub(crate) fn registry_directory_remaps(
+    registry_src: &Path,
+    sources: &[PathBuf],
+    host_sep: char,
+) -> Vec<String> {
+    let Some(root_slash) = slash_form(registry_src) else {
+        return Vec::new();
+    };
+    let root_slash = root_slash.trim_end_matches('/').to_string();
+    let mut dirs = std::collections::BTreeSet::<(usize, String, String)>::new();
+    for source in sources {
+        let Some(relative) = registry_relative_slash(source, registry_src) else {
+            continue;
+        };
+        push_registry_dir(&mut dirs, &root_slash, "", host_sep);
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut rel_dir = String::new();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            if !rel_dir.is_empty() {
+                rel_dir.push('/');
+            }
+            rel_dir.push_str(part);
+            push_registry_dir(&mut dirs, &root_slash, &rel_dir, host_sep);
+        }
+    }
+    dirs.into_iter()
+        .map(|(_, from, to)| format!("--remap-path-prefix={from}={to}"))
+        .collect()
+}
+
+/// Where registry sources land in debug info and panic paths: the same place
+/// the base `<CARGO_HOME>` remap puts them, which samply resolves to crates.io.
+const REGISTRY_REMAP_TARGET: &str = "/kache/.cargo/registry/src";
+
+fn push_registry_dir(
+    dirs: &mut std::collections::BTreeSet<(usize, String, String)>,
+    root_slash: &str,
+    rel_dir: &str,
+    host_sep: char,
+) {
+    let from_rel = rel_dir.replace('/', &host_sep.to_string());
+    let mut from = root_slash.replace('/', &host_sep.to_string());
+    if !from.ends_with(host_sep) {
+        from.push(host_sep);
+    }
+    if !from_rel.is_empty() {
+        from.push_str(&from_rel);
+        if !from.ends_with(host_sep) {
+            from.push(host_sep);
+        }
+    }
+    let to = if rel_dir.is_empty() {
+        format!("{REGISTRY_REMAP_TARGET}/")
+    } else {
+        format!("{REGISTRY_REMAP_TARGET}/{rel_dir}/")
+    };
+    dirs.insert((from.len(), from, to));
+}
+
+/// Give a `/rustc/<hash>` remap a trailing slash on both sides, using the
+/// separator `FROM` already uses. Other arguments stay as they are.
+pub(crate) fn slash_terminate_rust_src_remap(arg: &str) -> String {
+    let Some(body) = arg.strip_prefix("--remap-path-prefix=") else {
+        return arg.to_string();
+    };
+    let Some((from, to)) = body.split_once('=') else {
+        return arg.to_string();
+    };
+    if !to.starts_with("/rustc/") {
+        return arg.to_string();
+    }
+    let mut to = to.to_string();
+    if !to.ends_with('/') {
+        to.push('/');
+    }
+    let mut from = from.to_string();
+    let sep = if from.contains('\\') { '\\' } else { '/' };
+    if !from.ends_with(sep) {
+        from.push(sep);
+    }
+    format!("--remap-path-prefix={from}={to}")
+}
+
+pub(crate) fn host_neutral_remap_list(
+    base: Vec<String>,
+    registry_remaps: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = base
+        .into_iter()
+        .map(|arg| slash_terminate_rust_src_remap(&arg))
+        .collect();
+    out.extend(registry_remaps.iter().cloned());
+    out
+}
+
+/// Remap arguments for one rustc invocation. `skip_remap` injects nothing.
+/// `host_neutral_extra` of `Some` slash-terminates rust-src and appends the
+/// registry directories, including when that list is empty.
+pub(crate) fn rustc_remap_args(
+    skip_remap: bool,
+    base: Vec<String>,
+    host_neutral_extra: Option<&[String]>,
+) -> Vec<String> {
+    if skip_remap {
+        return Vec::new();
+    }
+    match host_neutral_extra {
+        Some(extra) => host_neutral_remap_list(base, extra),
+        None => base,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostNeutralDecision {
+    Unknown,
+    Off,
+    Remaps(Vec<String>),
+}
+
+struct HostNeutralPlan {
+    crate_name: String,
+    source_file: PathBuf,
+    decision: HostNeutralDecision,
+}
+
+thread_local! {
+    static HOST_NEUTRAL_PLAN: RefCell<Option<HostNeutralPlan>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn clear_host_neutral_decision() {
+    HOST_NEUTRAL_PLAN.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// `None` records that this unit keeps today's remaps. `Some` records the
+/// registry directory remaps. No plan is published when the unit has no
+/// crate name or source file to match at compile time.
+pub(crate) fn publish_host_neutral_decision(args: &RustcArgs, remaps: Option<Vec<String>>) {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return;
+    };
+    let decision = match remaps {
+        Some(remaps) => HostNeutralDecision::Remaps(remaps),
+        None => HostNeutralDecision::Off,
+    };
+    HOST_NEUTRAL_PLAN.with(|cell| {
+        *cell.borrow_mut() = Some(HostNeutralPlan {
+            crate_name: crate_name.to_string(),
+            source_file: source_file.to_path_buf(),
+            decision,
+        });
+    });
+}
+
+pub(crate) fn take_host_neutral_decision(args: &RustcArgs) -> HostNeutralDecision {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return HostNeutralDecision::Unknown;
+    };
+    HOST_NEUTRAL_PLAN.with(|cell| {
+        let matches = cell
+            .borrow()
+            .as_ref()
+            .is_some_and(|plan| plan.crate_name == crate_name && plan.source_file == source_file);
+        if !matches {
+            return HostNeutralDecision::Unknown;
+        }
+        cell.borrow_mut()
+            .take()
+            .map(|plan| plan.decision)
+            .unwrap_or(HostNeutralDecision::Unknown)
+    })
+}
+
+pub(crate) fn host_neutral_extra_remaps(decision: HostNeutralDecision) -> Option<Vec<String>> {
+    match decision {
+        HostNeutralDecision::Remaps(remaps) => Some(remaps),
+        HostNeutralDecision::Off | HostNeutralDecision::Unknown => None,
+    }
+}
+
+/// Remaps for this compile. Skipping remap does not consume a plan that
+/// belongs to a later compile of the same unit.
+///
+/// A compile that starts before its key has no plan. It repeats what an
+/// earlier compile of the unit applied, or else takes the remaps of its whole
+/// registry package, so the key its emitted closure gets can match a key
+/// computed before compiling.
+pub(crate) fn take_execute_remaps(args: &RustcArgs, skip_remap: bool) -> Option<Vec<String>> {
+    if skip_remap {
+        record_compiled_remaps(args, None);
+        return None;
+    }
+    let remaps = match take_host_neutral_decision(args) {
+        HostNeutralDecision::Unknown => match compiled_remaps(args) {
+            Some(applied) => applied,
+            None => provisional_registry_remaps(args),
+        },
+        decision => host_neutral_extra_remaps(decision),
+    };
+    record_compiled_remaps(args, remaps.clone());
+    remaps
+}
+
+/// Most entries a package walk reads. Every key of a registry unit walks its
+/// package, cache hits included; a larger package compiles without registry
+/// remaps in every lane. About 99% of crates.io packages are smaller.
+const MAX_PACKAGE_ENTRIES: usize = 1024;
+
+struct CompiledRemaps {
+    crate_name: String,
+    source_file: PathBuf,
+    remaps: Option<Vec<String>>,
+}
+
+thread_local! {
+    static COMPILED_REMAPS: RefCell<Option<CompiledRemaps>> = const { RefCell::new(None) };
+}
+
+fn record_compiled_remaps(args: &RustcArgs, remaps: Option<Vec<String>>) {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return;
+    };
+    COMPILED_REMAPS.with(|cell| {
+        *cell.borrow_mut() = Some(CompiledRemaps {
+            crate_name: crate_name.to_string(),
+            source_file: source_file.to_path_buf(),
+            remaps,
+        });
+    });
+}
+
+/// What the last compile of this unit applied, when one ran here.
+fn compiled_remaps(args: &RustcArgs) -> Option<Option<Vec<String>>> {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return None;
+    };
+    COMPILED_REMAPS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|seen| seen.crate_name == crate_name && seen.source_file == source_file)
+            .map(|seen| seen.remaps.clone())
+    })
+}
+
+/// The registry remaps the compile that emitted this unit's closure applied.
+pub(crate) fn applied_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
+    compiled_remaps(args).flatten()
+}
+
+/// Whether `applied` holds every remap a key-first compile of this closure
+/// would pass. Only then did each source take the same remap.
+pub(crate) fn remaps_cover_closure(
+    registry: &Path,
+    sources: &[PathBuf],
+    applied: &[String],
+) -> bool {
+    let applied: std::collections::HashSet<&str> = applied.iter().map(String::as_str).collect();
+    registry_directory_remaps(registry, sources, std::path::MAIN_SEPARATOR)
+        .iter()
+        .all(|remap| applied.contains(remap.as_str()))
+}
+
+/// Registry remaps for every directory of the unit's package, for a compile
+/// that starts before its closure is known. Extra directories change nothing
+/// rustc writes: each path still takes its deepest directory's remap.
+pub(crate) fn provisional_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
+    let (registry, manifest_dir) = registry_remap_unit(args)?;
+    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PACKAGE_ENTRIES)?
+        .into_iter()
+        .map(|dir| dir.join("_"))
+        .collect();
+    Some(registry_directory_remaps(
+        &registry,
+        &placeholders,
+        std::path::MAIN_SEPARATOR,
+    ))
+}
+
+/// `(registry/src, package)` for a unit that compiles with registry remaps
+/// in every lane: a registry package that is not a build script or
+/// proc-macro, has no `OUT_DIR` and no dylib extern. Whether its key is also
+/// host-neutral depends on the closure.
+pub(crate) fn registry_remap_unit(args: &RustcArgs) -> Option<(PathBuf, PathBuf)> {
+    if args.skip_path_remap()
+        || !unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref())
+        || args.crate_name.as_deref() == Some("build_script_build")
+        || args.crate_types.iter().any(|ty| ty == "proc-macro")
+        || has_dylib_extern(&args.externs)
+    {
+        return None;
+    }
+    let env = args.invocation_env();
+    if env.var_os("OUT_DIR").is_some() {
+        return None;
+    }
+    let manifest_dir = PathBuf::from(env.var_os("CARGO_MANIFEST_DIR")?);
+    let registry = registry_src_root(&manifest_dir)?.to_path_buf();
+    Some((registry, manifest_dir))
+}
+
+/// `root` and every directory below it, without following links. `None`
+/// past `limit` entries read or on any read error.
+fn package_directories(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let mut found = vec![root.to_path_buf()];
+    let mut next = 0;
+    let mut read = 0;
+    while let Some(dir) = found.get(next).cloned() {
+        next += 1;
+        for entry in std::fs::read_dir(&dir).ok()? {
+            read += 1;
+            if read > limit {
+                return None;
+            }
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_dir() {
+                found.push(entry.path());
+            }
+        }
+    }
+    Some(found)
+}
+
 /// Identity of an explicit native search directory an rlib can bundle from.
 ///
 /// Rlib native inputs beneath this unit's OUT_DIR are all content-keyed by
@@ -1832,7 +2544,7 @@ pub(crate) fn source_path_identity(
 /// Linked outputs and framework/all search paths keep their existing identity.
 /// Source files always use `source_path_identity`: rustc can expose their
 /// spelling through file!(), caller locations and debug information.
-fn out_dir_native_search_identity(
+pub(crate) fn out_dir_native_search_identity(
     args: &RustcArgs,
     path: &Path,
     out_dir: Option<&OsStr>,
@@ -2119,9 +2831,7 @@ fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
 /// suffix keeps its `.` and `..`, because a record has to reproduce the
 /// spelling rustc reported.
 ///
-/// `\` separates components on Windows only, so the walk has to hold both
-/// with and without it: from `root`, `a\b/..` is one level down on Windows
-/// and back at `root` on Unix.
+/// `\` separates components on Windows only ([`walk_stays_below`]).
 fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<String> {
     let rest = value
         .as_encoded_bytes()
@@ -2130,8 +2840,19 @@ fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<S
     let Some(components) = suffix.strip_prefix(['/', '\\']) else {
         return suffix.is_empty().then(String::new);
     };
-    (stays_below(components.split(['/', '\\']), floor) && stays_below(components.split('/'), floor))
-        .then(|| suffix.to_string())
+    walk_stays_below(components, floor).then(|| suffix.to_string())
+}
+
+/// [`stays_below`] for `components` as this system reads them. `\`
+/// separates components on Windows and is part of a name elsewhere: from
+/// `root`, `a\b/..` is one level down on Windows and back at `root` on Unix.
+/// Off Windows the walk has to stay inside both ways, as before. On Windows
+/// only its own reading counts, which is how Windows resolves the path:
+/// rustc there reports `include_str!("../../../../web/a.js")` in
+/// `crates/c/src/media/mod.rs` as `crates\c\src\media\../../../../web/a.js`.
+fn walk_stays_below(components: &str, floor: usize) -> bool {
+    stays_below(components.split(['/', '\\']), floor)
+        && (cfg!(windows) || stays_below(components.split('/'), floor))
 }
 
 /// Does a walk down `components` stay inside the directory it reaches after
@@ -2670,6 +3391,9 @@ pub(crate) struct WorkspaceRoots {
     pub(crate) vendored_package: Option<PathBuf>,
     /// How much of the tree the unit's record guard digests.
     pub(crate) guard: GuardScope,
+    /// Directory names the workspace guard leaves out at any depth
+    /// ([`workspace_guard_excluded`]).
+    pub(crate) guard_excluded: Vec<std::ffi::OsString>,
 }
 
 /// What a workspace unit's tree guard digests ([`TREE_GUARD_SCOPE_ENV`]).
@@ -2704,6 +3428,7 @@ fn guard_scope_of(
         GuardScope::Workspace
     }
 }
+
 
 impl WorkspaceRoots {
     /// Where this invocation puts a record's relative entries.
@@ -2791,9 +3516,55 @@ fn workspace_roots_in(
             .map(|path| joined_under(Some(current_dir), Path::new(path))),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
+        guard_excluded: workspace_guard_excluded(&root),
         root,
         target,
     })
+}
+
+/// The directory names `[workspace] guard_exclude` lists in the `.kache.toml`
+/// at the workspace root. The file is part of the tree the guard digests, so
+/// two checkouts whose guards match leave out the same names.
+///
+/// Leaving a directory out is the project's promise that nothing reads it
+/// while Rust compiles, which Kache cannot check. A closure that names a file
+/// there keeps no guard ([`guard_covers`]), but an unreported read there goes
+/// unseen.
+/// Empty when the file is missing or the setting is not a list of plain
+/// names, so the guard then reads the whole tree.
+fn workspace_guard_excluded(root: &Path) -> Vec<std::ffi::OsString> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Envelope {
+        workspace: Option<Section>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Section {
+        guard_exclude: Vec<String>,
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(".kache.toml")) else {
+        return Vec::new();
+    };
+    let names = match toml::from_str::<Envelope>(&text) {
+        Ok(envelope) => envelope.workspace.unwrap_or_default().guard_exclude,
+        Err(_) => return Vec::new(),
+    };
+    let plain = |name: &str| {
+        !name.contains(['/', '\\'])
+            && matches!(
+                Path::new(name).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+    };
+    if !names.iter().all(|name| plain(name)) {
+        tracing::warn!(
+            "ignoring [workspace] guard_exclude in {}: each entry must be one directory name",
+            root.join(".kache.toml").display()
+        );
+        return Vec::new();
+    }
+    names.into_iter().map(Into::into).collect()
 }
 
 /// Rows of workspace and path units, filed under an identity with the
@@ -3015,6 +3786,7 @@ fn ancestor_top_digest(
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
         excluded: vec![directory.join(".git")],
+        excluded_dirs: Vec::new(),
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
@@ -3131,8 +3903,11 @@ fn workspace_tree_digest_within(
         suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
-    let mut roots =
-        vec![TreeRoot::new(workspace.root.clone(), b"workspace", &skipped).skipping_build_dirs()];
+    let mut roots = vec![
+        TreeRoot::new(workspace.root.clone(), b"workspace", &skipped)
+            .skipping_build_dirs()
+            .excluding_dirs(&workspace.guard_excluded),
+    ];
     if let Some(out_dir) = &workspace.out_dir {
         roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
@@ -3199,7 +3974,12 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
+            let tree = out.tree_guard.as_ref().map(TreeGuard::flight_note);
+            let flight = crate::scheduler::join_discovery_flight_of_tree(
+                cache_dir,
+                &identity,
+                tree.as_deref(),
+            );
             let mut lock = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
@@ -3211,8 +3991,9 @@ fn resolve_key_inputs(
                 // record of another checkout's tree. Owning the flight would
                 // queue every later checkout behind this compile too, one
                 // compile at a time. Release it and key the way a peer
-                // without the flight does: a peer with the same key still
-                // waits on the compile flight and restores the entry.
+                // without the flight does: a peer with the same key restores
+                // the entry once it is stored (a holder that compiles before
+                // keying holds no compile flight to wait on).
                 if let Err(reason) = &prediction
                     && lock.take().is_some()
                 {
@@ -3336,6 +4117,19 @@ fn executable_pdb_admission(args: &RustcArgs, rustc_version: &str, custom_target
                 .is_none_or(|target| target.split('-').any(|part| part == "windows")))
 }
 
+/// Whether this executable's entry stores a macOS `.dSYM`. Since
+/// kunobi-ninja/kache#1905 it is stored file by file. An older client would
+/// restore such an entry without its bundle, and its own entries hold a
+/// `.dsym.tar` this layout replaces, so these executables take a key
+/// namespace of their own. Other executables keep their keys.
+fn macos_debug_bundle_admission(args: &RustcArgs, target: Option<&str>) -> bool {
+    args.is_user_facing_executable()
+        && args.emits_link()
+        && args.debuginfo_enabled()
+        && args.get_codegen_opt("split-debuginfo") != Some("off")
+        && target.is_some_and(|target| target.contains("-apple-"))
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -3386,6 +4180,8 @@ fn compute_key_into(
     out: &mut KeyOutputs,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("key");
+    // A key that never reaches compile must not leave remaps for the next unit.
+    clear_host_neutral_decision();
     let invocation = &file_hasher.invocation_env;
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
@@ -3430,11 +4226,55 @@ fn compute_key_into(
         );
     }
 
-    // rustc version
+    // rustc version. The closure is resolved first so a registry unit with
+    // no build script and no proc-macro can omit the host line. The bytes
+    // stay in this position: configured roots, then the version, then clippy.
     let rustc_version = get_rustc_version_for(&args.rustc, invocation)?;
-    hasher.update(b"rustc_version:");
-    hasher.update(rustc_version.as_bytes());
-    hasher.update(b"\n");
+    let emitted = dep_info_provided();
+    // A registry unit compiles with the remaps of its whole package in every
+    // lane, and its key carries their namespace. An emitted closure follows
+    // what its compile applied; a key-first one, what its compile will.
+    let remap_set = if emitted {
+        applied_registry_remaps(args)
+    } else {
+        provisional_registry_remaps(args)
+    };
+    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
+    // Hand the closure back to the wrapper, which records it as a prediction
+    // only once the invocation it belongs to has succeeded. The clone is one
+    // allocation per closure file against a whole rustc spawn.
+    out.dep_info = dep_info.clone();
+    let manifest_dir = args
+        .invocation_env()
+        .var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from);
+    let sources = dep_info
+        .as_ref()
+        .map(|info| info.source_files.as_slice())
+        .unwrap_or(&[]);
+    // Host-neutral only where those remaps reach every source.
+    let host_neutral_root = remap_set.as_deref().and_then(|remaps| {
+        applicable_host_neutral_root(
+            false,
+            unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref()),
+            &UnitClosure {
+                crate_name: args.crate_name.as_deref(),
+                crate_types: &args.crate_types,
+                externs: &args.externs,
+                sources,
+                manifest_dir: manifest_dir.as_deref(),
+                out_dir: out_dir.as_deref().map(Path::new),
+                skip_remap: args.skip_path_remap(),
+            },
+        )
+        .filter(|root| remaps_cover_closure(root, sources, remaps))
+    });
+    let (drop_host, namespace) =
+        host_neutral_version_flags(host_neutral_root.is_some(), remap_set.is_some());
+    if !emitted {
+        publish_host_neutral_decision(args, remap_set);
+    }
+    hash_rustc_version_for_unit(&mut hasher, &rustc_version, drop_host, namespace);
     tracing::trace!(
         "[key:{}] rustc_version={}",
         crate_name,
@@ -3517,6 +4357,10 @@ fn compute_key_into(
         hasher.set_group("pe_pdb_admission");
         fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");
     }
+    if macos_debug_bundle_admission(args, compiler_target) {
+        hasher.set_group("debug_bundle_layout");
+        fold_field(&mut hasher, b"debug_bundle_layout.v2:", b"per-file");
+    }
 
     // crate identity
     hasher.set_group("crate");
@@ -3580,9 +4424,20 @@ fn compute_key_into(
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
+    // A native MSVC link keys a compiled resource named alone by its bytes
+    // and place in the MSVC identity below, so its path stays out here.
+    let native_windows_msvc =
+        is_native_windows_msvc_link(args, &rustc_version, cfg!(target_os = "windows"), |rustc| {
+            get_rustc_version_for(rustc, invocation)
+        })?;
     for (key, value) in &codegen_opts {
         fold_field(&mut hasher, b"codegen_key:", key.as_bytes());
         if let Some(v) = value {
+            let v = if native_windows_msvc && is_keyed_windows_resource(key, v) {
+                WINDOWS_RESOURCE_ARGUMENT
+            } else {
+                v
+            };
             // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
             // carry absolute paths. None of these go through
             // PathNormalizer (they're rustc-controlled flags, not env);
@@ -3619,12 +4474,6 @@ fn compute_key_into(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
-    // Hand the closure back to the wrapper, which records it as a prediction
-    // only once the invocation it belongs to has succeeded. The clone is one
-    // allocation per closure file against a whole rustc spawn.
-    out.dep_info = dep_info.clone();
-
     let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
     externs.sort_by_key(|e| &e.name);
 
@@ -3652,7 +4501,8 @@ fn compute_key_into(
                 file_hasher.hash(file)
             }
             .with_context(|| format!("hashing source identity {}", file.display()))?;
-            let normalized_path = source_path_identity(file, path_normalizer)?;
+            let normalized_path =
+                keyed_source_path(file, host_neutral_root.as_deref(), path_normalizer)?;
             hashed.push((normalized_path, file_hash));
         }
         hashed.sort();
@@ -3909,6 +4759,11 @@ fn compute_key_into(
             // A separate length-prefixed namespace avoids both old key-only
             // aliases and separator ambiguity in a literal Unix filename.
             fold_field(&mut hasher, b"link_search_native_out_dir.v1:", &identity);
+            tracing::trace!(
+                "[key:{}] link_search_native_out_dir:{}",
+                crate_name,
+                String::from_utf8_lossy(&identity).escape_debug()
+            );
             continue;
         }
         let normalized = path_normalizer.normalize(path);
@@ -3945,12 +4800,6 @@ fn compute_key_into(
     if native_linker_side_files_are_unmodeled(args) {
         anyhow::bail!("native linker order/map/response side files are not cacheable");
     }
-    // Native MSVC links resolve their libraries and link-argument files in
-    // the MSVC identity below, so the Unix rules here stay off for them.
-    let native_windows_msvc =
-        is_native_windows_msvc_link(args, &rustc_version, cfg!(target_os = "windows"), |rustc| {
-            get_rustc_version_for(rustc, invocation)
-        })?;
     // Only a link searches for libraries, so only a link reads the host.
     let link_rustc_version = if args.invokes_linker() {
         Some(rustc_version_for_native_link(
@@ -4002,10 +4851,18 @@ fn compute_key_into(
     out.native_archives = Some(native_archives);
 
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
-    // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
+    // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw, except
+    // `-Z threads`, which only sets front-end parallelism (#1856).
     hasher.set_group("args");
     let backend_dylib = args.codegen_backend_dylib();
     for z in &args.unstable_flags {
+        // Artifact bytes do not depend on the parallel front end's thread
+        // count. `-Zthreads=8` and `-Z threads=8` both parse as `threads=8`.
+        // A different name, including one that merely contains `threads`,
+        // stays keyed.
+        if is_threads_unstable_flag(z) {
+            continue;
+        }
         // A backend dylib is keyed by its content, not its path: the wrapper
         // only reaches here for one when the user trusts it, and rebuilding
         // the backend in place must change the key while another checkout's
@@ -4206,7 +5063,7 @@ fn compute_key_into(
             // are unchanged; content hashes are still reused only with an
             // unchanged file fingerprint, through the same guards as other
             // key inputs.
-            crate::native_link_key::probe_linux_crt_objects_memoized_for(
+            native_linux_link_objects_for(
                 &crate::config::probe_memo_dir_for(invocation)?,
                 driver,
                 |path| file_hasher.hash(path),
@@ -4220,7 +5077,12 @@ fn compute_key_into(
             file_hasher.hash(&linker)
         },
         |sdkroot| match crate::native_link_key::sdk_identity_for_invocation(sdkroot, invocation)? {
-            Some(identity) => Ok(identity),
+            Some(identity) => native_macos_link_identity_for(
+                identity,
+                args,
+                |path| file_hasher.hash(path),
+                invocation,
+            ),
             None => anyhow::bail!("the macOS SDK could not be identified"),
         },
         env,
@@ -5246,6 +6108,16 @@ pub(crate) fn needs_native_bundle_audit(args: &RustcArgs, native_dirs: &[PathBuf
     args.emits_rlib() && !native_dirs.is_empty()
 }
 
+/// Whether `flag` is rustc's `-Z threads` option.
+///
+/// The name is the text before the first `=`. Both `-Zthreads=8` and
+/// `-Z threads=8` are stored as `threads=8`. `threads-count` and
+/// `share-generics` are different flags.
+fn is_threads_unstable_flag(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    name == "threads"
+}
+
 /// Whether `-Z packed-bundled-libs` makes rustc store every bundled archive
 /// as one member. Its value is not read: counting the flag as on only
 /// credits an rlib less (see the wrapper's bundle audit).
@@ -5509,7 +6381,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                         .extension()
                         .is_some_and(|ext| matches!(ext.to_str(), Some("tbd" | "dylib" | "so")))
                 {
-                    fold_apple_install_name(hasher, &path, dir, index)?;
+                    fold_apple_install_name(hasher, &path, dir, index, crate_name)?;
                 }
             }
         }
@@ -5528,7 +6400,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 };
                 for binary in [path.join(format!("{name}.tbd")), path.join(name)] {
                     if binary.is_file() && !crate::native_archive::has_archive_magic(&binary)? {
-                        fold_apple_install_name(hasher, &binary, dir, index)?;
+                        fold_apple_install_name(hasher, &binary, dir, index, crate_name)?;
                     }
                 }
             }
@@ -5557,7 +6429,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                         .is_empty()
                         && !crate::native_archive::has_archive_magic(&path)?
                     {
-                        fold_apple_install_name(hasher, &path, dir, index)?;
+                        fold_apple_install_name(hasher, &path, dir, index, crate_name)?;
                     }
                     break;
                 }
@@ -5734,14 +6606,13 @@ fn fold_apple_install_name<H: KeyFold>(
     path: &Path,
     dir: &Path,
     index: usize,
+    crate_name: &str,
 ) -> Result<()> {
     let name = apple_install_name::read(path)?;
     let file = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
-    fold_field(
-        hasher,
-        b"apple_install_name.v1:",
-        format!("{index}/{file}={name}").as_bytes(),
-    );
+    let entry = format!("{index}/{file}={name}");
+    fold_field(hasher, b"apple_install_name.v1:", entry.as_bytes());
+    tracing::trace!("[key:{}] apple_install_name:{}", crate_name, entry);
     Ok(())
 }
 
@@ -7219,7 +8090,14 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
     let mut entered = HashMap::new();
     sources.iter().all(|source| {
         guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
-            walk_reaches(root, &below, skips_build_dirs, &mut entered)
+            // Only the workspace walk, the one that skips build dirs, leaves
+            // directory names out.
+            let excluded: &[std::ffi::OsString] = if skips_build_dirs {
+                &workspace.guard_excluded
+            } else {
+                &[]
+            };
+            walk_reaches(root, &below, skips_build_dirs, excluded, &mut entered)
                 && package_scope_sees(root, &below, workspace)
         })
     })
@@ -7283,12 +8161,14 @@ fn guard_place<'a>(
 
 /// Does a walk from `root` that follows no symlink reach the file at
 /// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
-/// through a directory Cargo tagged as its build directory either.
+/// through a directory Cargo tagged as its build directory either, and never
+/// through one named in `excluded_dirs` ([`names_guard_excluded`]).
 /// `entered` keeps the answer for each directory checked.
 fn walk_reaches(
     root: &Path,
     below: &str,
     skips_build_dirs: bool,
+    excluded_dirs: &[std::ffi::OsString],
     entered: &mut HashMap<(PathBuf, bool), bool>,
 ) -> bool {
     use std::path::Component;
@@ -7309,6 +8189,9 @@ fn walk_reaches(
             depth = up;
             directory.pop();
             continue;
+        }
+        if names_guard_excluded(component.as_os_str(), excluded_dirs) {
+            return false;
         }
         directory.push(component);
         depth += 1;
@@ -7376,8 +8259,7 @@ fn workspace_relative_source(source: &Path, workspace: &WorkspaceRoots) -> Optio
     let spelled = source.to_str()?;
     let from_root = format!("{}/{spelled}", workspace.cwd);
     let components = from_root.strip_prefix(['/', '\\'])?;
-    (stays_below(components.split(['/', '\\']), 0) && stays_below(components.split('/'), 0))
-        .then(|| Portable::Literal(spelled.to_string()))
+    walk_stays_below(components, 0).then(|| Portable::Literal(spelled.to_string()))
 }
 
 /// One path or env value of a workspace unit: under `OUT_DIR`, under the
@@ -7792,6 +8674,9 @@ pub struct FileHasher<'db> {
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
+    /// The hash and stamp of the first spelling hashed of each file, by its
+    /// plain spelling ([`plain_spelling`]): Windows only, empty elsewhere.
+    spellings: RefCell<HashMap<PathBuf, (String, ObservedFingerprint)>>,
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
@@ -7891,7 +8776,65 @@ fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: 
 struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
-    header_scan: Option<(i64, String)>,
+}
+
+/// The smallest key input whose hash [`FileHasher::hash`] memoises. Other
+/// reads, such as a tree guard's, keep [`MIN_PERSISTED_HASH_BYTES`].
+const SOURCE_MEMO_MIN_BYTES: i64 = kache_store::file_hash::KEY_INPUT_MEMO_MIN_BYTES;
+
+/// Whether a hash read as `first` vouches for the same file seen again as
+/// `now` under another spelling. The file may have been written since, so
+/// only a settled first read and the same strong stamp (size, times, file
+/// index) carry it over, as a memo row would. The same spelling is the
+/// memo's question, not this one.
+fn may_carry_over(
+    first: &ObservedFingerprint,
+    now: &FileFingerprint,
+    requires_identity: bool,
+) -> bool {
+    let was = &first.fingerprint;
+    was.path != now.path
+        && first.settled()
+        && file_hash_memo_eligible(now.inode, requires_identity)
+        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
+            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
+}
+
+/// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
+/// `C:\a/b` and `c:\a\b` all give `C:\a\b`, the one file they name. `None`
+/// for any other path, and for one whose two spellings could name different
+/// files: a `.` or `..` (resolved by Win32, literal after `\\?\`), a name
+/// ending in a dot or a space (stripped by Win32 only), a `/` inside a
+/// verbatim name, a UNC or device path. Always `None` off Windows.
+#[cfg(windows)]
+fn plain_spelling(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+                    plain.push(format!("{}:", char::from(disk.to_ascii_uppercase())));
+                }
+                _ => return None,
+            },
+            Component::RootDir => plain.push("\\"),
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if name.ends_with(['.', ' ']) || name.contains('/') {
+                    return None;
+                }
+                plain.push(name);
+            }
+            Component::CurDir | Component::ParentDir => return None,
+        }
+    }
+    plain.is_absolute().then_some(plain)
+}
+
+#[cfg(not(windows))]
+fn plain_spelling(_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// [`hash_file`], for a read that follows a stat of the same file.
@@ -7957,6 +8900,7 @@ impl FileHasher<'static> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -7984,6 +8928,7 @@ impl FileHasher<'static> {
                 discovery_flight: RefCell::new(None),
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
+                spellings: RefCell::new(HashMap::new()),
                 env_dep_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
@@ -8005,6 +8950,10 @@ impl FileHasher<'static> {
     }
 }
 
+/// A header scan as a scanner returns it: the raw content hash, the scan
+/// stored without its macro definitions, and those as `(name, bodies)`.
+pub(crate) type CcScannedHeader = (String, String, Vec<(String, String)>);
+
 impl<'db> FileHasher<'db> {
     pub(crate) fn invocation_env(&self) -> &InvocationEnv {
         &self.invocation_env
@@ -8016,10 +8965,11 @@ impl<'db> FileHasher<'db> {
     /// observed is left out: its hash was right for this process, but a
     /// second write in the same timestamp tick would leave a row that no
     /// stamp check could catch. Flushing later does not change that, since
-    /// the bytes were read back then. The rows are an optimisation, so a busy
-    /// index (another process holds the write lock for longer than the short
-    /// wait here) drops them rather than stalling a hit; the next process
-    /// hashes those files again.
+    /// the bytes were read back then. In the daemon the rows go to one writer
+    /// thread that waits out a busy index ([`crate::memo_writer`]). Elsewhere,
+    /// or when that queue is full, a busy index (another process holds the
+    /// write lock for longer than the short wait here) drops them rather than
+    /// stalling a hit; the next process hashes those files again.
     pub fn flush_memo(&self) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
         pending.retain(|(observed, _)| observed.settled());
@@ -8031,21 +8981,29 @@ impl<'db> FileHasher<'db> {
             return;
         };
         let db = cache.db();
+        let rows: crate::memo_writer::MemoRows = pending
+            .into_iter()
+            .map(|(observed, hash)| (observed.fingerprint, hash))
+            .collect();
+        let rows = match crate::memo_writer::submit(Path::new(db.path().unwrap_or("")), rows) {
+            Ok(()) => return,
+            Err(rows) => rows,
+        };
         let _ = db.busy_timeout(std::time::Duration::from_millis(100));
-        let written = (|| -> rusqlite::Result<()> {
-            db.execute_batch("BEGIN IMMEDIATE")?;
-            for (observed, hash) in &pending {
-                if let Err(error) = cache.put(&observed.fingerprint, hash) {
-                    let _ = db.execute_batch("ROLLBACK");
-                    return Err(error);
-                }
-            }
-            db.execute_batch("COMMIT")
-        })();
+        let written = crate::memo_writer::write(db, &rows);
         let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
         if let Err(error) = written {
-            tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
+            tracing::debug!(rows = rows.len(), "file hash memo not written: {error}");
         }
+    }
+
+    /// Drop the pending memo rows of paths `unrecorded` claims, such as a
+    /// unit's own source: no other unit hashes it, and a memo check only
+    /// hashes it again when its stamp moved.
+    pub(crate) fn forget_pending_memo(&self, unrecorded: &dyn Fn(&Path) -> bool) {
+        self.pending_memo
+            .borrow_mut()
+            .retain(|(observed, _)| !unrecorded(Path::new(&observed.fingerprint.path)));
     }
 
     /// Flush as if every pending file had been observed one settle window
@@ -8075,6 +9033,7 @@ impl<'db> FileHasher<'db> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -8498,14 +9457,30 @@ impl<'db> FileHasher<'db> {
     /// write has moved it; an input observed sooner was recorded without a
     /// stamp and is compared by content every time. Any database, decoding,
     /// or metadata uncertainty is still a miss.
+    #[cfg(test)]
     pub(crate) fn cc_preprocess_memo_lookup(
         &self,
         memo_key: &str,
         resolve: impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<(String, Vec<PathBuf>)> {
+        self.cc_preprocess_memo_lookup_shadowing(memo_key, resolve, mapped_content)
+            .map(|(hash, satisfied, _)| (hash, satisfied))
+    }
+
+    /// [`Self::cc_preprocess_memo_lookup`], with the include-shadowing
+    /// derivation the compiler stored on the memo row, if any.
+    pub(crate) fn cc_preprocess_memo_lookup_shadowing(
+        &self,
+        memo_key: &str,
+        resolve: impl Fn(&str) -> Vec<PathBuf>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+    ) -> Option<(String, Vec<PathBuf>, Option<String>)> {
         let cache = self.cache.as_ref()?;
-        let record = match cache.get_cc_preprocess_memo(memo_key) {
+        let trace_fetch = crate::phase_trace::phase("cc_memo_fetch");
+        let record = cache.get_cc_preprocess_memo(memo_key);
+        drop(trace_fetch);
+        let record = match record {
             Ok(record) => record?,
             Err(error) => {
                 tracing::debug!("cc preprocess memo lookup failed: {error}");
@@ -8538,21 +9513,72 @@ impl<'db> FileHasher<'db> {
         // The paths that satisfied the memo are the inputs this invocation
         // would have discovered by preprocessing, and the caller needs them to
         // resolve include shadowing without a fresh dependency capture.
+        let _trace_verify = crate::phase_trace::phase("cc_memo_verify");
         let mut satisfied = Vec::with_capacity(inputs.len());
-        for (expected, scan) in inputs.iter().zip(&record.header_scans) {
-            satisfied.push(self.memo_input_is_unchanged(
-                expected,
-                scan,
-                &resolve,
-                mapped_content,
-            )?);
+        for expected in &inputs {
+            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
         }
         if record.needs_touch
             && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
         {
             tracing::debug!("cc preprocess memo touch failed: {error}");
         }
-        Some((record.preprocessed_hash, satisfied))
+        Some((record.preprocessed_hash, satisfied, record.shadowing))
+    }
+
+    /// Store the compiler's include-shadowing derivation on a memo row.
+    pub(crate) fn cc_preprocess_memo_set_shadowing(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        shadowing: &str,
+    ) {
+        if let Some(cache) = &self.cache
+            && let Err(error) =
+                cache.set_cc_preprocess_memo_shadowing(memo_key, preprocessed_hash, shadowing)
+        {
+            tracing::debug!("cc preprocess memo shadowing update failed: {error}");
+        }
+    }
+
+    /// The content hash of each path, from this invocation's validated
+    /// stamps where it has one, else by hashing.
+    pub(crate) fn cc_input_contents(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+        paths
+            .iter()
+            .map(|path| self.selected_content(path))
+            .collect()
+    }
+
+    /// Take the content hashes another hasher in this process observed for
+    /// a compile's read set, so keying selects those bytes, the ones the
+    /// read-set digest names, instead of hashing each input again.
+    pub(crate) fn adopt_observed(&self, inputs: &[CcPreprocessMemoInput]) {
+        let mut recent = self.recent_hashes.borrow_mut();
+        for input in inputs {
+            let Ok(resolved) = self.resolve_path(Path::new(input.local_path())) else {
+                continue;
+            };
+            recent.entry(resolved).or_insert_with(|| RecentHash {
+                hash: input.content.clone(),
+                fingerprint: Some(input.fingerprint.clone()),
+            });
+        }
+    }
+
+    fn selected_content(&self, path: &Path) -> anyhow::Result<String> {
+        let recent = {
+            let resolved = self.resolve_path(path)?;
+            let recent = self.recent_hashes.borrow();
+            recent
+                .get(&resolved)
+                .filter(|recent| recent.fingerprint.is_some())
+                .map(|recent| recent.hash.clone())
+        };
+        match recent {
+            Some(content) => Ok(content),
+            None => self.hash(path),
+        }
     }
 
     /// Does this input still hold the bytes the memo was recorded against?
@@ -8564,7 +9590,6 @@ impl<'db> FileHasher<'db> {
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
-        header_scan: &Option<(i64, String)>,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
@@ -8600,7 +9625,6 @@ impl<'db> FileHasher<'db> {
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
-                        header_scan: header_scan.clone(),
                     },
                 );
                 return Some(path.clone());
@@ -8644,6 +9668,19 @@ impl<'db> FileHasher<'db> {
         paths: &[(String, PathBuf)],
         maps_key: &str,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+    ) -> Option<Vec<CcPreprocessMemoInput>> {
+        self.cc_preprocess_fingerprints_recording(paths, maps_key, mapped_content, &|_| false)
+    }
+
+    /// [`Self::cc_preprocess_fingerprints`], not recording the mapped hashes
+    /// of paths `unrecorded` claims (a unit's own source, which no other
+    /// unit reads).
+    pub(crate) fn cc_preprocess_fingerprints_recording(
+        &self,
+        paths: &[(String, PathBuf)],
+        maps_key: &str,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
         let paths = paths
             .iter()
@@ -8720,7 +9757,9 @@ impl<'db> FileHasher<'db> {
                         return None;
                     }
                     known.insert(content.clone(), read.mapped.clone());
-                    learned.push((content.clone(), read.mapped.clone()));
+                    if !unrecorded(&path) {
+                        learned.push((content.clone(), read.mapped.clone()));
+                    }
                     read.mapped
                 }
             };
@@ -8742,49 +9781,57 @@ impl<'db> FileHasher<'db> {
         Some(inputs)
     }
 
-    /// Scan the input content already selected for this key, reusing results
-    /// across wrapper processes. Memo validation and hashing register the
-    /// snapshot for the write guard; do not stat every input a second time.
-    /// A new scan must report the hash of its bytes so a racing save cannot
-    /// poison the content-addressed result.
+    #[cfg(test)]
     pub(crate) fn cc_header_scans(
         &self,
         paths: &[PathBuf],
         version: i64,
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
     ) -> anyhow::Result<Vec<String>> {
+        let scan = |path: &Path| scan(path).map(|(raw, json)| (raw, json, Vec::new()));
+        Ok(self
+            .cc_header_scans_except(paths, version, &mut |_| false, &scan, &|_| false)?
+            .into_iter()
+            .map(|(_, scan)| scan.expect("nothing is held"))
+            .collect())
+    }
+
+    /// Scan the input content already selected for this key, reusing results
+    /// across wrapper processes. Memo validation and hashing register the
+    /// snapshot for the write guard; do not stat every input a second time.
+    /// A new scan must report the hash of its bytes so a racing save cannot
+    /// poison the content-addressed result.
+    ///
+    /// Returns each path's content hash with its scan. Contents `held` claims
+    /// are scans the caller already has: they are neither loaded nor
+    /// computed, and come back as `None`. `scan` also returns the header's
+    /// macro definitions as `(name, bodies)`; they are stored apart and read
+    /// back by name ([`Self::cc_header_macros`]). Scans of paths
+    /// `unrecorded` claims (a unit's own source, read by no other unit) are
+    /// not stored: writing them cost more than scanning them again.
+    pub(crate) fn cc_header_scans_except(
+        &self,
+        paths: &[PathBuf],
+        version: i64,
+        held: &mut dyn FnMut(&str) -> bool,
+        scan: &impl Fn(&Path) -> anyhow::Result<CcScannedHeader>,
+        unrecorded: &dyn Fn(&Path) -> bool,
+    ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
-        let mut known = std::collections::HashMap::new();
         for path in paths {
-            let selected = {
-                let resolved = self.resolve_path(path)?;
-                let recent = self.recent_hashes.borrow();
-                recent.get(&resolved).and_then(|recent| {
-                    recent
-                        .fingerprint
-                        .as_ref()
-                        .map(|_| (recent.hash.clone(), recent.header_scan.clone()))
-                })
-            };
-            let content = match selected {
-                Some((content, analysis)) => {
-                    if let Some((scan_version, scan)) = analysis
-                        && scan_version == version
-                    {
-                        known.insert(content.clone(), scan);
-                    }
-                    content
-                }
-                None => self.hash(path)?,
-            };
-            contents.push(content);
+            let content = self.selected_content(path)?;
+            let is_held = held(&content);
+            contents.push((content, is_held));
         }
         let missing: Vec<_> = contents
             .iter()
-            .filter(|content| !known.contains_key(*content))
-            .map(String::as_str)
+            .filter(|(_, is_held)| !is_held)
+            .map(|(content, _)| content.as_str())
             .collect();
-        if let Some(cache) = &self.cache {
+        let mut known = std::collections::HashMap::new();
+        if let Some(cache) = &self.cache
+            && !missing.is_empty()
+        {
             match cache.get_cc_header_scans(version, &missing) {
                 Ok(found) => known.extend(found),
                 Err(error) => tracing::debug!("cc header scan lookup failed: {error}"),
@@ -8792,28 +9839,48 @@ impl<'db> FileHasher<'db> {
         }
         let mut learned = Vec::new();
         let mut results = Vec::with_capacity(paths.len());
-        for (path, content) in paths.iter().zip(contents) {
-            let result = if let Some(result) = known.get(&content) {
-                result.clone()
+        for (path, (content, is_held)) in paths.iter().zip(contents) {
+            let result = if is_held {
+                None
+            } else if let Some(result) = known.get(&content) {
+                Some(result.clone())
             } else {
-                let (raw, result) = scan(path)?;
+                let (raw, result, macros) = scan(path)?;
                 anyhow::ensure!(
                     raw == content,
                     "cc: input changed while scanning header probes: {}",
                     path.display()
                 );
                 known.insert(content.clone(), result.clone());
-                learned.push((content, result.clone()));
-                result
+                if !unrecorded(path) {
+                    learned.push((content.clone(), result.clone(), macros));
+                }
+                Some(result)
             };
-            results.push(result);
+            results.push((content, result));
         }
         if let Some(cache) = &self.cache
-            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+            && !learned.is_empty()
+            && let Err(error) = cache.put_cc_header_scans_with_macros(version, &learned)
         {
             tracing::debug!("cc header scan update failed: {error}");
         }
         Ok(results)
+    }
+
+    /// The macro definitions named `names` in the scans of `contents`, as
+    /// `(content, name, bodies)`. Without a store there is nothing recorded,
+    /// and every scan was computed with its definitions in hand.
+    pub(crate) fn cc_header_macros(
+        &self,
+        version: i64,
+        contents: &[&str],
+        names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        match &self.cache {
+            Some(cache) => Ok(cache.get_cc_header_macros(version, contents, names)?),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The first input whose raw text hides a file the assembler would read,
@@ -8831,6 +9898,7 @@ impl<'db> FileHasher<'db> {
         &self,
         inputs: &[CcPreprocessMemoInput],
         scan: &impl Fn(&Path) -> Option<(String, Option<&'static str>)>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> Option<String> {
         let _trace = crate::phase_trace::phase("cc_asm_scan");
         let known = match &self.cache {
@@ -8859,7 +9927,9 @@ impl<'db> FileHasher<'db> {
                     }
                     let construct = scanned.unwrap_or("").to_string();
                     known.insert(input.content.clone(), construct.clone());
-                    learned.push((input.content.clone(), construct.clone()));
+                    if !unrecorded(Path::new(&input.fingerprint.path)) {
+                        learned.push((input.content.clone(), construct.clone()));
+                    }
                     construct
                 }
             };
@@ -8883,9 +9953,9 @@ impl<'db> FileHasher<'db> {
     /// the input was observed moves on any later write. One taken sooner can
     /// survive a second write in the same timestamp tick, so the input is
     /// recorded by content alone and every lookup compares that content. For
-    /// a file of 64 KiB or more the comparison goes through the file-hash
-    /// memo, which answers by stamp, so it is only as fresh as that memo's
-    /// rows. Refusing the record instead would keep a fresh checkout from
+    /// a file of [`SOURCE_MEMO_MIN_BYTES`] or more (any size on Windows) the
+    /// comparison goes through the file-hash memo, which answers by stamp, so
+    /// it is only as fresh as that memo's rows. Refusing the record instead would keep a fresh checkout from
     /// memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
@@ -8907,7 +9977,6 @@ impl<'db> FileHasher<'db> {
             if self
                 .memo_input_is_unchanged(
                     expected,
-                    &None,
                     &|_: &str| vec![recorded_path.clone()],
                     mapped_content,
                 )
@@ -9145,20 +10214,59 @@ impl<'db> FileHasher<'db> {
     fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
+        if let Some(recent) = self.hashed_under_another_spelling(&resolved) {
+            return Ok(recent);
+        }
         let path = resolved.as_path();
-        let (hash, observed) = self.hash_inner(path, true)?;
+        let (hash, observed, stamp_of_the_read) = self.hash_inner(path, true)?;
         if let Some(observed) = &observed {
             self.guard_input(observed);
+            // Only a stamp the bytes belong to may vouch for another
+            // spelling, as only such a stamp gets a memo row.
+            if stamp_of_the_read && let Some(plain) = plain_spelling(&resolved) {
+                self.spellings
+                    .borrow_mut()
+                    .entry(plain)
+                    .or_insert_with(|| (hash.clone(), observed.clone()));
+            }
         }
         let recent = RecentHash {
             hash,
             fingerprint: observed.map(|observed| observed.fingerprint),
-            header_scan: None,
         };
         self.recent_hashes
             .borrow_mut()
             .insert(resolved, recent.clone());
         Ok(recent)
+    }
+
+    /// The hash this process already took of the file `resolved` names,
+    /// under another spelling of it. On Windows one closure can name a file
+    /// twice: a crate that embeds a folder with rust-embed, which includes
+    /// the canonical `\\?\C:\…\assets\a.svg`, and also includes each file
+    /// as `concat!(env!("CARGO_MANIFEST_DIR"), "/assets/a.svg")`, which gives
+    /// `C:\…\pkg/assets/a.svg`. One that does so for 1,830 icons listed
+    /// 3,666 sources and read each file twice per key. This spelling takes the first one's
+    /// hash while the file keeps the settled stamp it had then, under its
+    /// own path, and joins the too-new guard with it, so the checks after
+    /// the compile stat it as they would have.
+    fn hashed_under_another_spelling(&self, resolved: &Path) -> Option<RecentHash> {
+        let plain = plain_spelling(resolved)?;
+        let (hash, first) = self.spellings.borrow().get(&plain).cloned()?;
+        let observed = ObservedFingerprint::from_path(resolved).ok()?;
+        if !may_carry_over(&first, &observed.fingerprint, cfg!(windows)) {
+            return None;
+        }
+        self.record_hit();
+        self.guard_input(&observed);
+        let recent = RecentHash {
+            hash,
+            fingerprint: Some(observed.fingerprint),
+        };
+        self.recent_hashes
+            .borrow_mut()
+            .insert(resolved.to_path_buf(), recent.clone());
+        Some(recent)
     }
 
     /// Validate and hash a compiled resource from one open file. Whole-file
@@ -9199,7 +10307,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9232,7 +10339,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9264,7 +10370,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9328,7 +10433,7 @@ impl<'db> FileHasher<'db> {
     /// or that moved while the file was read under the guard.
     pub(crate) fn hash_unkeyed(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
-        self.hash_inner(path, false).map(|(hash, _)| hash)
+        self.hash_inner(path, false).map(|(hash, _, _)| hash)
     }
 
     /// Small tree-guard files share one memo lookup per root. The row must
@@ -9410,11 +10515,15 @@ impl<'db> FileHasher<'db> {
     }
 
     /// With `keyed`, the file is a key input and the too-new guard sees it.
+    /// The hash of `path`, the stamp to report for it, and whether that
+    /// stamp belongs to the bytes hashed: it came with the hash (memo or
+    /// prefetch), or two stats around the read agreed, the rule a memo row
+    /// is written under.
     fn hash_inner(
         &self,
         path: &Path,
         keyed: bool,
-    ) -> Result<(String, Option<ObservedFingerprint>)> {
+    ) -> Result<(String, Option<ObservedFingerprint>, bool)> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
         let Some(cache) = &self.cache else {
@@ -9427,7 +10536,8 @@ impl<'db> FileHasher<'db> {
             };
             if !keyed || self.too_new.invocation_start_ns == 0 {
                 let hash = hash_file(path)?;
-                return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
+                let after = FileFingerprint::from_path(path).ok().map(observed);
+                return Ok((hash, after, false));
             }
             let Ok(before) = FileFingerprint::from_path(path).map(observed) else {
                 // No stamp before the read: whatever follows it is too new.
@@ -9436,12 +10546,12 @@ impl<'db> FileHasher<'db> {
                 if after.is_some() {
                     self.too_new.saw_too_new.set(true);
                 }
-                return Ok((hash, after.map(observed)));
+                return Ok((hash, after.map(observed), false));
             };
             self.note_too_new(&before.fingerprint);
             let hash = read_file_hash(path)?;
-            let (observed, _) = self.restat_after_read(path, before, true);
-            return Ok((hash, Some(observed)));
+            let (observed, unchanged) = self.restat_after_read(path, before, true);
+            return Ok((hash, Some(observed), unchanged));
         };
 
         let observed = match ObservedFingerprint::from_path(path) {
@@ -9451,7 +10561,7 @@ impl<'db> FileHasher<'db> {
                     "file hash cache metadata lookup failed for {}: {e}",
                     path.display()
                 );
-                return hash_file(path).map(|hash| (hash, None));
+                return hash_file(path).map(|hash| (hash, None, false));
             }
         };
         let fingerprint = &observed.fingerprint;
@@ -9460,13 +10570,18 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+        let memo_floor = if keyed {
+            SOURCE_MEMO_MIN_BYTES
+        } else {
+            MIN_PERSISTED_HASH_BYTES
+        };
+        if fingerprint.size < memo_floor
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
         {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            let (observed, _) = self.restat_after_read(path, observed, keyed);
-            return Ok((hash, Some(observed)));
+            let (observed, unchanged) = self.restat_after_read(path, observed, keyed);
+            return Ok((hash, Some(observed), unchanged));
         }
 
         // A hash from the daemon or the memo belongs to this stamp; no read
@@ -9478,13 +10593,13 @@ impl<'db> FileHasher<'db> {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok((prefetched.hash.clone(), Some(observed)));
+            return Ok((prefetched.hash.clone(), Some(observed), true));
         }
 
         match cache.get(fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok((hash, Some(observed)));
+                return Ok((hash, Some(observed), true));
             }
             Ok(None) => {}
             Err(e) => {
@@ -9500,7 +10615,7 @@ impl<'db> FileHasher<'db> {
                 .borrow_mut()
                 .push((observed.clone(), hash.clone()));
         }
-        Ok((hash, Some(observed)))
+        Ok((hash, Some(observed), unchanged))
     }
 
     /// Stat `path` again after reading the bytes `before` was taken for, when
@@ -9693,8 +10808,8 @@ impl<'db> FileHasher<'db> {
         };
         self.note_too_new(&fingerprint);
 
-        // Small libs skip the persistent cache (same policy as `hash`); the
-        // archive read is cheap and not worth a row.
+        // Small libs skip the persistent cache (the floor `hash` keeps off
+        // Windows); the archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
@@ -9819,7 +10934,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -10889,7 +12003,9 @@ pub(crate) fn rustc_tool_dirs_for(
 /// content hashes, under an explicit `--sysroot` and under the toolchain's own
 /// sysroot. Both are hashed because which one rustc searches first depends on
 /// its release. Finding none is an error, so the compile is not cached under a
-/// key that describes no backend.
+/// key that describes no backend. In a double-wrapper invocation the host and
+/// sysroot are the inner rustc's: `clippy-driver --version --verbose` prints
+/// only Clippy's version.
 pub(crate) fn toolchain_codegen_backends_for(
     args: &RustcArgs,
     rustc_version: &str,
@@ -10897,12 +12013,16 @@ pub(crate) fn toolchain_codegen_backends_for(
     file_hasher: &FileHasher,
     env: &InvocationEnv,
 ) -> Result<Vec<(String, String)>> {
-    let host = rustc_host_triple(rustc_version).context("rustc -vV reports no host")?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, |rustc| {
+        get_rustc_version_for(rustc, env)
+    })?;
+    let host = rustc_host_triple(&rustc_version).context("rustc -vV reports no host")?;
+    let rustc = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
     let sysroots = args
         .sysroot
         .iter()
         .filter_map(|root| env.resolve(root))
-        .chain(default_rustc_sysroot_for(&args.rustc, env));
+        .chain(default_rustc_sysroot_for(rustc, env));
     let found = codegen_backend_libraries(sysroots, host, name, file_hasher)?;
     anyhow::ensure!(
         !found.is_empty(),
@@ -11016,6 +12136,16 @@ fn tool_version_cache_path_in(
 }
 
 fn tool_version_cache_path_for(
+    binary: &Path,
+    prefix: &str,
+    env: &InvocationEnv,
+) -> Option<PathBuf> {
+    env.derived_path(binary, prefix, || {
+        derive_tool_version_cache_path(binary, prefix, env)
+    })
+}
+
+fn derive_tool_version_cache_path(
     binary: &Path,
     prefix: &str,
     env: &InvocationEnv,
@@ -11166,7 +12296,7 @@ fn file_digest(path: &Path) -> Option<String> {
 }
 
 /// Get the host target triple.
-fn host_target_triple() -> &'static str {
+pub(crate) fn host_target_triple() -> &'static str {
     option_env!("TARGET").unwrap_or("unknown")
 }
 
@@ -11252,7 +12382,7 @@ where
     match args.inner_rustc.as_deref() {
         Some(inner) => load_version(inner)
             .map(Cow::Owned)
-            .context("reading inner rustc version for native host link key"),
+            .context("reading the inner rustc version for its host triple"),
         None => Ok(Cow::Borrowed(outer_rustc_version)),
     }
 }
@@ -11582,6 +12712,9 @@ fn windows_link_identity_with_argument_files(
 
 /// Generic codegen hashing sorts by option name. LINK options can override
 /// earlier options across link-arg/link-args carriers, so retain that order too.
+///
+/// A compiled resource named alone ([`is_keyed_windows_resource`]) folds as
+/// [`WINDOWS_RESOURCE_ARGUMENT`]: its bytes and place are in the identity.
 fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs) {
     for (index, (carrier, value)) in args
         .codegen_opts
@@ -11594,7 +12727,14 @@ fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs
             .and_then(crate::native_link_key::WindowsDefaultLibrary::parse);
         let (carrier, value) = match default_library {
             Some(library) => ("defaultlib", library.canonical_name()),
-            None => (carrier.as_str(), value.as_deref().unwrap_or("")),
+            None => {
+                let value = value.as_deref().unwrap_or("");
+                if is_keyed_windows_resource(carrier, value) {
+                    (carrier.as_str(), WINDOWS_RESOURCE_ARGUMENT)
+                } else {
+                    (carrier.as_str(), value)
+                }
+            }
         };
         fold_field(
             hasher,
@@ -11604,6 +12744,30 @@ fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs
         fold_field(hasher, b"windows_link_arg_carrier.v1:", carrier.as_bytes());
         fold_field(hasher, b"windows_link_arg_value.v1:", value.as_bytes());
     }
+}
+
+/// What a native MSVC link keys in place of a compiled resource's path.
+const WINDOWS_RESOURCE_ARGUMENT: &str = "kache-windows-resource";
+
+/// Whether a `-C link-arg` value is one compiled resource (`.res`) named by
+/// absolute path and nothing else. A native MSVC link keys that file by its
+/// bytes and its place among the link arguments in the MSVC identity
+/// ([`windows_link_identity_with_argument_files`]), and the linker reads
+/// nothing else of it, so the path itself stays out of the key. winresource
+/// and embed-resource print `<OUT_DIR>/resource.res` this way; folded as
+/// spelled, that path tied the link's key to one target directory.
+fn is_keyed_windows_resource(key: &str, value: &str) -> bool {
+    key == "link-arg"
+        && matches!(
+            crate::native_link_key::windows_link_argument_input_files(key, value),
+            Some(crate::native_link_key::WindowsLinkArgumentInputs { files, default_libraries })
+                if default_libraries.is_empty()
+                    && matches!(
+                        files.as_slice(),
+                        [crate::native_link_key::WindowsLinkInput::Resource(path)]
+                            if path.as_os_str() == value
+                    )
+        )
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
@@ -11657,6 +12821,11 @@ fn fold_generic_linker_identity<H, Get>(
         hasher.update(b"linker:");
         hasher.update(linker_id.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            "[key:{}] linker={}",
+            args.crate_name.as_deref().unwrap_or("unknown"),
+            linker_id
+        );
     }
 }
 
@@ -11800,6 +12969,69 @@ where
         identity.replace('\n', ",")
     );
     Ok(())
+}
+
+/// The files a native Linux link through `driver` depends on beyond its
+/// inputs, by content: the CRT objects and libc it places and, for a driver
+/// other than the `cc` on PATH, the driver itself. `-C linker` names that
+/// driver and the key leaves its path out (`codegen_inputs`), and `linker:`
+/// folds only its `--version` banner, which a wrapper script answers as the
+/// compiler it wraps does: two wrappers that link differently (one adding
+/// `-no-pie`, one asking for RELR relocations) shared one key, and a build
+/// restored the programs the other linked. The plain `cc` keeps its key (no
+/// key bump: the goldens link through it); another driver's key changes once.
+fn native_linux_link_objects_for(
+    memo_dir: &Path,
+    driver: &Path,
+    hash: impl Fn(&Path) -> Result<String>,
+    invocation: &InvocationEnv,
+) -> Result<BTreeMap<String, String>> {
+    let mut objects = crate::native_link_key::probe_linux_crt_objects_memoized_for(
+        memo_dir, driver, &hash, invocation,
+    )?;
+    if !is_path_cc(driver, invocation) {
+        objects.insert("link_driver".to_owned(), hash(driver)?);
+    }
+    Ok(objects)
+}
+
+/// What a native macOS link folds as its SDK identity: `sdk_identity` and,
+/// for a driver other than the `cc` on PATH, the driver's content hash. As on
+/// Linux, `-C linker` names the driver, the key leaves its path out, and
+/// `linker:` folds only its `--version` banner, which a wrapper script around
+/// `cc` forwards unchanged. A build whose wrapper made clang run another
+/// linker (`--ld-path`) restored the program the default linker had made
+/// (#1966). A driver that does not resolve or hash passes the link through.
+/// The plain `cc` keeps its key (no key bump); another driver's key changes
+/// once.
+fn native_macos_link_identity_for(
+    sdk_identity: String,
+    args: &RustcArgs,
+    hash: impl FnOnce(&Path) -> Result<String>,
+    invocation: &InvocationEnv,
+) -> Result<String> {
+    let driver = resolve_link_driver_for(args, invocation)
+        .context("native macOS link has no cc/linker driver; cannot key the link")?;
+    let mut identity = sdk_identity;
+    if !is_path_cc(&driver, invocation) {
+        identity.push_str("\nlink_driver=");
+        identity.push_str(&hash(&driver).context("hashing the native macOS link driver")?);
+    }
+    Ok(identity)
+}
+
+/// Whether `driver` is the `cc` a bare name finds on the client's PATH,
+/// symlinks followed: the driver a link without `-C linker` runs.
+fn is_path_cc(driver: &Path, env: &InvocationEnv) -> bool {
+    let Some(cc) = env.resolve_program(Path::new("cc")) else {
+        return false;
+    };
+    // A path that does not resolve is not known to be that `cc`, so its bytes
+    // are keyed (or the hash fails and the link passes through).
+    match (std::fs::canonicalize(driver), std::fs::canonicalize(&cc)) {
+        (Ok(driver), Ok(cc)) => driver == cc,
+        _ => false,
+    }
 }
 
 pub(crate) fn resolve_link_driver_for(args: &RustcArgs, env: &InvocationEnv) -> Option<PathBuf> {

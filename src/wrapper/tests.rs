@@ -613,7 +613,9 @@ fn a_package_keyed_without_its_files_is_reported_once_a_session() {
 #[test]
 #[cfg(unix)]
 fn maybe_trigger_prefetch_refuses_symlinked_build_session() {
+    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::TempDir::new().unwrap();
+    let _isolated = isolate_daemon_autostart(temp.path());
     let target = temp.path().join("target_file");
     std::fs::write(&target, "target content").unwrap();
 
@@ -3898,6 +3900,17 @@ fn cc_store_freezes_private_artifacts_without_mutating_compiler_outputs() {
     );
 }
 
+/// Anchor plus the stored suffix. Restore writes that suffix with the local
+/// separator; `Path::join` would keep `/` inside the suffix on Windows.
+fn restored_anchor_path(anchor: &std::path::Path, relative_slash: &str) -> String {
+    format!(
+        "{}{}{}",
+        anchor.display(),
+        std::path::MAIN_SEPARATOR,
+        relative_slash.replace('/', std::path::MAIN_SEPARATOR_STR)
+    )
+}
+
 /// Rust store staging leaves compiler outputs untouched while the cached
 /// dep-info round trip re-roots target, package, and workspace paths.
 #[test]
@@ -3968,23 +3981,15 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         Some(&restoring_workspace),
         link::DepInfoMode::Expand,
     );
-    assert!(
-        restored.contains(
-            restoring_target
-                .join("release/deps/libfoo-abc.rlib")
-                .to_str()
-                .unwrap()
-        )
-    );
-    assert!(restored.contains(restoring_working_dir.join("src/lib.rs").to_str().unwrap()));
-    assert!(
-        restored.contains(
-            restoring_workspace
-                .join("shared/asset.txt")
-                .to_str()
-                .unwrap()
-        )
-    );
+    assert!(restored.contains(&restored_anchor_path(
+        &restoring_target,
+        "release/deps/libfoo-abc.rlib"
+    )));
+    assert!(restored.contains(&restored_anchor_path(&restoring_working_dir, "src/lib.rs")));
+    assert!(restored.contains(&restored_anchor_path(
+        &restoring_workspace,
+        "shared/asset.txt"
+    )));
 }
 
 /// A `0600` dep-info snapshot is published as `0400`, which another user of a
@@ -5006,11 +5011,8 @@ fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
         .unwrap();
         assert_eq!(std::fs::read(&restored_object).unwrap(), b"wasm object");
         let restored = std::fs::read_to_string(&restored_depfile).unwrap();
-        let expected_header = consumer
-            .join("src/inc/header with space.h")
-            .display()
-            .to_string()
-            .replace(' ', "\\ ");
+        let expected_header =
+            restored_anchor_path(&consumer, "src/inc/header with space.h").replace(' ', "\\ ");
         assert_eq!(
             restored,
             format!(
@@ -5322,18 +5324,13 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
     let restored = std::fs::read_to_string(&target).unwrap();
     assert!(
         restored.starts_with(&format!(
-            "{}{}debug/deps/libfoo.rlib:",
-            anchor.display(),
-            std::path::MAIN_SEPARATOR
+            "{}:",
+            restored_anchor_path(&anchor, "debug/deps/libfoo.rlib")
         )),
         "dep-info should be expanded at restore anchor, got: {restored}"
     );
     assert!(
-        restored.contains(&format!(
-            "{}{}src/lib.rs",
-            dir.path().display(),
-            std::path::MAIN_SEPARATOR
-        )),
+        restored.contains(&restored_anchor_path(dir.path(), "src/lib.rs")),
         "dep-info source should be expanded at the consumer cwd: {restored}"
     );
     assert_eq!(
@@ -5840,7 +5837,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -5958,7 +5955,7 @@ fn an_unproven_loadability_check_runs_on_every_restore() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -6177,6 +6174,69 @@ fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
     }
 }
 
+/// An entry with a bundle stored file by file (#1905) restores the bundle
+/// through its manifest and never places the manifest or its files beside
+/// the binary. The current opt-outs skip it like a legacy tar.
+#[test]
+fn split_debug_bundle_restore_honors_the_current_policy() {
+    for (flags, expected) in [
+        (vec!["-g"], true),
+        (vec!["-g", "-Csplit-debuginfo=off"], false),
+        (vec!["-Cdebuginfo=0"], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let blob = |content: &[u8]| {
+            let hash = blake3::hash(content).to_hex().to_string();
+            create_blob(&store, &hash, content);
+            hash
+        };
+        let executable = b"\x7fELFcached executable";
+        let mut primary = cached_file("foo", &blob(executable));
+        primary.size = executable.len() as u64;
+        primary.executable = true;
+        let manifest = br#"{"version":1,"files":[{"path":"Contents/Resources/DWARF/foo","name":"foo.dsym.0"}],"empty_files":["Contents/empty"]}"#;
+        let mut argv = vec![
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ];
+        argv.extend(&flags);
+        let args = rustc_args(&argv);
+        let mut meta = entry_meta(
+            "split-debug-bundle",
+            vec![
+                primary,
+                cached_file("foo.dsym.json", &blob(manifest)),
+                cached_file("foo.dsym.0", &blob(b"d")),
+            ],
+            &[],
+        );
+        meta.crate_types = vec!["bin".into()];
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        assert!(out_dir.join("foo").is_file(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.json").exists(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.0").exists(), "{flags:?}");
+        let dwarf = out_dir.join("foo.dSYM/Contents/Resources/DWARF/foo");
+        assert_eq!(dwarf.is_file(), expected, "{flags:?}");
+        assert_eq!(
+            out_dir.join("foo.dSYM/Contents/empty").is_file(),
+            expected,
+            "{flags:?}"
+        );
+        if expected {
+            assert_eq!(std::fs::read(dwarf).unwrap(), b"d");
+        }
+    }
+}
+
 /// Tar bytes shaped like a store-time debug bundle: entries relative to
 /// the bundle root, the layout `unpack_debug_bundle` re-creates.
 fn debug_bundle_tar(dwarf_name: &str, dwarf: &[u8]) -> Vec<u8> {
@@ -6287,41 +6347,47 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         .expect("cc link must be runnable on the macOS test host");
     assert!(link.success(), "cc link failed");
 
-    // Store side: bake + tar the bundle while the `.o` exists.
+    // Store side: bake + stage the bundle while the `.o` exists.
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
-    let tar_path = crate::compiler::platform::MacOsPlatform::default()
+    let artifacts = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
         .unwrap()
-        .expect("macOS host must package a bundle for a -g binary");
+        .expect("macOS host must package a bundle for a -g binary")
+        .into_artifacts();
 
     // Cache + restore side, in a directory the `.o` never existed in.
     let restore_dir = tempfile::tempdir().unwrap();
     let config = test_config(restore_dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
-    let hash = crate::cache_key::hash_file(&tar_path).unwrap();
-    let blob = store.blob_path(&hash);
-    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-    std::fs::copy(&tar_path, &blob).unwrap();
-    let cached = cached_file("hello-bin.dsym.tar", &hash);
+    let files: Vec<_> = artifacts
+        .iter()
+        .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+        .collect();
+    let key = "3193193193193193193193193193193193193193193193193193193193193193";
+    store
+        .put_with_compile_time(
+            key,
+            "hello",
+            &["bin".into()],
+            &[],
+            "",
+            "",
+            &files,
+            "",
+            "",
+            0,
+        )
+        .unwrap();
+    let meta = store.get(key).unwrap().unwrap();
     let deps = restore_dir.path().join("deps");
     std::fs::create_dir_all(&deps).unwrap();
-    let target = deps.join("hello-bin.dsym.tar");
-    let platform = platform::current();
-    materialize_cached_artifact(
-        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+    crate::compiler::debug_bundle::restore(
         &store,
-        &cached,
-        &target,
-        ArtifactKind::DebugBundle,
-        None,
-        restore_dir.path(),
-        restore_dir.path(),
-        None,
-        &[],
-        &*platform,
-        "test restore",
-        None,
+        &meta.files,
+        &meta.files[0],
+        &deps.join("hello-bin.dsym.json"),
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
     )
     .unwrap();
 
@@ -6990,6 +7056,79 @@ fn parse_cc(args: &[&str]) -> crate::compiler::cc::CcArgs {
     crate::compiler::cc::CcArgs::parse(&s(args)).unwrap()
 }
 
+fn cc_args_named(source: &str, package: Option<&str>) -> crate::compiler::cc::CcArgs {
+    let vars: Vec<(String, String)> = package
+        .map(|name| ("CARGO_PKG_NAME".to_string(), name.to_string()))
+        .into_iter()
+        .collect();
+    let env = crate::invocation::InvocationEnv::from_parts(vars, None, None, std::env::temp_dir());
+    crate::compiler::cc::CcArgs::parse_for(
+        &[
+            "cc".to_string(),
+            "-c".to_string(),
+            source.to_string(),
+            "-o".to_string(),
+            "out.o".to_string(),
+        ],
+        &env,
+    )
+    .unwrap()
+}
+
+#[test]
+fn lock_scope_for_package_foo_includes_its_cc_entry_not_a_source_file() {
+    let lock = std::collections::HashSet::from(["foo".to_string()]);
+    let published = cc_entry_crate_name(&cc_args_named("src/bar.c", Some("foo")));
+    assert_eq!(published, "foo");
+    assert!(
+        lock.contains(&published),
+        "a lock scope for foo includes the cc entry named foo"
+    );
+    assert!(
+        !lock.contains("bar.c"),
+        "a lock scope for foo does not include an entry named only bar.c"
+    );
+
+    let bare = cc_entry_crate_name(&cc_args_named("src/bar.c", None));
+    assert_eq!(bare, "bar.c");
+    assert!(!lock.contains(&bare));
+
+    let hyphen = cc_entry_crate_name(&cc_args_named("curve25519.c", Some(" aws-lc-sys ")));
+    let hyphen_lock = std::collections::HashSet::from(["aws_lc_sys".to_string()]);
+    assert_eq!(hyphen, "aws_lc_sys");
+    assert!(hyphen_lock.contains(&hyphen));
+    assert!(!hyphen_lock.contains("curve25519.c"));
+
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("  "))),
+        "bar.c"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some(""))),
+        "bar.c"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("foo_bar"))),
+        "foo_bar"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("foo-bar"))),
+        "foo_bar"
+    );
+
+    let no_source = crate::compiler::cc::CcArgs::parse_for(
+        &["cc".to_string()],
+        &crate::invocation::InvocationEnv::from_parts(
+            Vec::<(String, String)>::new(),
+            None,
+            None,
+            std::env::temp_dir(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(cc_entry_crate_name(&no_source), "unknown");
+}
+
 /// `cc_event_root` honors the override exactly (pins whole-body
 /// mutants on a helper the diff would otherwise leave uncovered).
 #[test]
@@ -7038,9 +7177,13 @@ fn seed_cc_object_entry(store: &Store, cache_key: &str, dir: &Path) {
         .unwrap();
 }
 
-/// Keep auto-start from `send_upload_job` off the developer's daemon.
-/// Persist uses the test `Config`; daemon spawn reloads `KACHE_CONFIG`.
-fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
+/// Keep auto-start from `send_upload_job` and `send_build_started` off the
+/// developer's daemon. Persist uses the test `Config`; daemon spawn reloads
+/// `KACHE_CONFIG` (`start_daemon_background` loads the process's config, not
+/// the one passed in), so without this a test whose hint finds no daemon at
+/// its own socket health-checks, and may replace, the user's.
+/// `KACHE_SOCKET_PATH` is read even under `ignore_env`, so it goes too.
+fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard, TestEnvGuard) {
     let config_path = dir.join("isolated-kache.toml");
     let cache_dir = dir.join("isolated-cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -7066,6 +7209,7 @@ fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
             "KACHE_CACHE_DIR",
             cache_dir.to_str().expect("utf-8 isolated cache path"),
         ),
+        TestEnvGuard::remove("KACHE_SOCKET_PATH"),
     )
 }
 
@@ -7233,6 +7377,7 @@ fn remote_demand_wait_includes_success_and_failed_reply() {
             &key,
             "foo.c",
             NegativeReply::ContinueCompile,
+            |_| None,
         );
         assert_eq!(result.is_some(), ok);
         let demands = crate::demand::take();
@@ -7256,7 +7401,8 @@ fn remote_disabled_does_not_create_a_demand_or_wait() {
             &store,
             "key",
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7312,7 +7458,7 @@ fn remote_acquisition_preserves_negative_reply_policy_and_provenance() {
             serde_json::json!({ "ok": true, "found": found, "prefetched": prefetched }),
         );
         wait_until_reachable(&config.socket_path());
-        let result = acquire_entry(&config, &store, &key, "foo.c", policy);
+        let result = acquire_entry(&config, &store, &key, "foo.c", policy, |_| None);
         assert_eq!(result.as_ref().map(|(_, origin)| *origin), expected);
         if let Some((meta, _)) = result {
             assert_eq!(meta.cache_key, key);
@@ -7338,7 +7484,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &key,
             "foo.c",
-            NegativeReply::CheckConcurrentEntry
+            NegativeReply::CheckConcurrentEntry,
+            |_| None,
         )
         .is_none()
     );
@@ -7351,7 +7498,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &missing,
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7362,7 +7510,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &key,
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7389,18 +7538,20 @@ fn clang_cl_debug_does_not_bypass_local_admission() {
 }
 
 #[test]
-fn cc_remote_publication_skips_clang_cl_debug_only() {
+fn cc_remote_publication_skips_clang_cl_debug_and_native_msvc() {
     let gnu = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
     let gnu_debug = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o", "-g2"]);
     let cl = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj"]);
     let cl_debug = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
     let cl_g = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-g"]);
+    let msvc = parse_cc(&["cl.exe", "/c", "foo.c", "/Fofoo.obj", "/Brepro"]);
 
     assert!(cc_publishes_to_remote(&gnu));
     assert!(cc_publishes_to_remote(&gnu_debug));
     assert!(cc_publishes_to_remote(&cl));
     assert!(!cc_publishes_to_remote(&cl_debug));
     assert!(!cc_publishes_to_remote(&cl_g));
+    assert!(!cc_publishes_to_remote(&msvc));
 }
 
 #[test]
@@ -7486,6 +7637,104 @@ fn cc_try_remote_hit_does_not_restore_on_a_remote_miss() {
         !output.exists(),
         "found=false must not restore even when the local store already has the entry"
     );
+}
+
+/// #1946: an `-E` call stores only preprocessor stdout. A `-c` call that
+/// reaches the same entry through the remote must compile, not exit 0
+/// without writing its object.
+#[test]
+fn cc_remote_entry_without_the_object_is_evicted_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-remote-preprocess-only")
+        .to_hex()
+        .to_string();
+    let stdout = dir.path().join("stdout.i");
+    std::fs::write(&stdout, b"# 1 \"t.S\"\n").unwrap();
+    store
+        .put_with_compile_time_independent(
+            &key,
+            "foo.c",
+            &[],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "",
+            &[(
+                stdout,
+                crate::compiler::cc::CC_STDOUT_STORE_NAME.to_string(),
+            )],
+            "",
+            "",
+            12,
+        )
+        .unwrap();
+
+    let output = dir.path().join("out.o");
+    let output_arg = output.to_string_lossy().into_owned();
+    let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+    let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+    wait_until_reachable(&config.socket_path());
+
+    assert_eq!(try_cc_remote_hit(&config, &store, &parsed, &key), None);
+    assert!(daemon.request_count() >= 1);
+    assert!(!output.exists());
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "the rejected entry is evicted, as a rejected local entry is"
+    );
+}
+
+/// The nvcc remote path applies the local rule too: an entry without the
+/// requested dep-info compiles instead of restoring the object alone.
+#[test]
+fn nvcc_remote_entry_without_requested_depinfo_is_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"nvcc-remote-missing-depinfo")
+        .to_hex()
+        .to_string();
+    seed_cc_object_entry(&store, &key, dir.path());
+
+    let output = dir.path().join("out.o");
+    let depinfo = dir.path().join("out.d");
+    let argv: Vec<String> = [
+        "nvcc",
+        "-c",
+        "k.cu",
+        "-o",
+        output.to_str().unwrap(),
+        "-MF",
+        depinfo.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let parsed = NvccCompiler::with_extra_allowlist_flags(Vec::new())
+        .parse(&argv)
+        .unwrap();
+    let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+    wait_until_reachable(&config.socket_path());
+
+    let exit = nvcc_try_remote_hit(
+        &config,
+        &store,
+        &parsed,
+        &key,
+        "k.cu",
+        "/nvcc-root",
+        std::time::Instant::now(),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(exit, None);
+    assert!(daemon.request_count() >= 1);
+    assert!(!output.exists());
+    assert!(store.get(&key).unwrap().is_none());
 }
 
 fn cc_handoff<'a>(
@@ -9150,13 +9399,13 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
     put_test_entry(&store, dir.path(), "local-demand-key");
-    let before = chrono::Utc::now().timestamp_millis() as u64;
+    let before = jiff::Timestamp::now().as_millisecond() as u64;
     assert!(
         lookup_local_entry(&store, &[], "local-demand-key")
             .unwrap()
             .is_some()
     );
-    let after = chrono::Utc::now().timestamp_millis() as u64;
+    let after = jiff::Timestamp::now().as_millisecond() as u64;
     log_event(
         &config,
         EventInputs::new("/repo", "foo", EventResult::LocalHit, 10)
@@ -9166,7 +9415,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].schema, 27);
+    assert_eq!(events[0].schema, 28);
     let demands = &events[0].demands;
     assert_eq!(demands.len(), 1);
     assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -9215,7 +9464,7 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.compile_time_ms, 20);
     assert_eq!(event.size, 30);
     assert_eq!(event.cache_key, "cache-key");
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(event.key_ms, 40);
     assert_eq!(event.key_hash_hits, 4);
     assert_eq!(event.key_hash_misses, 5);
@@ -9333,7 +9582,7 @@ fn log_event_records_the_wrapper_phase_accumulators() {
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     let event = &events[0];
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     // Whatever other tests add is real time, far under the next band.
     for (name, value, floor, fed) in [
         ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -9469,7 +9718,7 @@ fn log_event_persists_same_key_lookup_rejection() {
     let event = &events[0];
     assert_eq!(event.result, EventResult::Miss);
     assert_eq!(event.cache_key, "same-key");
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(
         event.lookup_rejection,
         "matching entry lacks dep-info required by this invocation"
@@ -9539,7 +9788,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
             .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
-    assert_eq!(events[0].schema, 27);
+    assert_eq!(events[0].schema, 28);
     assert_eq!(events[0].result, EventResult::LocalHit);
     assert!(
         events[0].verify_compare.is_empty(),
@@ -9557,7 +9806,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].schema, 27);
+    assert_eq!(events[1].schema, 28);
     assert_eq!(
         events[1].verify_compare,
         "content: libfoo.rlib (byte mismatch)"
@@ -10967,6 +11216,7 @@ fn session_markers_are_job_scoped_when_store_is_shared() {
 fn remote_prefetch_creates_a_fresh_marker_in_the_job_runtime() {
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
+    let _isolated = isolate_daemon_autostart(dir.path());
     let workspace = dir.path().join("workspace");
     let source = workspace.join("src/lib.rs");
     let out_dir = workspace.join("target/debug/deps");
@@ -11292,6 +11542,7 @@ fn a_failed_discovery_backs_off_and_a_success_clears_it() {
     // marker, between calls.
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::TempDir::new().unwrap();
+    let _isolated = isolate_daemon_autostart(dir.path());
     let mut config = test_config(dir.path().to_path_buf());
     let mut args = rustc_args(&["rustc", "foo.rs"]);
     args.out_dir = Some(dir.path().join("target/debug/deps"));
@@ -11526,6 +11777,25 @@ fn refresh_session_marker_extends_own_session_but_never_clobbers_newer() {
     refresh_session_marker(&config, root, "mine");
     let (_, id) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
     assert_eq!(id, "newer");
+}
+
+#[test]
+fn refresh_session_marker_leaves_a_recently_touched_marker_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = test_config(dir.path().to_path_buf());
+    let root = "/ws";
+    let marker = session_marker_path(&config, root);
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let recent = now_epoch_secs() - (SESSION_REFRESH_SECS - 5);
+    std::fs::write(&marker, format!("v1 {recent} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    let (ts, _) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(ts, recent);
+    let stale = now_epoch_secs() - SESSION_REFRESH_SECS;
+    std::fs::write(&marker, format!("v1 {stale} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    let (ts, _) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert!(ts > stale);
 }
 
 #[test]
@@ -11832,6 +12102,188 @@ fn a_deferred_cc_compile_is_stored_unless_a_peer_beat_it_or_an_input_moved() {
     assert!(!cc_restore_committed(true, false));
 }
 
+#[cfg(unix)]
+#[test]
+fn native_msvc_read_set_restores_an_object_and_detects_a_shadowing_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let compiler = root.join("cl.exe");
+    let object = root.join("unit.obj");
+    let calls = root.join("compiles");
+    let earlier = root.join("earlier");
+    let later = root.join("later");
+    for include in [&earlier, &later] {
+        std::fs::create_dir(include).unwrap();
+    }
+    std::fs::write(later.join("value.h"), "#define VALUE 1\n").unwrap();
+    std::fs::write(
+        root.join("unit.c"),
+        "#include <value.h>\nint value = VALUE;\n",
+    )
+    .unwrap();
+    for name in ["c1.dll", "c1xx.dll", "c2.dll"] {
+        std::fs::write(root.join(name), name).unwrap();
+    }
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+# Shell builtins only: the Nix build sandbox has no cat.
+deps= output= source= includes=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        /EP)
+            pass=; read -r pass < "${0%/*}/c2.dll" || :
+            if [ "$pass" = unsupported ]; then
+                printf 'const char *stamp[] = {"Nov 19", "20:30", "2026"};\n'
+            else
+                printf 'const char *stamp[] = {"1", "1", "1"};\n'
+            fi
+            exit 0
+            ;;
+        /sourceDependencies) shift; deps=$1 ;;
+        /Fo*) output=${1#/Fo} ;;
+        *.c) source=$1 ;;
+    esac
+    shift
+done
+case "$source" in
+    probe.c) printf 'probe' > "$output" ;;
+    unit.c)
+        if [ -n "$deps" ] && [ -f reject-capture ]; then exit 9; fi
+        if [ -f reject-plain ]; then printf 'run\n' >> errors; exit 11; fi
+        header="$PWD/later/value.h"
+        if [ -f "$PWD/earlier/value.h" ]; then header="$PWD/earlier/value.h"; fi
+        includes="\"$header\""
+        printf 'run\n' >> compiles
+        IFS= read -r line < "$header"
+        printf '%s\n' "$line" > "$output"
+        ;;
+    *) exit 1 ;;
+esac
+if [ -n "$deps" ]; then
+    printf '{"Version":"1.2","Data":{"Source":"%s/%s","Includes":[%s]}}' "$PWD" "$source" "$includes" > "$deps"
+fi
+"#,
+    );
+
+    let mut config = test_config(root.join("cache"));
+    config.deferred_discovery = true;
+    config.min_store_compile_ms = 0;
+    config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
+        prefix: "artifacts".to_owned(),
+        backend: crate::config::RemoteBackendConfig::Filesystem(
+            crate::config::FilesystemRemoteConfig {
+                root: root.join("remote"),
+                atomic_write_dir: root.join("staging"),
+            },
+        ),
+    });
+    let env = crate::invocation::InvocationEnv::from_parts(
+        [
+            ("PATH", std::ffi::OsString::from("/usr/bin:/bin")),
+            ("INCLUDE", std::env::join_paths([&earlier, &later]).unwrap()),
+            ("KACHE_CACHE_DIR", config.cache_dir.as_os_str().to_owned()),
+        ],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let args = [
+        compiler.to_str().unwrap(),
+        "/c",
+        "/Brepro",
+        "/Z7",
+        "/Founit.obj",
+        "unit.c",
+    ]
+    .map(str::to_owned);
+    let compile = || assert_eq!(run_cc_for(&config, &args, &env).unwrap(), 0);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 1\n"
+    );
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 1\n"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n");
+
+    std::fs::write(earlier.join("value.h"), "#define VALUE 2\n").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 2\n"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\nrun\n");
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\nrun\n",
+        "the cached capture capability allows recording the new read set"
+    );
+
+    std::fs::write(root.join("c2.dll"), "updated compiler pass").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\nrun\nrun\n");
+
+    std::fs::write(root.join("reject-capture"), "").unwrap();
+    std::fs::write(earlier.join("value.h"), "#define VALUE 3\n").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 3\n",
+        "an injection failure retries the original compile"
+    );
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\nrun\nrun\nrun\nrun\n",
+        "a compile without a captured read set must not be cached"
+    );
+
+    std::fs::remove_file(root.join("reject-capture")).unwrap();
+    std::fs::write(root.join("c2.dll"), "unsupported").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\n".repeat(7),
+        "an unsupported toolset must not cache objects"
+    );
+    std::fs::write(root.join("reject-plain"), "").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    assert_eq!(run_cc_for(&config, &args, &env).unwrap(), 11);
+    assert_eq!(
+        std::fs::read_to_string(root.join("errors")).unwrap(),
+        "run\n",
+        "an uninstrumented failure must not run the compiler twice"
+    );
+
+    let fallback = root.join("fallback");
+    kache_fs::testutil::write_executable(&fallback, "#!/bin/sh\nprintf attempted > fallback-ran\n");
+    config.fallback = Some(fallback.to_str().unwrap().to_owned());
+    let mut unsupported = args.to_vec();
+    unsupported.push("/Zi".to_owned());
+    assert_eq!(run_cc_for(&config, &unsupported, &env).unwrap(), 11);
+    assert!(!root.join("fallback-ran").exists());
+}
+
 #[test]
 fn admit_scheduler_miss_off_returns_empty_without_leases() {
     let dir = tempfile::tempdir().unwrap();
@@ -12085,10 +12537,11 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     );
 }
 
-/// Only a compile that reports its dep-info and does not link may start
-/// before its key: a stopped rustc must not leave a linker behind.
+/// Only a compile that reports its dep-info may start before its key. One
+/// that links is suspended while it is keyed, which needs Linux to show it
+/// stopped and childless: a stopped rustc must not leave a linker behind.
 #[test]
-fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
+fn a_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     let parse = |crate_type: &str, json: bool| {
         let mut argv = vec![
             "rustc",
@@ -12108,7 +12561,12 @@ fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     assert!(stop_on_hit_allowed(&parse("rlib", true)));
     assert!(!stop_on_hit_allowed(&parse("lib", false)));
     for linked in ["bin", "proc-macro", "cdylib", "dylib"] {
-        assert!(!stop_on_hit_allowed(&parse(linked, true)), "{linked}");
+        assert_eq!(
+            stop_on_hit_allowed(&parse(linked, true)),
+            cfg!(target_os = "linux"),
+            "{linked}"
+        );
+        assert!(!stop_on_hit_allowed(&parse(linked, false)), "{linked}");
     }
 }
 
@@ -12449,7 +12907,7 @@ fn a_passthrough_reason_is_classified_on_the_event() {
         EventInputs::new("/repo", "foo.c", EventResult::Passthrough, 10)
             .passthrough_reason("unsupported|cc link mode".to_string()),
     );
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(event.miss_reason, crate::events::MissReason::Unsupported);
     let hit = super::build_event_details(
         &config,
@@ -12776,7 +13234,7 @@ fn rebuilt_event_uses_actual_outputs_for_success_even_without_store() {
                 .store_error("cannot store".into())
                 .rebuilt(true, &artifacts, Some("cargo-package-name".into())),
         );
-        assert_eq!(event.schema, 27);
+        assert_eq!(event.schema, 28);
         assert_eq!(event.rebuilt_package.as_deref(), Some("cargo-package-name"));
         assert_eq!(
             event.rebuilt_fingerprint.as_deref(),
@@ -12858,12 +13316,21 @@ fn rebuilt_event_keeps_unknown_package_and_unkeyed_fingerprint_absent() {
     assert!(event.rebuilt_package.is_none());
     assert!(event.rebuilt_fingerprint.is_none());
     assert!(event.rebuilt_path.is_some());
-    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
-        path: PathBuf::from("/staging/temp.dsym.tar"),
-        store_name: "bundle.tar".into(),
-        kind: ArtifactKind::DebugBundle,
-        required: false,
-    }]);
+    let outputs = ArtifactSet::new(
+        [
+            ArtifactKind::DebugBundle,
+            ArtifactKind::DebugBundleManifest,
+            ArtifactKind::DebugBundleFile,
+        ]
+        .into_iter()
+        .map(|kind| crate::compiler::Artifact {
+            path: PathBuf::from("/staging/temp.dsym.tar"),
+            store_name: "bundle.tar".into(),
+            kind,
+            required: false,
+        })
+        .collect(),
+    );
     let event = build_event_details(
         &config,
         EventInputs::new("/repo", "example", EventResult::Miss, 1)
@@ -14071,7 +14538,7 @@ fn cancelled_scheduler_waits_reach_error_events_without_spawning_compilers() {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.result, EventResult::Error);
-        assert_eq!(event.schema, 27);
+        assert_eq!(event.schema, 28);
         assert_eq!(event.exit_code, None, "there was no compiler exit");
         assert!(event.passthrough_reason.is_empty());
         assert!(
@@ -14118,4 +14585,132 @@ fn scheduler_cancellation_guard_keeps_an_existing_error_event() {
     assert_eq!(events[0].exit_code, Some(101));
     assert_eq!(events[0].elapsed_ms, 19);
     assert_eq!(events[0].scheduler_decisions[0].elapsed_ms, 17);
+}
+
+#[test]
+fn seed_attempt_is_settled_and_recorded_on_the_event() {
+    use super::SeedAttempt::*;
+    for (looked, portable, imported, attempt) in [
+        (false, true, false, NotTried),
+        (true, false, false, Unportable),
+        (true, true, false, NoDonor),
+        // A donor an earlier preparation imported counts, looked or not.
+        (false, false, true, Imported),
+        (true, true, true, Imported),
+    ] {
+        assert_eq!(
+            super::SeedAttempt::of(looked, portable, imported),
+            attempt,
+            "looked={looked} portable={portable} imported={imported}"
+        );
+    }
+    for (attempt, seeded, settled) in [
+        (NotTried, true, Imported),
+        (NotTried, false, NotTried),
+        (Imported, false, Unportable),
+        (NoDonor, false, NoDonor),
+        (Unportable, false, Unportable),
+    ] {
+        assert_eq!(
+            attempt.settle(seeded),
+            settled,
+            "{attempt:?} seeded={seeded}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    for (attempt, recorded) in [
+        (Imported, "imported"),
+        (NoDonor, "no-donor"),
+        (Unportable, "unportable"),
+        (NotTried, ""),
+    ] {
+        let event = super::build_event_details(
+            &config,
+            EventInputs::new("/repo", "unit", EventResult::Passthrough, 10)
+                .incremental_seed_attempt(attempt),
+        );
+        assert_eq!(event.incremental_seed_attempt, recorded);
+        // Older events lack the field; an empty one is not written.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json.get("incremental_seed_attempt").is_some(),
+            !recorded.is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
+    use super::SeedAttempt::*;
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let _cache = crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(root.as_os_str()));
+    let compiler = root.join("rustc-mock");
+    kache_fs::testutil::write_executable(&compiler, "#!/bin/sh\nprintf 'rustc 1.99.0 (test)\\n'\n");
+    let missing = root.join("gone/target/debug");
+    // (automatic seeding, explicit donor, unstable) -> attempt
+    for (case, (automatic, explicit, unstable, expected)) in [
+        (false, false, true, NotTried),
+        (false, true, false, NotTried),
+        (false, true, true, NoDonor),
+        (true, false, false, NoDonor),
+        (true, true, false, NoDonor),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fresh unit per case: each has no incremental state of its own.
+        let profile = root.join(format!("receiver-{case}/target/debug"));
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let args = RustcArgs::parse(&[
+            compiler.display().to_string(),
+            "--crate-name".into(),
+            "sample".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            profile.join("deps").display().to_string(),
+            "-Cincremental=".to_owned() + profile.join("incremental").to_str().unwrap(),
+            "-Cextra-filename=-1234abcd".into(),
+            "-Zremap-cwd-prefix=/src".into(),
+        ])
+        .unwrap();
+        let unit = crate::incremental_policy::AdaptiveUnit::eligible(&args, b"guard").unwrap();
+        let mut config = test_config(root.join("cache"));
+        config.seed_incremental = automatic;
+        config.unstable = unstable;
+        config.incremental_seed_from = explicit.then(|| missing.clone());
+        let mut lease = unit.try_immediate().unwrap();
+        let (_, attempt) = super::prepare_worktree_compiler_args(&config, &args, &mut lease);
+        assert_eq!(
+            attempt, expected,
+            "automatic={automatic} explicit={explicit} unstable={unstable}"
+        );
+    }
+}
+
+#[test]
+fn only_a_linking_executable_skips_the_cache_when_executables_are_off() {
+    let rustc = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "--crate-name", "app", "src/main.rs"];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    let check_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,metadata"]);
+    let check_test = rustc(&["--test", "--emit=dep-info,metadata"]);
+    let build_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,link"]);
+    let build_test = rustc(&["--test", "--emit=link=target/app"]);
+    let default_emit = rustc(&["--crate-type", "bin"]);
+    let check_lib = rustc(&["--crate-type", "lib", "--emit=dep-info,metadata"]);
+
+    for args in [&build_bin, &build_test, &default_emit] {
+        assert!(skips_uncached_executable(args, false), "{:?}", args.emit);
+        assert!(!skips_uncached_executable(args, true), "{:?}", args.emit);
+    }
+    for args in [&check_bin, &check_test, &check_lib] {
+        assert!(!skips_uncached_executable(args, false), "{:?}", args.emit);
+    }
 }

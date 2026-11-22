@@ -460,9 +460,11 @@ fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
         INDEX_SCHEMA_GENERATION,
         "the schema ran again"
     );
+    // Verdicts are keyed per scan rule set, so the older release's verdict
+    // for `c` sits beside this release's instead of being ignored.
     assert_eq!(
         rows(&db),
-        [2, 1, 2, 2, 2],
+        [2, 1, 2, 2, 3],
         "nothing was dropped the second time"
     );
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);
@@ -2594,6 +2596,46 @@ fn deferred_durability_verifies_pending_hits_until_the_flush() {
     assert!(strict.try_durability_flush_lock().unwrap().is_some());
 }
 
+/// A lookup reads an entry's row twice: [`Store::contains`] finds it
+/// committed, then its durable flag decides whether the blobs are hashed.
+/// Another build can evict the entry in between, and the blob outlives the
+/// row while another entry still holds it (or until the eviction's unlink,
+/// which follows its commit). A pending entry evicted in that window is still
+/// verified: a blob whose size is right and whose bytes are not is a miss.
+#[test]
+fn a_pending_entry_evicted_between_a_lookups_two_reads_is_verified() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "evicted", 64);
+    put_test_entry(&store, dir.path(), "sharing", 64);
+    assert_eq!(store.pending_durability().unwrap(), 2);
+    let blob = store.blob_path(&store.stored_meta("evicted").unwrap().files[0].hash);
+    // What a crash before the flush can leave: the right size, other bytes.
+    let mut perms = fs::metadata(&blob).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&blob, perms).unwrap();
+    fs::write(&blob, vec![b'x'; 64]).unwrap();
+
+    let evictor = Store::open(&config).unwrap();
+    DURABLE_READ_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || evictor.remove_entry("evicted").unwrap()));
+    });
+    let hit = store.get("evicted").unwrap();
+    assert!(
+        DURABLE_READ_HOOK.with(|slot| slot.borrow().is_none()),
+        "the lookup reached its durable read"
+    );
+    assert!(blob.exists(), "the shared blob outlived the evicted row");
+    assert!(
+        hit.is_none(),
+        "a pending entry evicted between the reads is verified, not served"
+    );
+}
+
 /// Deferred durability covers downloaded entries too: both import paths
 /// leave the entry pending, so a hit verifies its bytes until the flush.
 /// With the feature off, an import is durable at once.
@@ -2954,9 +2996,15 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                 .flush_entry_durability_with(
                     "many-artifacts",
                     |file| {
-                        let metadata_sync = calls == count;
+                        // An entry past the handle bound flushes its metadata
+                        // first and verifies its blobs under the writer lock.
+                        let metadata_sync = if count == 65 {
+                            calls == 0
+                        } else {
+                            calls == count
+                        };
                         calls += 1;
-                        let must_hold_writer = count == 65 || metadata_sync;
+                        let must_hold_writer = count == 65 && !metadata_sync;
                         let competing = rusqlite::Transaction::new_unchecked(
                             &peer.db,
                             rusqlite::TransactionBehavior::Immediate,
@@ -3318,6 +3366,36 @@ fn durability_flush_rechecks_the_verified_cas_inode() {
     assert!(store.flush_entry_durability("same-generation").unwrap());
 }
 
+/// An entry within the handle bound flushes its blobs, metadata and
+/// directory before the writer lock: on macOS each flush is an F_FULLFSYNC,
+/// and lookups and stores wait on that lock. A larger entry still flushes its
+/// blobs under it.
+#[test]
+fn durability_flush_syncs_blobs_and_metadata_before_taking_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "outside-lock", 29);
+    let blobs = store.get("outside-lock").unwrap().unwrap().files.len();
+    let synced = std::cell::Cell::new(0);
+    let synced_before_lock = std::cell::Cell::new(None);
+    assert!(
+        store
+            .flush_entry_durability_with(
+                "outside-lock",
+                |file| {
+                    synced.set(synced.get() + 1);
+                    file.sync_all()
+                },
+                || synced_before_lock.set(Some(synced.get())),
+            )
+            .unwrap()
+    );
+    assert_eq!(synced_before_lock.get(), Some(blobs + 1));
+    assert_eq!(synced.get(), blobs + 1);
+}
+
 #[test]
 fn durability_flush_keeps_failed_blob_and_metadata_syncs_retryable() {
     for fail_on in [0, 1] {
@@ -3647,6 +3725,46 @@ fn put_records_known_hash_only_for_stable_outputs() {
         store.file_hash_lookup(&independent),
         crate::file_hash::FileHashLookup::NeedsHash(_)
     ));
+}
+
+/// A small `.rmeta` is a key input downstream. Windows key reads look it up in
+/// the memo, so a put that knows its hash records it there; elsewhere the
+/// file is read instead and no row is kept.
+#[test]
+fn put_records_a_small_output_where_key_reads_look_it_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let metadata = dir.path().join("libsmall.rmeta");
+    std::fs::write(&metadata, vec![b'm'; 4096]).unwrap();
+    let expected = crate::file_hash::hash_file(&metadata).unwrap();
+
+    store
+        .put(
+            "known-hash-small",
+            "small",
+            &["lib".to_string()],
+            &[],
+            "host",
+            "dev",
+            &[(metadata.clone(), "libsmall.rmeta".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    let lookup = store
+        .file_hash_cache()
+        .lookup_cached_from(&metadata, crate::file_hash::KEY_INPUT_MEMO_MIN_BYTES);
+    if cfg!(windows) {
+        assert!(matches!(
+            lookup,
+            crate::file_hash::FileHashLookup::Hit(actual) if actual == expected
+        ));
+    } else {
+        assert!(matches!(
+            lookup,
+            crate::file_hash::FileHashLookup::Uncacheable
+        ));
+    }
 }
 
 #[test]
@@ -4908,6 +5026,134 @@ fn evict_waits_for_a_competing_writer_and_still_evicts() {
     assert_eq!(stats.entries_locked, 0, "{stats:?}");
     assert_eq!(stats.entries_evicted, 1, "{stats:?}");
     assert!(!store.contains("contended"));
+}
+
+/// A compile store waits out an index writer instead of failing the put.
+/// The first two lock attempts are refused, so a store that tries only
+/// once, or only twice, returns the busy error. The third takes the lock
+/// after that writer commits.
+#[test]
+fn put_waits_out_an_index_writer_and_still_stores() {
+    static COMPILE_STORE_REFUSALS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    // One call per refused BEGIN. Returning false makes SQLite give up
+    // this attempt without waiting out the busy timeout.
+    fn refuse_two_lock_attempts_then_wait(count: i32) -> bool {
+        if COMPILE_STORE_REFUSALS.load(Ordering::SeqCst) < 2 {
+            COMPILE_STORE_REFUSALS.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        count < 2_000
+    }
+
+    COMPILE_STORE_REFUSALS.store(0, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut store = Store::open(&config).unwrap();
+    store
+        .db
+        .busy_handler(Some(refuse_two_lock_attempts_then_wait))
+        .unwrap();
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute("UPDATE entries SET durable = durable", [])
+        .unwrap();
+    let committer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while COMPILE_STORE_REFUSALS.load(Ordering::SeqCst) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.execute_batch("COMMIT").unwrap();
+    });
+
+    let output = dir.path().join("libwaited.rlib");
+    std::fs::write(&output, b"waited").unwrap();
+    let stored = store.put(
+        "waited",
+        "waited_crate",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        &[(output, "libwaited.rlib".to_string())],
+        "",
+        "",
+    );
+    committer.join().unwrap();
+    stored.expect("put waits out the index writer");
+    assert_eq!(
+        COMPILE_STORE_REFUSALS.load(Ordering::SeqCst),
+        2,
+        "the store did not refuse exactly two lock attempts"
+    );
+    assert!(store.contains("waited"));
+}
+
+/// Three refused lock attempts fail the put. A fourth attempt would obtain
+/// the lock, so an extra retry, or a retry that ignores the attempt bound,
+/// stores the entry and this test fails.
+#[test]
+fn put_stops_after_three_busy_lock_attempts() {
+    static COMPILE_STORE_GAVE_UP: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    fn refuse_three_lock_attempts_then_wait(count: i32) -> bool {
+        if COMPILE_STORE_GAVE_UP.load(Ordering::SeqCst) < 3 {
+            COMPILE_STORE_GAVE_UP.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        count < 2_000
+    }
+
+    COMPILE_STORE_GAVE_UP.store(0, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut store = Store::open(&config).unwrap();
+    store
+        .db
+        .busy_handler(Some(refuse_three_lock_attempts_then_wait))
+        .unwrap();
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute("UPDATE entries SET durable = durable", [])
+        .unwrap();
+    let committer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while COMPILE_STORE_GAVE_UP.load(Ordering::SeqCst) < 3
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.execute_batch("COMMIT").unwrap();
+    });
+
+    let output = dir.path().join("libstopped.rlib");
+    std::fs::write(&output, b"stopped").unwrap();
+    let stored = store.put(
+        "stopped",
+        "stopped_crate",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        &[(output, "libstopped.rlib".to_string())],
+        "",
+        "",
+    );
+    committer.join().unwrap();
+    let err = stored.expect_err("three busy attempts must fail the put");
+    assert!(is_sqlite_contention(&err), "{err:#}");
+    assert_eq!(
+        COMPILE_STORE_GAVE_UP.load(Ordering::SeqCst),
+        3,
+        "the store did not use all three lock attempts"
+    );
+    assert!(!store.contains("stopped"));
 }
 
 #[test]
@@ -10360,13 +10606,15 @@ fn republication_during_removal_cleanup_is_never_stranded() {
     assert_eq!(refcount, 1, "B's refcounts must be intact");
 }
 
-/// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
-/// lost-the-race case ONLY — a cleanup failure while the directory still
-/// exists (permissions, open handles) must surface as an error, not be
-/// swallowed as if the competitor had won.
+/// A directory the cleanup cannot remove (an unwritable folder inside it)
+/// no longer fails the removal: under the write lock the entry's directory
+/// only leaves the store's names, into the trash, and its removal after the
+/// lock fails there, logged, for the next sweep to try again. The logical
+/// removal stays committed (#670) and the store keeps no residue under the
+/// entry's name.
 #[cfg(unix)]
 #[test]
-fn persistent_directory_cleanup_failure_is_an_error() {
+fn persistent_directory_cleanup_failure_stays_in_the_trash() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -10388,49 +10636,46 @@ fn persistent_directory_cleanup_failure_is_an_error() {
             "",
         )
         .unwrap();
-
-    // An unwritable directory with a file inside makes remove_dir_all
-    // fail with a persistent, non-race error. Nested one level down:
-    // cleanup's readonly-clearing pass covers entry_dir's immediate
-    // children, so a top-level readonly dir would simply be repaired.
     let entry_dir = store.entry_dir("stuck");
     let inner = entry_dir.join("legacy").join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("artifact"), b"x").unwrap();
     std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // Stash the blob hash BEFORE the removal: remove_dir_all deletes
-    // children in unspecified order, so meta.json may or may not survive
-    // the failed cleanup.
-    let stashed_hash = {
+    let hash = {
         let meta: EntryMeta =
             serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
                 .unwrap();
         meta.files[0].hash.clone()
     };
 
-    let err = store.remove_entry("stuck");
-    // Restore permissions so the tempdir can be dropped regardless.
-    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let removed = store.remove_entry("stuck");
+
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    let left: Vec<_> = std::fs::read_dir(&trash)
+        .unwrap()
+        .flatten()
+        .map(|item| item.path())
+        .collect();
+    for item in &left {
+        let stuck = item.join("legacy").join("inner");
+        if stuck.exists() {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    removed.unwrap();
+    assert!(!store.contains("stuck"));
+    assert!(!entry_dir.exists(), "nothing stays under the entry's name");
     assert!(
-        err.is_err(),
-        "a persistent cleanup failure must not be swallowed as a lost race"
+        !store.blob_path(&hash).exists(),
+        "the blob only that entry held is freed"
     );
-    // The failure direction matters (#670): the logical removal commits
-    // BEFORE cleanup, so a cleanup failure leaves a deleted row plus
-    // partially deleted, unindexed residue — recoverable. Rolling the row
-    // back after files were already deleted would manufacture a committed
-    // row without artifacts, which is the phantom this function must
-    // never produce.
-    assert!(
-        !store.contains("stuck"),
-        "the logical removal must stay committed across a cleanup failure"
+    assert_eq!(
+        left.len(),
+        1,
+        "the stuck directory waits in the trash: {left:?}"
     );
-    assert!(
-        store.blob_path(&stashed_hash).is_file(),
-        "blob unlinks run only after directory cleanup succeeds; a failed \
-             cleanup leaves the file for the orphan sweep"
-    );
+    EvictedTrash::new(&config.store_dir()).empty_leftovers();
+    assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 0);
 }
 
 /// kunobi-ninja/kache#510: two removers racing on the SAME entry must not
@@ -10571,6 +10816,211 @@ fn evict_does_not_fire_while_physical_size_is_within_budget() {
         "physical 200 <= max 300 (the trigger): nothing to evict"
     );
     assert!(store.contains("dup_a") && store.contains("dup_b"));
+}
+
+/// An evicted entry's directory and last-reference blob leave the store's
+/// names under the write lock and their files go after it: none is left in
+/// the store or in its trash, and a leftover of a removal cut short goes at
+/// the next sweep.
+#[test]
+fn evict_frees_files_through_the_trash_and_empties_its_leftovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    std::fs::create_dir_all(trash.join("left.1.2")).unwrap();
+    std::fs::write(trash.join("left.1.2").join("meta.json"), b"{}").unwrap();
+    std::fs::write(trash.join("blob.1.3"), b"x").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert_eq!(stats.disk_bytes_reclaimed, 300 * 1024);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+    let left: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
+    assert!(left.is_empty(), "the trash kept {left:?}");
+}
+
+/// With no trash to move them into, an evicted entry's directory and its
+/// last blob are removed under the lock, as before the trash.
+#[test]
+fn evict_removes_files_in_place_when_the_trash_cannot_be_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    // A file where the trash folder goes: the folder cannot be made.
+    std::fs::write(config.store_dir().join(EVICTED_TRASH_DIR), b"").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+}
+
+/// `take` reports a name that is already gone as taken without making the
+/// trash, moves an existing name into the trash, and leaves to the caller a
+/// name it cannot read.
+#[test]
+fn evicted_trash_takes_names_and_reports_what_it_cannot_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let trash_dir = store_dir.join(EVICTED_TRASH_DIR);
+    let mut trash = EvictedTrash::new(&store_dir);
+
+    assert!(trash.take(&store_dir.join("missing")));
+    assert!(!trash_dir.exists(), "a missing name needs no trash");
+
+    let blob = store_dir.join("blob");
+    std::fs::write(&blob, b"x").unwrap();
+    #[cfg(unix)]
+    assert!(
+        !trash.take(&blob.join("child")),
+        "a path through a file cannot be read, so the caller removes it"
+    );
+    assert!(trash.take(&blob));
+    assert!(!blob.exists());
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 1);
+
+    trash.empty();
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+}
+
+/// A trash item counts as removed when it is gone, also when something else
+/// removed it first, and not when the delete is refused.
+#[test]
+fn a_trash_item_is_removed_unless_the_delete_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(remove_trash_item(&dir.path().join("gone")));
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(remove_trash_item(&file));
+    assert!(!file.exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stuck = dir.path().join("stuck");
+        let inner = stuck.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("artifact"), b"x").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let removed = remove_trash_item(&stuck);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!removed, "an unwritable folder inside refuses the delete");
+    }
+}
+
+/// The GC sweep empties what a removal left in the trash even when nothing
+/// is evicted. A read-only store leaves it alone.
+#[test]
+fn the_sweep_empties_the_trash_without_an_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let trash_dir = config.store_dir().join(EVICTED_TRASH_DIR);
+    std::fs::create_dir_all(trash_dir.join("entry.1.0")).unwrap();
+    std::fs::write(trash_dir.join("entry.1.0").join("lib.rlib"), b"x").unwrap();
+    std::fs::write(trash_dir.join("blob.1.1"), b"x").unwrap();
+
+    let read_only = Store::open_read_only(&config).unwrap();
+    assert_eq!(read_only.sweep_evicted_trash(), 0);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 2);
+
+    assert_eq!(store.sweep_evicted_trash(), 2);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+    assert_eq!(store.sweep_evicted_trash(), 0);
+}
+
+/// A put that brings a blob back after a removal took its name, and before
+/// the trash is emptied, keeps its blob: emptying only touches the trash.
+#[test]
+fn a_blob_put_back_before_the_trash_empties_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "first", 64);
+    let hash = store.get("first").unwrap().unwrap().files[0].hash.clone();
+    let blob = store.blob_path(&hash);
+
+    let mut trash = EvictedTrash::new(&config.store_dir());
+    assert!(trash.take(&blob));
+    assert!(!blob.exists());
+    put_test_entry(&store, dir.path(), "second", 64);
+    assert!(blob.exists(), "the put brings the blob back");
+    trash.empty();
+
+    assert_eq!(crate::file_hash::hash_file(&blob).unwrap(), hash);
+    let trash_dir = config.store_dir().join(EVICTED_TRASH_DIR);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+}
+
+fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for item in items.flatten() {
+        let path = item.path();
+        if path.is_dir() {
+            files.extend(walkdir_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// kunobi-ninja/kache#608 (ranking + stop condition): entries whose blobs
@@ -14555,6 +15005,79 @@ fn a_size_sweep_leaves_bytes_held_by_target_directories_out_of_its_budget() {
     assert!(!store.contains("held"));
 }
 
+/// An automatic sweep is asked for by the store's size less what target
+/// directories held at the last sweep, a figure up to a sweep old. Once its
+/// probe has measured them again, a store whose own part is not over the
+/// trigger evicts nothing; one whose own part is over it still goes down to
+/// the target. A requested sweep keeps the band.
+#[test]
+fn an_automatic_sweep_evicts_nothing_when_its_probe_finds_the_store_under_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    // Trigger at 1,000 bytes, target 900.
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 450);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    assert_eq!(store.physical_size().unwrap(), 1150);
+
+    // 1,150 less 200 held: 950 of its own, under the trigger, over the target.
+    let under = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert_eq!(under.entries_evicted, 0, "{under:?}");
+    assert_eq!(under.bytes_held, 200, "{under:?}");
+    assert!(store.contains("a") && store.contains("b") && store.contains("held"));
+
+    // 100 more of its own: 1,050, over the trigger, so down to the target.
+    put_idle_entry(&store, dir.path(), "c", 100);
+    let over = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert!(over.entries_evicted >= 1, "{over:?}");
+    assert_eq!(over.bytes_held, 200, "{over:?}");
+    assert!(store.contains("held"));
+    let own = store.physical_size().unwrap() - over.bytes_held;
+    assert!(own <= 900, "stops at the target: {own}");
+}
+
+/// An own part exactly at the trigger is not over it: the automatic sweep
+/// evicts nothing.
+#[test]
+fn an_automatic_sweep_evicts_nothing_when_its_own_part_is_at_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 500);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    assert_eq!(store.physical_size().unwrap(), 1200);
+
+    let stats = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert_eq!(stats.entries_evicted, 0, "{stats:?}");
+    assert_eq!(stats.bytes_held, 200, "{stats:?}");
+    assert_eq!(stats.entries_unreclaimable, 1, "the held entry: {stats:?}");
+}
+
+/// A requested sweep of a store whose own part is between the target and the
+/// trigger still evicts down to the target.
+#[test]
+fn a_requested_sweep_keeps_the_band_when_the_store_is_under_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 450);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+
+    let stats = store.evict().unwrap();
+    assert!(stats.entries_evicted >= 1, "{stats:?}");
+    let own = store.physical_size().unwrap() - stats.bytes_held;
+    assert!(own <= 900, "stops at the target: {own}");
+}
+
 /// Counted toward `max_size`, held bytes stay (evicting them frees no
 /// disk) and the sweep evicts other entries, least valuable first, until the
 /// whole store is under its target.
@@ -15548,8 +16071,7 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
 
 /// An index stamped 10 by a release from before the header-scan memo
 /// (#1638) has no `cc_header_scans`: opening it must add the table, or
-/// every C/C++ preprocess memo read (which joins it) and the memo pruning
-/// fail on that store for good.
+/// every header scan read and the memo pruning fail on that store for good.
 #[test]
 fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -15592,7 +16114,12 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
     let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
     assert_eq!(memo.preprocessed_hash, "preprocessed");
-    assert_eq!(memo.header_scans, vec![None]);
+    assert!(
+        cache
+            .get_cc_header_scans(7, &["header-content"])
+            .unwrap()
+            .is_empty()
+    );
     cache
         .put_cc_header_scans(7, &[("header-content".into(), "[]".into())])
         .unwrap();
@@ -15603,5 +16130,278 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);
     let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
     assert_eq!(memo.preprocessed_hash, "preprocessed");
-    assert_eq!(memo.header_scans, vec![Some((7, "[]".into()))]);
+    assert_eq!(
+        cache.get_cc_header_scans(7, &["header-content"]).unwrap()["header-content"],
+        "[]"
+    );
+}
+
+/// The current schema stamp does not prove `cc_header_macros` exists. An
+/// open that skips the table check leaves it missing, and header-macro
+/// reads fail on that store.
+#[test]
+fn a_current_index_missing_header_macros_gains_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    db.execute_batch("DROP TABLE cc_header_macros").unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cc_header_macros'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "cc_header_macros was not created");
+}
+
+/// A current stamp does not vouch for `cc_header_macros`: a release from
+/// before it may have stamped this generation back over an index that
+/// lacks the table.
+#[test]
+fn a_current_index_without_the_macro_table_gains_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch("DROP TABLE cc_header_macros").unwrap();
+    drop(db);
+    let db = open_index_db(&path).unwrap();
+    assert!(crate::cc_memo::has_header_macros_table(&db).unwrap());
+}
+
+/// Make every `DELETE` on `table` slow, as a cold page cache makes it on a
+/// large index: a trigger counts a million-row join. Returns what deleting
+/// the row `probe` costs (rolled back).
+fn slow_deletes(side: &Connection, table: &str, probe: &str) -> Duration {
+    side.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS slow_n (x);
+         DELETE FROM slow_n;
+         WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000)
+             INSERT INTO slow_n SELECT x FROM c;
+         CREATE TABLE IF NOT EXISTS slow_sink (n);
+         CREATE TRIGGER slow_{table} AFTER DELETE ON {table}
+             BEGIN INSERT INTO slow_sink SELECT count(*) FROM slow_n a, slow_n b; END;"
+    ))
+    .unwrap();
+    side.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    side.execute(
+        &format!("DELETE FROM {table} WHERE cache_key = ?1"),
+        [probe],
+    )
+    .unwrap();
+    let cost = started.elapsed();
+    side.execute_batch("ROLLBACK").unwrap();
+    cost
+}
+
+/// Wait until something else holds the index's write lock.
+fn until_the_write_lock_is_held(side: &Connection) {
+    side.busy_timeout(Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    while side.execute_batch("BEGIN IMMEDIATE").is_ok() {
+        side.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the prune never took the write lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The tombstone prune finds its rows by a stamp no index covers, and
+/// deletes them a short transaction at a time: a put that asks for the
+/// write lock while it runs, waiting in SQLite's busy handler as puts do,
+/// gets it within a few of the prune's transactions, not after all its rows.
+/// Old rows of both tables go, recent ones stay.
+#[test]
+fn a_long_tombstone_prune_lets_a_waiting_put_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    side.execute(
+        "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES ('recent', datetime('now'))",
+        [],
+    )
+    .unwrap();
+    let row_cost = slow_deletes(&side, "eviction_tombstones", "recent");
+    // The busy handler asks again at most 100 ms apart.
+    let wait = (PRUNE_LOCK_HOLD + row_cost) * 3 + PRUNE_LOCK_GAP + Duration::from_millis(100);
+    let count = (wait.as_secs_f64() * 3.0 / row_cost.as_secs_f64()).ceil() as usize + 2;
+    side.execute_batch(&format!(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {count})
+             INSERT INTO eviction_tombstones (cache_key, evicted_at)
+             SELECT 'old' || x, datetime('now', '-30 days') FROM c;
+         INSERT INTO shadow_victims (cache_key, swept_at, shadow_policy) VALUES
+             ('old-shadow', datetime('now', '-30 days'), 'p'),
+             ('new-shadow', datetime('now'), 'p');"
+    ))
+    .unwrap();
+
+    let pruner = std::thread::spawn(move || store.prune_tombstones(14).map(|n| (n, store)));
+    until_the_write_lock_is_held(&side);
+    side.busy_timeout(wait).unwrap();
+    let got_in = side.execute_batch("BEGIN IMMEDIATE").is_ok();
+    if got_in {
+        side.execute_batch("ROLLBACK").unwrap();
+    }
+    let (removed, store) = pruner.join().unwrap().unwrap();
+
+    assert!(
+        got_in,
+        "a prune of {count} tombstones of {row_cost:?} each kept the write lock past {wait:?}"
+    );
+    assert_eq!(removed, count);
+    assert_eq!(
+        store.tombstone_stats().unwrap().0,
+        1,
+        "the recent one stays"
+    );
+    let shadows: Vec<String> = side
+        .prepare("SELECT cache_key FROM shadow_victims")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(shadows, ["new-shadow"]);
+}
+
+/// A key read as old but evicted again before its delete has a fresh row,
+/// which the prune keeps.
+#[test]
+fn a_tombstone_evicted_again_after_the_prune_read_it_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store
+        .db
+        .execute(
+            "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES
+                   ('old', datetime('now', '-30 days')),
+                   ('again', datetime('now', '-30 days'))",
+            [],
+        )
+        .unwrap();
+    let keys = store
+        .keys_older_than("eviction_tombstones", "evicted_at", "-14 days")
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    store
+        .db
+        .execute(
+            "UPDATE eviction_tombstones SET evicted_at = datetime('now') WHERE cache_key = 'again'",
+            [],
+        )
+        .unwrap();
+
+    let removed = store
+        .delete_old_rows_by_key("eviction_tombstones", "evicted_at", &keys, "-14 days")
+        .unwrap();
+
+    assert_eq!(removed, 1);
+    let left: String = store
+        .db
+        .query_row("SELECT cache_key FROM eviction_tombstones", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(left, "again");
+}
+
+/// A prune whose rows take far less than [`PRUNE_LOCK_HOLD`] to delete
+/// deletes them in one transaction, after one gap, not one per row.
+#[test]
+fn a_quick_tombstone_prune_deletes_its_rows_in_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store
+        .db
+        .execute_batch(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200)
+                 INSERT INTO eviction_tombstones (cache_key, evicted_at)
+                 SELECT 'old' || x, datetime('now', '-30 days') FROM c;",
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    assert_eq!(store.prune_tombstones(14).unwrap(), 200);
+    let took = started.elapsed();
+
+    assert!(
+        took < PRUNE_LOCK_GAP * 20,
+        "200 quick deletes took {took:?}, as if they went a transaction each"
+    );
+    assert_eq!(store.tombstone_stats().unwrap().0, 0);
+}
+
+/// A holder's note sits beside its lock file, readable while the lock is
+/// held (Windows refuses reads of a locked range), and goes with the holder.
+/// A note a killed holder left is replaced by the next holder's, or removed
+/// when the next holder has none.
+#[test]
+fn a_lock_note_is_readable_while_held_and_goes_with_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flight");
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    assert_eq!(StoreLock::held_note(&path), None, "no note yet");
+    lock.mark_note(Some("tree-a"));
+    assert_eq!(StoreLock::held_note(&path).as_deref(), Some("tree-a"));
+    drop(lock);
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "the note goes with its holder"
+    );
+
+    std::fs::write(path.with_extension("note"), "left by a killed holder").unwrap();
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    lock.mark_note(Some("tree-b"));
+    assert_eq!(StoreLock::held_note(&path).as_deref(), Some("tree-b"));
+    drop(lock);
+    std::fs::write(path.with_extension("note"), "left by a killed holder").unwrap();
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    lock.mark_note(None);
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "a holder without a note removes a stale one"
+    );
+    std::fs::write(path.with_extension("note"), "").unwrap();
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "an empty note reads as none"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_retainer_probes_answer_in_the_order_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let paths: Vec<PathBuf> = (0..1100)
+        .map(|i| {
+            let path = dir.path().join(format!("blob-{i}"));
+            std::fs::write(&path, format!("content {i}")).unwrap();
+            if i % 7 == 0 {
+                std::fs::hard_link(&path, outside.join(format!("link-{i}"))).unwrap();
+            }
+            path
+        })
+        .collect();
+    let retained = super::probe_external_retainers(&paths);
+    let expected: Vec<bool> = (0..paths.len()).map(|i| i % 7 == 0).collect();
+    assert_eq!(retained, expected);
+    // Too few for a second thread, and none at all: a sweep of a store with
+    // no last-reference blob.
+    assert_eq!(super::probe_external_retainers(&paths[..8]), expected[..8]);
+    assert!(super::probe_external_retainers(&[]).is_empty());
 }

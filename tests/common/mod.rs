@@ -23,15 +23,79 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// `<target>/kache-test-bootstrap`, derived from the running test binary at
-/// `<target>/<profile>/deps/<test-bin>` so it follows `CARGO_TARGET_DIR`
-/// (including `cargo llvm-cov`'s).
+/// `<target>/kache-test-bootstrap`, shared by all test binaries in the same
+/// build directory. Cargo 1.100 puts test binaries under `build/<pkg>/<hash>/out`.
 fn bootstrap_target_dir() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test binary path");
-    dir.pop(); // test binary
-    dir.pop(); // deps/
-    dir.pop(); // <profile>/
-    dir.join("kache-test-bootstrap")
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = exe.parent().expect("test output directory");
+    let levels = if out.file_name() == Some(OsStr::new("out"))
+        && out.ancestors().nth(3).and_then(Path::file_name) == Some(OsStr::new("build"))
+    {
+        5 // out, hash, package, build, profile, then the build directory
+    } else {
+        2 // deps, profile, then the build directory
+    };
+    out.ancestors()
+        .nth(levels)
+        .expect("test build directory")
+        .join("kache-test-bootstrap")
+}
+
+#[allow(dead_code)]
+pub fn dir_entries(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("reading {}: {error}", path.display()),
+    };
+    entries
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap().path())
+}
+
+/// Internal rustc outputs, before Cargo copies or links them to the profile root.
+#[allow(dead_code)]
+pub fn cargo_unit_outputs(profile: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    dir_entries(&profile.join("deps")).chain(
+        dir_entries(&profile.join("build"))
+            .filter(|path| path.is_dir())
+            .flat_map(|package| dir_entries(&package))
+            .filter(|path| path.is_dir())
+            .flat_map(|unit| dir_entries(&unit.join("out"))),
+    )
+}
+
+#[allow(dead_code)]
+pub fn cargo_fingerprints(profile: &Path, package: &str) -> impl Iterator<Item = PathBuf> + use<> {
+    let prefix = format!("{package}-");
+    dir_entries(&profile.join(".fingerprint"))
+        .filter(move |path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .chain(
+            dir_entries(&profile.join("build").join(package)).map(|unit| unit.join("fingerprint")),
+        )
+        .filter(|path| path.is_dir())
+}
+
+#[allow(dead_code)]
+pub fn cargo_build_script_out_dirs(
+    profile: &Path,
+    package: &str,
+) -> impl Iterator<Item = PathBuf> + use<> {
+    let build = profile.join("build");
+    let prefix = format!("{package}-");
+    dir_entries(&build)
+        .filter(move |path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .filter(|unit| unit.join("output").is_file())
+        .chain(dir_entries(&build.join(package)).filter(|unit| unit.join("run/stdout").is_file()))
+        .map(|unit| unit.join("out"))
+        .filter(|path| path.is_dir())
 }
 
 /// `KACHE_TEST_USE_CARGO_BIN_EXE=1` skips the bootstrap build and uses the
@@ -137,6 +201,25 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")
 }
 
+/// Crate directory a cc object of `source` is published under.
+///
+/// Same rule as `cc_entry_crate_name`: a nonempty `CARGO_PKG_NAME` wins,
+/// with `-` folded to `_`, and otherwise the source file name. Cargo sets
+/// that variable on this process; the wrapper child inherits it.
+#[allow(dead_code)]
+pub fn cc_published_crate_name(source: &str) -> String {
+    if let Ok(package) = std::env::var("CARGO_PKG_NAME") {
+        let package = package.trim();
+        if !package.is_empty() {
+            return package.replace('-', "_");
+        }
+    }
+    Path::new(source)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// A child `cargo` or `kache` whose Kache state is pinned to `cache_dir`.
 ///
 /// Tests read `events.jsonl` and reach the daemon socket under the cache dir
@@ -178,6 +261,7 @@ pub fn hermetic_command(
         .env_remove("KACHE_CARGO_SHIM_DEPTH")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME")
+        .env_remove("KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE")
         .env_remove("KACHE_OUT_DIR_ALIAS_ROOT")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
         .env_remove("KACHE_S3_BUCKET")

@@ -1,6 +1,6 @@
 [package]
 name = "kache-ipc"
-version = "2.1.1"
+version = "2.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Local sockets, endpoint naming, and peer checks for Kache."
@@ -14,14 +14,14 @@ default = []
 async = ["interprocess/tokio", "kunobi-daemon/local-async", "dep:tokio"]
 
 [dependencies]
-kache-protocol = { version = "2.1.1", path = "../kache-protocol" }
-kache-fs = { version = "2.1.1", path = "../kache-fs", features = ["staging"] }
+kache-protocol = { version = "2.3.0", path = "../kache-protocol" }
+kache-fs = { version = "2.3.0", path = "../kache-fs", features = ["staging"] }
 serde = "1"
 serde_json = "1"
 tracing = "0.1"
 tokio = { version = "1", optional = true, features = ["time"] }
 anyhow = "1"
-interprocess = "2.4.7"
+interprocess = "2.4.8"
 kunobi-daemon = { version = "0.10.3", default-features = false, features = ["local"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -30,7 +30,8 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1.15"
 blake3 = { version = "1", features = ["pure"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
+windows-link = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_Security"] }
 
 [dev-dependencies]
 tempfile = "3"

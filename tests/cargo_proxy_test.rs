@@ -391,11 +391,15 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
     );
 
     assert!(
-        host.join("target/debug/.fingerprint").is_dir(),
+        common::cargo_fingerprints(&host.join("target/debug"), "proxy_host")
+            .next()
+            .is_some(),
         "the proxied build keeps its own intermediates in the worktree"
     );
     assert!(
-        nested_target.join("debug/.fingerprint").is_dir(),
+        common::cargo_fingerprints(&nested_target.join("debug"), "proxy_guest")
+            .next()
+            .is_some(),
         "the nested build must keep its intermediates where its build script put them"
     );
     assert!(
@@ -479,21 +483,26 @@ fn build_dir_override_needs_a_cargo_that_knows_the_key() {
         std::fs::create_dir_all(&project).unwrap();
         versioned_fake_cargo(&fake_cargo, version);
 
-        let output = Command::new(KACHE_BIN)
-            .arg("cargo")
-            .arg("--")
-            .args(args)
-            .current_dir(&project)
-            .env("HOME", &home)
-            .env("CARGO_HOME", home.join(".cargo"))
-            .env("KACHE_REAL_CARGO", &fake_cargo)
-            .env("KACHE_TEST_CAPTURE", &capture)
-            .env_remove("CARGO_BUILD_BUILD_DIR")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_RUSTFLAGS")
-            .output()
-            .unwrap();
+        let cache = dir.path().join("cache");
+        let output = hermetic_command(
+            KACHE_BIN,
+            &cache,
+            Some(&common::isolated_config_path(&cache)),
+        )
+        .arg("cargo")
+        .arg("--")
+        .args(args)
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CARGO_HOME", home.join(".cargo"))
+        .env("KACHE_REAL_CARGO", &fake_cargo)
+        .env("KACHE_TEST_CAPTURE", &capture)
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .output()
+        .unwrap();
         assert!(
             output.status.success(),
             "proxy failed: {}",
@@ -661,12 +670,19 @@ fn non_utf8_cargo_argument_passes_through_without_cli_panic() {
     let fake_cargo = dir.path().join("cargo");
     kache_fs::testutil::write_executable(&fake_cargo, "#!/bin/sh\nexit 0\n");
 
-    let output = Command::new(KACHE_BIN)
-        .args(["cargo", "--", "build"])
-        .arg(OsString::from_vec(vec![b'f', b'o', 0x80]))
-        .env("KACHE_REAL_CARGO", &fake_cargo)
-        .output()
-        .unwrap();
+    // Hermetic: the proxy leases the store's target-use lock while Cargo
+    // runs, and the developer's own store must never be the one it locks.
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .args(["cargo", "--", "build"])
+    .arg(OsString::from_vec(vec![b'f', b'o', 0x80]))
+    .env("KACHE_REAL_CARGO", &fake_cargo)
+    .output()
+    .unwrap();
 
     assert!(
         output.status.success(),
@@ -685,12 +701,19 @@ fn non_utf8_wrapper_argument_fails_closed_before_compiler_execution() {
         format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
     );
 
-    let output = Command::new(KACHE_BIN)
-        .arg(&fake_rustc)
-        .arg(OsString::from_vec(vec![b's', b'r', b'c', b'/', 0x80]))
-        .env("RUSTC", &fake_rustc)
-        .output()
-        .unwrap();
+    // Hermetic: the client asks a daemon to compile, and the developer's
+    // own (their config's socket) must never be the one it reaches.
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .arg(&fake_rustc)
+    .arg(OsString::from_vec(vec![b's', b'r', b'c', b'/', 0x80]))
+    .env("RUSTC", &fake_rustc)
+    .output()
+    .unwrap();
 
     assert!(!output.status.success());
     assert!(!sentinel.exists(), "unsafe compiler fallback was executed");
@@ -721,16 +744,21 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
         "#!/bin/sh\nprintf '%s %s' \"${CARGO_BUILD_BUILD_DIR-unset}\" \"$*\" > \"$KACHE_TEST_CAPTURE\"\n",
     );
 
-    let output = Command::new(KACHE_BIN)
-        .args(["cargo", "--", "build"])
-        .current_dir(&project)
-        .env("HOME", &home)
-        .env("CARGO_HOME", home.join(".cargo"))
-        .env("KACHE_REAL_CARGO", &fake_cargo)
-        .env("KACHE_TEST_CAPTURE", &capture)
-        .env_remove("CARGO_BUILD_BUILD_DIR")
-        .output()
-        .unwrap();
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .args(["cargo", "--", "build"])
+    .current_dir(&project)
+    .env("HOME", &home)
+    .env("CARGO_HOME", home.join(".cargo"))
+    .env("KACHE_REAL_CARGO", &fake_cargo)
+    .env("KACHE_TEST_CAPTURE", &capture)
+    .env_remove("CARGO_BUILD_BUILD_DIR")
+    .output()
+    .unwrap();
 
     assert!(
         output.status.success(),
@@ -833,13 +861,17 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
 
     for worktree in [&worktree_a, &worktree_b, &worktree_c] {
         assert!(
-            worktree.join("target/debug/.fingerprint").is_dir(),
+            common::cargo_fingerprints(&worktree.join("target/debug"), "proxy_shared_target")
+                .next()
+                .is_some(),
             "intermediate fingerprints must be private to {}",
             worktree.display()
         );
     }
     assert!(
-        !shared_target.join("debug/.fingerprint").exists(),
+        common::cargo_fingerprints(&shared_target.join("debug"), "proxy_shared_target")
+            .next()
+            .is_none(),
         "the shared final target must not contain Cargo fingerprint state"
     );
 
@@ -914,13 +946,12 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
     assert!(json["targets"][0]["plan"]["protected"].as_u64().unwrap() > 0);
     let planned_bytes = json["targets"][0]["plan"]["bytes"].clone();
     // Access time is intentionally misleading for every fingerprint file.
-    for unit in std::fs::read_dir(target.join("debug/.fingerprint")).unwrap() {
-        for file in std::fs::read_dir(unit.unwrap().path()).unwrap() {
-            filetime::set_file_atime(
-                file.unwrap().path(),
-                filetime::FileTime::from_unix_time(1, 0),
-            )
-            .unwrap();
+    let fingerprints: Vec<_> =
+        common::cargo_fingerprints(&target.join("debug"), "liveness_fixture").collect();
+    assert!(!fingerprints.is_empty());
+    for fingerprint in fingerprints {
+        for file in common::dir_entries(&fingerprint) {
+            filetime::set_file_atime(file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         }
     }
     let clean = run(&["clean", "--artifacts", "--json", "--yes"], true);
@@ -1700,7 +1731,11 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(target.join("check/debug/.fingerprint").is_dir());
+    assert!(
+        common::cargo_fingerprints(&target.join("check/debug"), "compiler_gc_probe")
+            .next()
+            .is_some()
+    );
     held.unlock().unwrap();
     let version = Command::new("rustc").arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();

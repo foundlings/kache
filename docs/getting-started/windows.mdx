@@ -32,7 +32,8 @@ cache_executables = true
 
 For one PowerShell session, set `$env:KACHE_CACHE_EXECUTABLES = "1"` before the
 build. If you use the GitHub Action, configure its `cache-executables` input
-instead of relying on the CLI default.
+instead of relying on the CLI default. `cargo check` and `cargo clippy` of
+binaries and tests write no executable, so they are cached either way.
 
 V2 pairs a cached MSVC PE executable with the sibling PDB named by its debug
 record, checking that their identities agree. Missing/mismatched PDBs, unsupported
@@ -107,7 +108,15 @@ or failed identity queries, keep caching artifacts but read bytes on each key. E
 `/DEFAULTLIB` requests still validate and hash the selected archive together.
 An unavailable or older daemon uses the synchronous path too.
 
-Record the slow build with phase tracing:
+Keep the workspace, its `target` directory and Cargo home on NTFS. Rust sources,
+dependency crates and registry files reuse the same memos, so an unchanged file
+is hashed once. On ReFS (including Dev Drive), FAT or exFAT every cache key
+reads its inputs again, and on-access antivirus scanning makes those reads slow.
+ReFS still gives copy-on-write restores. `kache doctor` names any of these
+directories that is not on NTFS.
+
+`kache doctor` also reports the median key time of the latest build. If it
+fails, record the slow build with phase tracing:
 
 ```powershell
 $env:KACHE_PHASE_TRACE_DIR = Join-Path $env:TEMP 'kache-phases'

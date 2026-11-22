@@ -1,7 +1,6 @@
 use crate::store::StoreHashExt;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
-use chrono::Utc;
 use kache_store::eviction::HeldBytesBudget;
 pub(crate) use kache_store::markers::*;
 use std::path::{Component, Path, PathBuf};
@@ -223,6 +222,13 @@ where
         return None;
     }
     Some(unit)
+}
+
+/// Whether `cache_executables = false` sends this compile through uncached:
+/// it links a binary or a test. A check or clippy of one emits metadata only,
+/// no executable, so it is cached whatever `cache_executables` says.
+fn skips_uncached_executable(args: &RustcArgs, cache_executables: bool) -> bool {
+    args.is_user_facing_executable() && args.emits_link() && !cache_executables
 }
 
 /// Whether the pre-key incremental lanes may run. Never on a re-entry after a
@@ -894,7 +900,7 @@ fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remo
 /// GCC/Clang objects (and clang-cl without CodeView debug) use the rustc
 /// remote pipeline. clang-cl debug objects embed un-remapped paths.
 fn cc_publishes_to_remote(parsed: &crate::compiler::cc::CcArgs) -> bool {
-    !parsed.embeds_codeview_debug()
+    parsed.family != crate::compiler::cc::ToolFamily::Msvc && !parsed.embeds_codeview_debug()
 }
 
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
@@ -1565,6 +1571,7 @@ pub(crate) fn run_nvcc_for(
                 restore_ms,
                 key_record: KeyEventRecord::default(),
                 object_output: recorded_object_output(parsed.object_output_path()),
+                readonly_store: hit_store.is_read_only(),
             }
             .report(config, &meta);
             return Ok(0);
@@ -1640,6 +1647,7 @@ pub(crate) fn run_nvcc_for(
             restore_ms,
             key_record: KeyEventRecord::default(),
             object_output: recorded_object_output(parsed.object_output_path()),
+            readonly_store: false,
         }
         .report(config, &meta);
         return Ok(0);
@@ -2019,6 +2027,7 @@ fn nvcc_try_remote_hit(
         cache_key,
         crate_name,
         NegativeReply::ContinueCompile,
+        |meta| nvcc_cache_entry_rejection_reason(parsed, meta),
     ) else {
         return Ok(None);
     };
@@ -2050,6 +2059,7 @@ fn nvcc_try_remote_hit(
         restore_ms,
         key_record: KeyEventRecord::default(),
         object_output: recorded_object_output(parsed.object_output_path()),
+        readonly_store: false,
     }
     .report(config, &meta);
     Ok(Some(0))
@@ -2104,6 +2114,29 @@ thread_local! {
     static CC_PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
 }
 
+/// Crate directory a cc object is published under.
+///
+/// Lock-scoped sync lists Cargo package names. A build script sets
+/// `CARGO_PKG_NAME` to that package (`aws-lc-sys` is listed as `aws_lc_sys`),
+/// so the object has to be stored there or the pull never asks for it. The
+/// cc cache key still hashes each source path, which keeps two files in one
+/// package distinct. No package name keeps the source file name, and a lock
+/// scope does not list that.
+fn cc_entry_crate_name(parsed: &crate::compiler::cc::CcArgs) -> String {
+    if let Ok(package) = parsed.invocation_env.var("CARGO_PKG_NAME") {
+        let package = package.trim();
+        if !package.is_empty() {
+            return package.replace('-', "_");
+        }
+    }
+    parsed
+        .sources
+        .first()
+        .and_then(|source| source.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn run_cc_inner(
     config: &Config,
     wrapper_args: &[String],
@@ -2126,12 +2159,7 @@ fn run_cc_inner(
         .context("parsing cc-family arguments")?;
     drop(trace_parse);
     if crate::compiler::cc::cc_is_internal_key_probe_for(env) {
-        let crate_name = parsed
-            .sources
-            .first()
-            .and_then(|s| s.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
+        let crate_name = cc_entry_crate_name(&parsed);
         return cc_direct_passthrough_with_event(
             config,
             &parsed,
@@ -2143,14 +2171,7 @@ fn run_cc_inner(
     }
     let event_root = cc_event_root(&parsed);
 
-    // The crate-name slot in events / metadata is the source file
-    // name for cc — the closest analogue to rustc's crate name.
-    let crate_name = parsed
-        .sources
-        .first()
-        .and_then(|s| s.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
+    let crate_name = cc_entry_crate_name(&parsed);
 
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,
@@ -2165,7 +2186,9 @@ fn run_cc_inner(
             reasons.join("; ")
         );
         let reason = refuse_reason_string(&refuse);
-        return if parsed.requires_compiler_output_semantics() {
+        return if parsed.family == crate::compiler::cc::ToolFamily::Msvc
+            || parsed.requires_compiler_output_semantics()
+        {
             cc_direct_passthrough_with_event(
                 config,
                 &parsed,
@@ -2314,7 +2337,8 @@ fn run_cc_with_store(
         // entry, and no fallback wrapper is waiting to be asked.
         None if precompiled.is_none()
             && config.deferred_discovery
-            && config.remote.is_none()
+            && (config.remote.is_none()
+                || parsed.family == crate::compiler::cc::ToolFamily::Msvc)
             && config.fallback.is_none()
             && config.readonly_store.is_none()
             && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
@@ -2453,6 +2477,7 @@ fn run_cc_with_store(
                     restore_ms,
                     key_record: KeyEventRecord::default(),
                     object_output: recorded_object_output(parsed.object_output_path()),
+                    readonly_store: hit_store.is_read_only(),
                 }
                 .report(config, &meta);
                 drop(trace_report);
@@ -2576,6 +2601,7 @@ fn run_cc_with_store(
             restore_ms,
             key_record: KeyEventRecord::default(),
             object_output: recorded_object_output(parsed.object_output_path()),
+            readonly_store: false,
         }
         .report(config, &meta);
         compiler.commit_preprocess_memo(&file_hasher);
@@ -3568,6 +3594,7 @@ fn cc_try_remote_hit(
         cache_key,
         crate_name,
         NegativeReply::ContinueCompile,
+        |meta| cc_cache_entry_rejection_reason(parsed, meta),
     ) else {
         return Ok(None);
     };
@@ -3605,6 +3632,7 @@ fn cc_try_remote_hit(
         restore_ms,
         key_record: KeyEventRecord::default(),
         object_output: recorded_object_output(parsed.object_output_path()),
+        readonly_store: false,
     }
     .report(config, &meta);
     compiler.commit_preprocess_memo(file_hasher);
@@ -4139,7 +4167,7 @@ fn run_parsed_rustc(
         &args.all_args,
         args.invocation_env(),
     );
-    let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    let skip_user_facing = skips_uncached_executable(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),
@@ -5101,7 +5129,18 @@ fn run_parsed_rustc(
     // A Windows executable finds its `.pdb` by the GUID, age and name it
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
-    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
+    // A proc macro can write the checkout path into generated code where the
+    // key cannot see it (kunobi-ninja/kache#1914).
+    let key_binds_manifest_dir =
+        crate::embedded_checkout::key_binds_manifest_dir(key_outputs.env_deps.as_ref());
+    let names_checkout = || {
+        crate::embedded_checkout::embedded_checkout_reason(
+            args,
+            &result.artifacts,
+            key_binds_manifest_dir,
+        )
+    };
+    if let Some(reason) = unaudited.or(degraded).or(unpaired).or_else(names_checkout) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -5192,14 +5231,14 @@ fn run_parsed_rustc(
     // objects, so the platform runs dsymutil. Packed debug info, including
     // rustc's macOS default when `-Csplit-debuginfo` was not passed, already
     // wrote the adjacent `.dSYM` (kunobi-ninja/kache#1752); that bundle is
-    // what gets cached. The store holds one flat tar. Restore unpacks it
-    // next to the binary, where lldb prefers it over the stale debug map.
-    // The staging TempDir must outlive `store.put*` below, which hashes the
-    // tar at this path — same lifetime pattern as `prepare_cc_store_files`.
+    // what gets cached. The store holds it one file per artifact plus a
+    // manifest (kunobi-ninja/kache#1905). Restore clones the files next to
+    // the binary, where lldb prefers them over the stale debug map. The
+    // staging TempDir must outlive `store.put*` below, which hashes the
+    // staged files — same lifetime pattern as `prepare_cc_store_files`.
     let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
     if wants_debug_bundle(args)
-        && let Some((exec_path, exec_name)) =
-            find_executable_output(compiler, args, &result.artifacts)
+        && let Some((exec_path, _)) = find_executable_output(compiler, args, &result.artifacts)
     {
         match tempfile::tempdir_in(args.invocation_env().temp_dir()) {
             Ok(staging) => {
@@ -5208,16 +5247,13 @@ fn run_parsed_rustc(
                     staging.path(),
                     args.get_codegen_opt("split-debuginfo"),
                 ) {
-                    Ok(Some(tar_path)) => {
-                        result.artifacts.push(crate::compiler::Artifact {
-                            path: tar_path,
-                            // Single path component (`is_safe_artifact_name`
-                            // gates restore) derived from the executable's
-                            // store name: `foo-abc` → `foo-abc.dsym.tar`.
-                            store_name: format!("{exec_name}.dsym.tar"),
-                            kind: ArtifactKind::DebugBundle,
-                            required: false,
-                        });
+                    Ok(Some(bundle)) => {
+                        // Single path components (`is_safe_artifact_name`
+                        // gates restore) named after the executable:
+                        // `foo-abc` → `foo-abc.dsym.json`, `foo-abc.dsym.0`.
+                        for artifact in bundle.into_artifacts() {
+                            result.artifacts.push(artifact);
+                        }
                         _debug_bundle_staging = Some(staging);
                     }
                     // None (non-macOS host, packed with no bundle, tool
@@ -6667,7 +6703,8 @@ fn adaptive_compile_before_key(
         ctx.args.invokes_linker(),
         ctx.config.test_lease.as_deref(),
     );
-    let mut compiler_args = prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
+    let (mut compiler_args, seed_attempt) =
+        prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
     let bootstrap = std::cell::Cell::new(lease.worktree_bootstrap());
     let bootstrap_observed = std::cell::Cell::new(false);
     let ready = !bootstrap.get()
@@ -6841,6 +6878,7 @@ fn adaptive_compile_before_key(
         .lookup_ms(lookup_ms)
         .passthrough_reason("adaptive seed".to_owned())
         .incremental_seed(seeded_from.as_deref())
+        .incremental_seed_attempt(seed_attempt.settle(seeded_from.is_some()))
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -7037,6 +7075,16 @@ fn compile_before_key(
 /// to report its dep-info as a JSON artifact, and must not link: stopping
 /// kills rustc alone, and a linker it had already started could still write
 /// over the restored output.
+///
+/// On Linux a compile that links qualifies too: it is suspended at its
+/// dep-info while it is keyed, and only offered a stop once Linux shows it
+/// stopped with no child (`compile::capture_rustc_output_with`).
+#[cfg(target_os = "linux")]
+fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
+    args.reports_artifacts()
+}
+
+#[cfg(not(target_os = "linux"))]
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
     args.reports_artifacts() && !args.invokes_linker()
 }
@@ -7672,6 +7720,7 @@ fn try_rustc_remote_hit(
             &entry_key.key,
             hit.crate_name,
             NegativeReply::CheckConcurrentEntry,
+            |_| None,
         ) else {
             continue;
         };
@@ -8236,8 +8285,24 @@ fn restore_from_cache_with_memo_store(
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
         // Older entries may carry a bundle despite an explicit opt-out.
-        if kind == ArtifactKind::DebugBundle && !wants_debug_bundle(args) {
+        if kind.is_debug_bundle() && !wants_debug_bundle(args) {
             continue;
+        }
+        match kind {
+            // Restored through its manifest, never as a file of its own.
+            ArtifactKind::DebugBundleFile => continue,
+            ArtifactKind::DebugBundleManifest => {
+                crate::compiler::debug_bundle::restore(
+                    store,
+                    &meta.files,
+                    cached_file,
+                    &target_path,
+                    config.restore_max_size,
+                )
+                .context("rustc restore: restoring debug bundle")?;
+                continue;
+            }
+            _ => {}
         }
         let restored = materialize_cached_artifact(
             config.restore_max_size,
@@ -8601,27 +8666,82 @@ fn discard_bootstrap_outputs(outputs: &ArtifactSet) -> bool {
     true
 }
 
+/// How a private compile looked for another checkout's incremental state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeedAttempt {
+    NotTried,
+    /// It looked, but the invocation could not be made portable.
+    Unportable,
+    NoDonor,
+    Imported,
+}
+
+impl SeedAttempt {
+    /// `looked`: the unit had no state of its own and seeding was on.
+    /// `imported` holds the lease's donor, which an earlier preparation may
+    /// have set.
+    fn of(looked: bool, portable: bool, imported: bool) -> Self {
+        match (imported, looked, portable) {
+            (true, ..) => Self::Imported,
+            (false, false, _) => Self::NotTried,
+            (false, true, false) => Self::Unportable,
+            (false, true, true) => Self::NoDonor,
+        }
+    }
+
+    /// The outcome once the compile ran: an earlier preparation may have
+    /// imported the seed, and a declined bootstrap discards an import.
+    fn settle(self, seeded: bool) -> Self {
+        match (self, seeded) {
+            (_, true) => Self::Imported,
+            (Self::Imported, false) => Self::Unportable,
+            (other, false) => other,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotTried => "",
+            Self::Unportable => "unportable",
+            Self::NoDonor => "no-donor",
+            Self::Imported => "imported",
+        }
+    }
+}
+
 fn prepare_worktree_compiler_args(
     config: &Config,
     args: &RustcArgs,
     lease: &mut Lease,
-) -> Vec<String> {
+) -> (Vec<String>, SeedAttempt) {
     let automatic = automatic_seeding_enabled(config, args);
-    if !automatic {
-        return lease.worktree_compiler_args(
-            args,
-            config.incremental_seed_from.as_deref(),
-            config.unstable,
-        );
-    }
-    let donors = if let Some(profile) = &config.incremental_seed_from {
-        vec![profile.clone()]
-    } else if lease.needs_worktree_donor() {
-        automatic_worktree_donors(config, args)
+    let (compiler_args, looked) = if !automatic {
+        let donor = config.incremental_seed_from.as_deref();
+        let looked = config.unstable && donor.is_some() && lease.needs_worktree_donor();
+        (
+            lease.worktree_compiler_args(args, donor, config.unstable),
+            looked,
+        )
     } else {
-        Vec::new()
+        let looked = lease.needs_worktree_donor();
+        let donors = if let Some(profile) = &config.incremental_seed_from {
+            vec![profile.clone()]
+        } else if looked {
+            automatic_worktree_donors(config, args)
+        } else {
+            Vec::new()
+        };
+        (
+            lease.worktree_compiler_args_from(args, &donors, true),
+            looked,
+        )
     };
-    lease.worktree_compiler_args_from(args, &donors, true)
+    let attempt = SeedAttempt::of(
+        looked,
+        lease.worktree_portable(),
+        lease.worktree_seed_donor().is_some(),
+    );
+    (compiler_args, attempt)
 }
 
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
@@ -8701,7 +8821,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
-    let mut compiler_args = prepare_worktree_compiler_args(config, args, &mut lease);
+    let (mut compiler_args, seed_attempt) =
+        prepare_worktree_compiler_args(config, args, &mut lease);
     let permit = adaptive_lane_takes_permit(kind).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
@@ -8829,6 +8950,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         .lookup_ms(lookup_ms)
         .passthrough_reason(reason)
         .incremental_seed(seeded_from.as_deref())
+        .incremental_seed_attempt(seed_attempt.settle(seeded_from.is_some()))
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -9276,7 +9398,7 @@ impl RebuiltArtifacts {
         let outputs: Vec<_> = artifacts
             .outputs()
             .iter()
-            .filter(|artifact| artifact.kind != ArtifactKind::DebugBundle)
+            .filter(|artifact| !artifact.kind.is_debug_bundle())
             .collect();
         if outputs.is_empty() {
             return Self::default();
@@ -9328,6 +9450,7 @@ pub(crate) struct EventInputs<'a> {
     passthrough_reason: String,
     skip_reason: String,
     incremental_seed: String,
+    incremental_seed_attempt: &'static str,
     object_output: String,
     package: String,
     store_error: String,
@@ -9337,6 +9460,7 @@ pub(crate) struct EventInputs<'a> {
     fallback_attempt: Option<crate::fallback::Attempt>,
     key_record: KeyEventRecord,
     rebuilt: RebuiltArtifacts,
+    readonly_store: bool,
 }
 
 impl<'a> EventInputs<'a> {
@@ -9363,6 +9487,7 @@ impl<'a> EventInputs<'a> {
             passthrough_reason: String::new(),
             skip_reason: String::new(),
             incremental_seed: String::new(),
+            incremental_seed_attempt: "",
             object_output: String::new(),
             package: String::new(),
             store_error: String::new(),
@@ -9372,6 +9497,7 @@ impl<'a> EventInputs<'a> {
             fallback_attempt: None,
             key_record: KeyEventRecord::default(),
             rebuilt: RebuiltArtifacts::default(),
+            readonly_store: false,
         }
     }
 
@@ -9485,6 +9611,11 @@ impl<'a> EventInputs<'a> {
         self
     }
 
+    fn incremental_seed_attempt(mut self, attempt: SeedAttempt) -> Self {
+        self.incremental_seed_attempt = attempt.as_str();
+        self
+    }
+
     pub(crate) fn skip_reason(mut self, reason: impl Into<String>) -> Self {
         self.skip_reason = reason.into();
         self
@@ -9499,6 +9630,13 @@ impl<'a> EventInputs<'a> {
     /// Package a build-script run belongs to.
     pub(crate) fn package(mut self, package: String) -> Self {
         self.package = package;
+        self
+    }
+
+    /// Mark a local hit whose entry came from `[cache] readonly_store`.
+    /// Ignored on any other result.
+    pub(crate) fn readonly_store(mut self, readonly_store: bool) -> Self {
+        self.readonly_store = readonly_store && self.result == EventResult::LocalHit;
         self
     }
 
@@ -9668,6 +9806,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         passthrough_reason,
         skip_reason,
         incremental_seed,
+        incremental_seed_attempt,
         object_output,
         package,
         store_error,
@@ -9677,6 +9816,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         fallback_attempt,
         key_record: recorded,
         rebuilt,
+        readonly_store,
     } = inputs;
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
@@ -9735,7 +9875,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
     );
     let miss_reason = events::MissReason::classify(&passthrough_reason);
     BuildEvent {
-        ts: Utc::now(),
+        ts: jiff::Timestamp::now(),
         crate_name: crate_name.to_string(),
         root: root.to_string(),
         version: crate::VERSION.to_string(),
@@ -9749,7 +9889,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
             .then(|| cache_key.to_string()),
         rebuilt_path: rebuilt.primary,
         rebuilt_paths: rebuilt.paths,
-        schema: 27,
+        schema: 28,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -9794,9 +9934,11 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         passthrough_reason,
         skip_reason,
         incremental_seed,
+        incremental_seed_attempt: incremental_seed_attempt.to_owned(),
         miss_reason,
         object_output,
         package,
+        readonly_store,
         store_error,
         store_handed_off: store_put.output_blobs != 0
             && INVOCATION_SETTINGS.with(|slot| {
@@ -9897,9 +10039,9 @@ fn explain_miss_diff(
         // the post-hoc folds (key salt / extra inputs).
         changed.push("salt_or_extra_inputs".to_string());
     }
-    let ago = Utc::now()
-        .signed_duration_since(last_hit.ts)
-        .num_minutes()
+    let ago = jiff::Timestamp::now()
+        .duration_since(last_hit.ts)
+        .as_mins()
         .max(0);
     crate::notice::show(&format!(
         "[kache] miss: crate {} (last hit {}m ago; key changed in: {})",
@@ -10248,6 +10390,14 @@ pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &s
     let marker = session_marker_path(config, root);
     match std::fs::read_to_string(&marker) {
         Ok(content) => match parse_session_marker(&content) {
+            // Touched recently enough: rewriting it on every compile cost a
+            // create and a rename in one shared directory per cache hit.
+            Some((touched, id))
+                if id == session_id
+                    && now_epoch_secs().saturating_sub(touched) < SESSION_REFRESH_SECS =>
+            {
+                return;
+            }
             Some((_, id)) if id == session_id => {}
             _ => return, // superseded or unreadable — never clobber
         },
@@ -10342,6 +10492,11 @@ pub(crate) fn prune_session_markers(
 
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
+
+/// How stale a session marker may grow before an event refreshes it. A
+/// session can end up to this much sooner than [`BUILD_SESSION_SECS`] of
+/// inactivity.
+const SESSION_REFRESH_SECS: u64 = 30;
 
 /// Remove the directory passed as `-C incremental`. Cargo passes
 /// `<profile>/incremental`, which every unit of the profile shares. Normal

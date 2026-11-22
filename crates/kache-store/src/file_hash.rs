@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
+/// The smallest key input whose hash is memoised: looked up when a key reads
+/// it, and recorded when a store or restore already knows it. Off Windows a
+/// small file is read about as fast as its row is looked up, so this is
+/// [`MIN_PERSISTED_HASH_BYTES`]. On Windows reading a file opens it for its
+/// data, which an antivirus filter may scan, while the stamp comes from an
+/// attribute-only open, so any size is memoised. A warm build of a 1,200-unit
+/// desktop app read about 20,500 small sources per build on a 4 vCPU Windows
+/// 11 VM.
+pub const KEY_INPUT_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
+    0
+} else {
+    MIN_PERSISTED_HASH_BYTES
+};
+
 /// Windows metadata without a handle-derived ID cannot prove unchanged bytes.
 /// Other platforms retain their existing file-hash memo policy.
 pub fn file_hash_memo_eligible(inode: i64, requires_identity: bool) -> bool {
@@ -224,7 +238,8 @@ impl<'db> FileHashCache<'db> {
     }
 
     /// The memoised hash for `fingerprint`: a row whose whole stamp matches,
-    /// recorded under [`FILE_HASH_RULE`] or a later rule.
+    /// recorded under [`FILE_HASH_RULE`] or a later rule, in this boot
+    /// ([`memo_rows_valid_since`]).
     pub fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
         if !file_hash_memo_eligible(fingerprint.inode, cfg!(windows)) {
             return Ok(None);
@@ -233,14 +248,15 @@ impl<'db> FileHashCache<'db> {
             .query_row(
                 "SELECT hash FROM file_hashes
                  WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5
-                   AND rule >= ?6",
+                   AND rule >= ?6 AND updated_at >= datetime(?7, 'unixepoch')",
                 params![
                     fingerprint.path,
                     fingerprint.size,
                     fingerprint.mtime_ns,
                     fingerprint.ctime_ns,
                     fingerprint.inode,
-                    FILE_HASH_RULE
+                    FILE_HASH_RULE,
+                    memo_rows_valid_since()
                 ],
                 |row| row.get(0),
             )
@@ -257,13 +273,15 @@ impl<'db> FileHashCache<'db> {
         fingerprints: &[&FileFingerprint],
     ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
         let mut found = std::collections::HashMap::new();
+        let since = memo_rows_valid_since();
         for chunk in fingerprints.chunks(FILE_HASH_LOOKUP_CHUNK) {
             let wanted: std::collections::HashSet<&FileFingerprint> =
                 chunk.iter().copied().collect();
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
-                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}"
+                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}
+                   AND updated_at >= datetime({since}, 'unixepoch')"
             ))?;
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
@@ -729,6 +747,20 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     ensure_input_predictions_last_used(db, unix_now())
 }
 
+/// Why no file under `path` can be served from the hash memo, or `None` when
+/// files there can be. Only Windows needs handle evidence (NTFS) for that.
+pub fn memo_identity_problem(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    return windows_fingerprint(path)
+        .err()
+        .map(|error| format!("{error:#}"));
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 impl FileFingerprint {
     /// Identity of a file as the memo sees it. Also the cheapest available
     /// proof that an external tool did NOT rewrite a file across some
@@ -847,7 +879,16 @@ fn windows_fingerprint_from_parts(
     change_time: i64,
 ) -> Result<FileFingerprint> {
     if !filesystem.starts_with(&[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0]) {
-        anyhow::bail!("filesystem does not provide a supported strong file identity");
+        let end = filesystem.iter().position(|&unit| unit == 0);
+        let name = String::from_utf16_lossy(&filesystem[..end.unwrap_or(filesystem.len())]);
+        anyhow::bail!(
+            "{} gives no file identity the hash memo can trust",
+            if name.is_empty() {
+                "this filesystem"
+            } else {
+                &name
+            }
+        );
     }
     let index = (u64::from(file_index.0) << 32) + u64::from(file_index.1);
     let changed = u64::try_from(change_time).context("invalid NTFS change time")?;
@@ -879,6 +920,124 @@ pub fn with_weak_windows_fingerprints_for_tests<T>(run: impl FnOnce() -> T) -> T
         }
     }
     let _restore = Restore(WEAK_WINDOWS_FINGERPRINTS.with(|weak| weak.replace(true)));
+    run()
+}
+
+/// The Unix second from which `file_hashes` rows are served: when this
+/// machine booted. A row vouches for a file's bytes by its stamp (size,
+/// mtime, ctime, inode), and a hard stop (power loss, a kernel panic, a VM
+/// killed by its host) can break that: the stamp is journaled, but data still
+/// in the page cache is lost, so a file written in the seconds before the stop
+/// comes back at its size, its times and its inode, as zeros or as holes. The
+/// row then vouches for bytes the file no longer holds, for as long as the
+/// file stays untouched. A row recorded before the boot is therefore not
+/// served: the file is read once again and the row recorded then is. A clean
+/// reboot costs the same single read per file. `0`, every row, where the boot
+/// time is unknown (every platform but Linux, Android and Windows, for now).
+///
+/// The tree-digest memos follow the same rule.
+pub fn memo_rows_valid_since() -> i64 {
+    #[cfg(test)]
+    if let Some(boot) = BOOT_SECS_FOR_TESTS.with(std::cell::Cell::get) {
+        return boot;
+    }
+    static BOOT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| boot_time_secs().unwrap_or(0))
+}
+
+/// When this machine booted, in Unix seconds: the `btime` line of
+/// `/proc/stat`, or on Windows the boot time the kernel keeps
+/// ([`windows_boot_time_secs`]). `None` where it is unknown, and every row is
+/// served, as before.
+fn boot_time_secs() -> Option<i64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        boot_time_in_proc_stat(&stat)
+    }
+    #[cfg(windows)]
+    {
+        windows_boot_time_secs()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    {
+        None
+    }
+}
+
+/// When Windows booted, in Unix seconds: the boot time the kernel keeps,
+/// which `NtQuerySystemInformation` reports for `SystemTimeOfDayInformation`
+/// and WMI as `Win32_OperatingSystem.LastBootUpTime`. Like Linux's `btime`
+/// it moves when the clock is set, by the size of the step. The system time
+/// minus `GetTickCount64` is not the same value: it is only as fine as the
+/// tick (about 16 ms) and can sit below the kernel's boot time, the side
+/// that serves a row from before the boot.
+#[cfg(windows)]
+fn windows_boot_time_secs() -> Option<i64> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemTimeOfDayInformation,
+    };
+    // SYSTEM_TIMEOFDAY_INFORMATION, which winternl.h leaves opaque: the boot
+    // time and the current time as FILETIMEs, then the time zone bias, its id
+    // and padding, the boot time bias and the sleep time bias, 48 bytes.
+    let mut info = [0u64; 6];
+    let mut written = 0u32;
+    // SAFETY: `info` is 48 writable bytes, aligned for the 64-bit fields the
+    // call writes, alive across the call, and the length passed is their size;
+    // `written` is a live u32 the call may fill.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of_val(&info) as u32,
+            &mut written,
+        )
+    };
+    if status < 0 || (written as usize) < 2 * std::mem::size_of::<u64>() {
+        return None;
+    }
+    let unix_ns = |filetime: u64| filetime_to_unix_ns((filetime >> 32) as u32, filetime as u32);
+    boot_secs_from_time_of_day(unix_ns(info[0]), unix_ns(info[1]), windows_system_time_ns())
+}
+
+/// The boot second from what `SystemTimeOfDayInformation` reports, its boot
+/// time and its current time (nanoseconds since the Unix epoch), checked
+/// against the system time read beside the call (`now_ns`): a current time
+/// off it, or a boot after it, means the bytes are not laid out as
+/// [`windows_boot_time_secs`] reads them, and the boot time is unknown.
+/// Rounded down, so a row recorded in the boot's own second is served.
+#[cfg(any(test, windows))]
+fn boot_secs_from_time_of_day(boot_ns: i64, current_ns: i64, now_ns: i64) -> Option<i64> {
+    const LAYOUT_SLACK_NS: u64 = 60_000_000_000;
+    let laid_out =
+        boot_ns > 0 && boot_ns <= current_ns && current_ns.abs_diff(now_ns) <= LAYOUT_SLACK_NS;
+    laid_out.then(|| boot_ns.div_euclid(1_000_000_000))
+}
+
+/// The `btime` line of `/proc/stat`.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn boot_time_in_proc_stat(stat: &str) -> Option<i64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|secs| secs.trim().parse().ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BOOT_SECS_FOR_TESTS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `run` as on a machine that booted at `boot_secs` (Unix seconds), for
+/// tests of the memo across an unclean stop ([`memo_rows_valid_since`]).
+#[cfg(test)]
+fn with_boot_time_for_tests<T>(boot_secs: i64, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOT_SECS_FOR_TESTS.with(|boot| boot.set(self.0));
+        }
+    }
+    let _restore = Restore(BOOT_SECS_FOR_TESTS.with(|boot| boot.replace(Some(boot_secs))));
     run()
 }
 
@@ -987,8 +1146,15 @@ impl FileHashCache<'_> {
     /// blake3. Lets a caller holding a coarse lock (the daemon's `Mutex<Store>`)
     /// release it before the expensive file read and re-take it only for the
     /// short record (#281). Mirrors `FileHasher::hash`'s fingerprint + min-size +
-    /// cache-get logic exactly, so the cache key is identical.
+    /// cache-get logic, so the cache key is identical. The floor here is
+    /// `MIN_PERSISTED_HASH_BYTES`: the smaller key inputs that
+    /// `FileHasher::hash` memoises on Windows are looked up in process.
     pub fn lookup_cached(&self, path: &Path) -> FileHashLookup {
+        self.lookup_cached_from(path, MIN_PERSISTED_HASH_BYTES)
+    }
+
+    /// [`Self::lookup_cached`] for files of `floor` bytes and more.
+    pub(crate) fn lookup_cached_from(&self, path: &Path, floor: i64) -> FileHashLookup {
         let cache = self;
         let fingerprint = match FileFingerprint::from_path(path) {
             Ok(fp) => fp,
@@ -1000,7 +1166,7 @@ impl FileHashCache<'_> {
                 return FileHashLookup::Uncacheable;
             }
         };
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < floor {
             return FileHashLookup::Uncacheable;
         }
         match cache.get(&fingerprint) {
@@ -1032,10 +1198,10 @@ impl FileHashCache<'_> {
     /// path here instead would pair the new file's fingerprint with the old
     /// file's hash.
     ///
-    /// Honors the same size floor as `FileHasher::hash`, which would not consult
-    /// the memo for a smaller file anyway.
+    /// Honors [`KEY_INPUT_MEMO_MIN_BYTES`], the floor a key read looks rows
+    /// up from; a smaller file is just not recorded here.
     pub fn record_verified(&self, fingerprint: &FileFingerprint, hash: &str) {
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < KEY_INPUT_MEMO_MIN_BYTES {
             return;
         }
         self.record_cached(fingerprint, hash);
@@ -1117,6 +1283,28 @@ mod tests {
         assert_eq!(empty.size, 0);
         assert_eq!(empty.mtime_ns, i64::MAX);
         assert_eq!(empty.ctime_ns, i64::MAX);
+    }
+
+    #[test]
+    fn a_local_temporary_directory_has_memo_identity() {
+        // Test machines keep temporary files on NTFS on Windows; elsewhere
+        // every filesystem passes.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(memo_identity_problem(dir.path()), None);
+    }
+
+    #[test]
+    fn an_unsupported_filesystem_is_named_in_the_rejection() {
+        let error = windows_fingerprint_from_parts(
+            Path::new("runtime.lib"),
+            &[82, 101, 70, 83, 0, 0],
+            (0, 1),
+            (0, 1),
+            116_444_736_000_000_001,
+            116_444_736_000_000_001,
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("ReFS "), "{error}");
     }
 
     #[test]
@@ -2321,6 +2509,149 @@ mod tests {
     }
 
     #[test]
+    fn the_boot_time_is_the_btime_line_of_proc_stat() {
+        let stat = "cpu  1 2 3\nintr 5\nbtime 1794057339\nprocesses 9\n";
+        assert_eq!(boot_time_in_proc_stat(stat), Some(1_794_057_339));
+        assert_eq!(boot_time_in_proc_stat("cpu 1\nbtimes 7\n"), None);
+    }
+
+    #[test]
+    fn a_windows_boot_time_is_rounded_down_and_read_only_from_the_expected_layout() {
+        const SECOND: i64 = 1_000_000_000;
+        // 2026-11-16 19:47:39.999999999 UTC, read 15 minutes later.
+        let boot = 1_794_858_459 * SECOND + 999_999_999;
+        let now = boot + 900 * SECOND;
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now),
+            Some(1_794_858_459),
+            "a row stamped in the boot's own second must be served"
+        );
+        // The call's current time and the system time read beside it agree
+        // within a minute when the bytes hold what they are read as.
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND + 1),
+            None
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND - 1),
+            None
+        );
+        // A boot in the reported instant itself is still a boot; one after it,
+        // or none at all, is not.
+        assert_eq!(
+            boot_secs_from_time_of_day(now, now, now),
+            Some(1_794_859_359)
+        );
+        assert_eq!(boot_secs_from_time_of_day(now + 1, now, now), None);
+        assert_eq!(boot_secs_from_time_of_day(0, now, now), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn this_machine_booted_in_the_past() {
+        let boot = boot_time_secs().expect("this platform's boot time is known");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 2017-07-14: no machine running these tests booted before it.
+        assert!(boot > 1_500_000_000, "boot time {boot}");
+        assert!(
+            boot <= i64::try_from(now).unwrap(),
+            "boot time {boot} is ahead of now {now}"
+        );
+    }
+
+    #[test]
+    fn a_row_recorded_before_this_boot_is_not_served() {
+        // A hard stop can lose a file's last writes while its size, times and
+        // inode, already journaled, survive: the file then reads as zeros
+        // under a stamp the memo recorded with the old bytes' hash. A row
+        // from before the boot is read again once, and the row the read
+        // records is served.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("crashed.rmeta");
+        std::fs::write(&file, vec![0u8; 70 * 1024]).unwrap();
+        let fh = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let FileHashLookup::NeedsHash(stamp) = fh.lookup_cached(&file) else {
+            panic!("a new file has no row");
+        };
+        fh.record_cached(&stamp, "beforethestop");
+        let before_the_stop = || {
+            fh.db()
+                .execute(
+                    "UPDATE file_hashes SET updated_at = '2026-11-07 13:14:09'",
+                    [],
+                )
+                .unwrap();
+        };
+        before_the_stop();
+        let boot = 1_794_057_339; // 2026-11-07 13:15:39 UTC
+        with_boot_time_for_tests(boot, || {
+            assert!(
+                matches!(fh.lookup_cached(&file), FileHashLookup::NeedsHash(_)),
+                "the row predates the boot, so the file must be read again"
+            );
+            assert_eq!(fh.get(&stamp).unwrap(), None, "get serves no pre-boot row");
+            assert!(
+                fh.get_many(&[&stamp]).unwrap().is_empty(),
+                "get_many serves no pre-boot row"
+            );
+            fh.record_cached(&stamp, "readafterboot");
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row recorded in this boot is served"
+            );
+        });
+        before_the_stop();
+        with_boot_time_for_tests(boot - 3_600, || {
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row from this boot keeps vouching"
+            );
+            assert_eq!(
+                fh.get_many(&[&stamp])
+                    .unwrap()
+                    .get(&stamp.path)
+                    .map(String::as_str),
+                Some("readafterboot"),
+                "get_many serves a row from this boot"
+            );
+        });
+        fh.db()
+            .execute(
+                "UPDATE file_hashes SET updated_at = '2026-11-07 13:15:39'",
+                [],
+            )
+            .unwrap();
+        with_boot_time_for_tests(boot, || {
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row stamped in the boot second is served"
+            );
+            assert_eq!(
+                fh.get_many(&[&stamp])
+                    .unwrap()
+                    .get(&stamp.path)
+                    .map(String::as_str),
+                Some("readafterboot"),
+                "get_many serves a row stamped in the boot second"
+            );
+        });
+    }
+
+    #[test]
     fn lookup_cached_miss_then_record_then_hit_roundtrips() {
         // The daemon's lock-narrowing seam: a large file first reports
         // NeedsHash (miss), then after record_cached() a subsequent
@@ -2346,10 +2677,10 @@ mod tests {
     }
 
     #[test]
-    fn record_verified_honors_the_persistence_floor() {
+    fn record_verified_honors_the_key_input_floor() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
-        let below = dir.path().join("below.rlib");
+        let below = dir.path().join("below.rmeta");
         let at_floor = dir.path().join("at-floor.rlib");
         std::fs::write(&below, vec![1u8; 65_535]).unwrap();
         std::fs::write(&at_floor, vec![2u8; 65_536]).unwrap();
@@ -2358,10 +2689,14 @@ mod tests {
         hasher.record_verified(&FileFingerprint::from_path(&below).unwrap(), "below");
         hasher.record_verified(&FileFingerprint::from_path(&at_floor).unwrap(), "at-floor");
 
-        assert!(matches!(
-            hasher.lookup_cached(&below),
-            FileHashLookup::Uncacheable
-        ));
+        // A key read on Windows looks up a small output, so a restore or store
+        // that knows its hash records it there and nowhere else.
+        let below_lookup = hasher.lookup_cached_from(&below, KEY_INPUT_MEMO_MIN_BYTES);
+        if cfg!(windows) {
+            assert!(matches!(below_lookup, FileHashLookup::Hit(hash) if hash == "below"));
+        } else {
+            assert!(matches!(below_lookup, FileHashLookup::Uncacheable));
+        }
         assert!(matches!(
             hasher.lookup_cached(&at_floor),
             FileHashLookup::Hit(hash) if hash == "at-floor"
@@ -2371,6 +2706,6 @@ mod tests {
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM file_hashes", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(rows, 1, "sub-threshold fingerprints must not be stored");
+        assert_eq!(rows, if cfg!(windows) { 2 } else { 1 });
     }
 }

@@ -69,19 +69,8 @@ fn past_mtime() -> i64 {
 }
 
 fn reset_fixture_fingerprint(target_dir: &Path) {
-    let fingerprints = target_dir.join("debug/.fingerprint");
-    if fingerprints.is_dir() {
-        for entry in fs::read_dir(&fingerprints).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("adaptive-fixture-"))
-            {
-                fs::remove_dir_all(entry.path()).unwrap();
-            }
-        }
+    for fingerprint in common::cargo_fingerprints(&target_dir.join("debug"), "adaptive-fixture") {
+        fs::remove_dir_all(fingerprint).unwrap();
     }
 }
 
@@ -175,19 +164,7 @@ fn build_variant_impl(
 
     // Execute a tiny direct consumer of the produced rlib. Event transitions
     // alone would not catch stale incremental output.
-    let deps = target_dir.join("debug/deps");
-    let rlib = fs::read_dir(&deps)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libadaptive_fixture-") && name.ends_with(".rlib")
-                })
-        })
-        .expect("fixture rlib was not produced");
+    let rlib = target_dir.join("debug/libadaptive_fixture.rlib");
     let consumer_source = project.join("consumer.rs");
     let consumer_binary = project.join("consumer");
     fs::write(
@@ -200,8 +177,6 @@ fn build_variant_impl(
         .arg("--edition=2024")
         .arg("--extern")
         .arg(format!("adaptive_fixture={}", rlib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
         .arg("-o")
         .arg(&consumer_binary)
         .output()
@@ -430,6 +405,12 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
         after_hit["dep_info_runs"], 1,
         "the first edit after a hit discovers its closure once: {after_hit:#}"
     );
+
+    // Returning to cached source inside the active window, as a revert or a
+    // branch switch does, restores instead of compiling incrementally.
+    let returned = build(1);
+    assert_eq!(returned["result"], "local_hit", "event: {returned:#}");
+    assert_eq!(returned["compiler_runs"], 0);
 
     // The predicted key may select incremental compilation, but must not
     // publish its output. With policy state removed, this variant still misses.
@@ -777,6 +758,66 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     assert_passthrough(&active, "adaptive active");
     assert_eq!(active["compiler_runs"], 1, "event: {active:#}");
     assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
+}
+
+/// `cargo check` of a binary and of its tests emits metadata only, no
+/// executable, so both are cached even where executables are not
+/// (`cache_executables` off, the Windows default): a second target directory
+/// restores them.
+#[test]
+fn checks_of_executables_are_cached_when_executables_are_not() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { print!(\"checked\"); }\n\n#[test]\nfn checked() {}\n",
+    )
+    .unwrap();
+    let check = |target: &str| {
+        let output = hermetic_command(
+            "cargo",
+            cache.path(),
+            Some(&project.path().join("missing-kache.toml")),
+        )
+        .args(["check", "--offline", "--quiet", "--all-targets"])
+        .current_dir(project.path())
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("CARGO_TARGET_DIR", project.path().join(target))
+        .env("KACHE_CACHE_EXECUTABLES", "0")
+        .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+        .env("KACHE_SEED_NEW_TARGETS", "0")
+        .env_remove("KACHE_FALLBACK")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("KACHE_DISABLED")
+        .output()
+        .expect("failed to check the executable fixture");
+        assert!(
+            output.status.success(),
+            "check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    };
+    check("first");
+    check("second");
+    let events = fixture_events(cache.path());
+    let mut results: Vec<&str> = events
+        .iter()
+        .map(|event| event["result"].as_str().unwrap_or_default())
+        .collect();
+    results.sort_unstable();
+    assert_eq!(
+        results,
+        ["local_hit", "local_hit", "miss", "miss"],
+        "events: {events:#?}"
+    );
 }
 
 #[test]

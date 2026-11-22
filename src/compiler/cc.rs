@@ -72,7 +72,11 @@ pub enum ToolFamily {
     Clang,
     /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
     ClangCl,
+    /// Microsoft's native compiler.
+    Msvc,
 }
+
+mod msvc;
 
 /// Store name for a `-E` expansion that went to stdout (no `-o`).
 pub(crate) const CC_STDOUT_STORE_NAME: &str = "stdout.i";
@@ -98,7 +102,7 @@ impl ToolFamily {
     pub fn dialect(self) -> Dialect {
         match self {
             ToolFamily::Gnu | ToolFamily::Clang => Dialect::Gnu,
-            ToolFamily::ClangCl => Dialect::Cl,
+            ToolFamily::ClangCl | ToolFamily::Msvc => Dialect::Cl,
         }
     }
 
@@ -109,9 +113,12 @@ impl ToolFamily {
     /// `clang`/`clang++`/`clang-<n>` basename is `Clang`.
     /// `zigcc` wrappers (cargo-zigbuild) are also `Clang` — zig's cc is
     /// clang-based.
-    /// Everything else (gcc, cc, g++, c++) is `Gnu`. Bare `cl` is NOT
-    /// special-cased — real MSVC `cl.exe` stays out of scope.
+    /// Microsoft's `cl.exe` has its own family. Everything else (gcc, cc,
+    /// g++, c++) is `Gnu`.
     pub fn detect(program: &str, rest: &[String]) -> ToolFamily {
+        if msvc::is_driver(program) {
+            return ToolFamily::Msvc;
+        }
         let name = super::command_basename(program)
             .map(super::strip_windows_exe_suffix)
             .unwrap_or(program)
@@ -756,6 +763,15 @@ impl CcArgs {
     /// - **Assemble mode**: `-S` is still refused. `-E` to a named file
     ///   or to stdout is cached.
     pub fn refuse_reasons(&self, extra_allowlist_flags: &[String]) -> Vec<RefuseReason> {
+        if self.family == ToolFamily::Msvc {
+            return if msvc::admits(self) && !self.requires_compiler_output_semantics() {
+                Vec::new()
+            } else {
+                vec![RefuseReason::Unsupported(
+                    "unsupported native MSVC compile shape",
+                )]
+            };
+        }
         let mut reasons = Vec::new();
 
         // ── Non-`-c` mode refusals (short-circuit) ──
@@ -1099,13 +1115,16 @@ impl CcArgs {
     }
 
     /// The subset of `rest` that identifies the *compile configuration*
-    /// — per-translation-unit noise removed: source files, the `-o`
+    /// — per-translation-unit noise removed: source paths, the `-o`
     /// output path, and (under the Gnu dialect only) dependency-file
     /// flags (`-MF`/`-MT`/`-MQ`) with their values. Under the Cl dialect
     /// those `-M*` spellings are CRT selection (codegen), so they are
-    /// kept. The resolved-invocation probe (`cc -###`) is memoized on
-    /// this, so every TU of a build that shares a flag set reuses one
-    /// probe record instead of re-resolving per file.
+    /// kept. Each source is reduced to its suffix, in place
+    /// (`source_suffix_marker`), since the suffix picks the language the
+    /// driver compiles. The resolved-invocation probe (`cc -###`) is
+    /// memoized on this, so every TU of a build that shares a flag set
+    /// and a source suffix reuses one probe record instead of
+    /// re-resolving per file.
     pub fn config_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         let probe_args = self.probe_args();
@@ -1135,7 +1154,8 @@ impl CcArgs {
                 .iter()
                 .any(|s| s.to_str() == Some(arg.as_str()))
             {
-                // source file — per-TU
+                // source file: the path is per-TU, the suffix is not (#1981)
+                out.push(source_suffix_marker(arg));
             } else {
                 out.push(arg.clone());
             }
@@ -1175,6 +1195,23 @@ fn cc_terminal_diagnostic_flag(arg: &str) -> bool {
         arg,
         "-fcolor-diagnostics" | "-fno-color-diagnostics" | "-fansi-escape-codes"
     ) || arg.starts_with("-fdiagnostics-")
+}
+
+/// What [`CcArgs::config_args`] keeps of a source file: its suffix.
+///
+/// Without `-x`, the driver picks the input language from the suffix, so
+/// `cc -### -c t.S` and `cc -### -c t.c` resolve different `cc1` lines.
+/// Keying the probe record on the suffix gives each language its own
+/// record, and every TU of one language still shares one (#1981). The case
+/// is kept: `S` and `s` are different languages, and so are `C` and `c`.
+/// The NUL byte keeps the marker apart from every real argument, since argv
+/// cannot carry one.
+fn source_suffix_marker(source: &str) -> String {
+    let suffix = Path::new(source)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    format!("\0source-suffix={suffix}")
 }
 
 pub(crate) fn output_path_requires_compiler_semantics(path: &Path) -> bool {
@@ -1747,6 +1784,12 @@ const CC_ASSEMBLER_FILE_DIRECTIVES: [&str; 2] = [".incbin", ".include"];
 /// invoked as `emit incbin, payload.bin`, or `.inc\()bin` inside `.rept`).
 const CC_ASSEMBLER_MACRO_DIRECTIVES: [&str; 4] = [".macro", ".irp", ".irpc", ".rept"];
 
+/// The directives that close those bodies. Openers have more spellings than
+/// the list above: `.rep`, GNU's `.irep` and `.irepc`, and counts with no
+/// blank, as in `.rept(1)`. Neither clang nor GNU as assembles a body
+/// without its closing directive, and that has one spelling per kind.
+const CC_ASSEMBLER_BODY_ENDS: [&str; 3] = [".endr", ".endm", ".endmacro"];
+
 /// Why the assembler may read a file the key cannot see, if it may.
 ///
 /// `.incbin` and assembler `.include` run after preprocessing, so no depfile
@@ -1774,16 +1817,22 @@ fn cc_assembler_hidden_input(expansion: &[u8]) -> Option<&'static str> {
 ///
 /// Directives are matched ignoring case, as the assembler does, and must end
 /// at a word boundary. A file directive counts when the next non-blank byte
-/// opens its operand: a quote, or a backslash for an escaped quote in a C
-/// string or a macro argument. That keeps C++ member access such as
+/// opens its operand: a quote, a backslash for an escaped quote in a C
+/// string or a macro argument, or a slash for a comment the assembler skips
+/// (`.incbin/**/"f"`). That keeps C++ member access such as
 /// `opts.include(` out. A macro facility counts when a blank follows it;
-/// `.altmacro` and the `\()` separator count anywhere.
+/// `.altmacro` and the directives that close a body count anywhere.
+///
+/// `\()` joins pieces of a name only inside a body, so it does not count on
+/// its own, and libstdc++'s regex string `".[\\()*+?"` stays cacheable. A
+/// body's pieces may sit in different files, which the compile-first path
+/// scans one at a time, but its closing directive is spelled in one of them.
 fn cc_assembler_text_hidden_input(text: &[u8]) -> Option<&'static str> {
     let file = CC_ASSEMBLER_FILE_DIRECTIVES.into_iter().find(|directive| {
         cc_directive_operands(text, directive.as_bytes()).any(|rest| {
             rest.iter()
                 .find(|byte| !matches!(byte, b' ' | b'\t'))
-                .is_some_and(|byte| matches!(byte, b'"' | b'\\'))
+                .is_some_and(|byte| matches!(byte, b'"' | b'\\' | b'/'))
         })
     });
     file.or_else(|| {
@@ -1795,14 +1844,14 @@ fn cc_assembler_text_hidden_input(text: &[u8]) -> Option<&'static str> {
         })
     })
     .or_else(|| {
-        cc_directive_operands(text, b".altmacro")
-            .next()
-            .map(|_| ".altmacro")
-    })
-    .or_else(|| {
-        text.windows(3)
-            .any(|window| window == br"\()")
-            .then_some(r"\()")
+        [".altmacro"]
+            .into_iter()
+            .chain(CC_ASSEMBLER_BODY_ENDS)
+            .find(|directive| {
+                cc_directive_operands(text, directive.as_bytes())
+                    .next()
+                    .is_some()
+            })
     })
 }
 
@@ -4394,8 +4443,9 @@ fn cl_debug_present(parsed: &CcArgs) -> bool {
 /// token stream and MUST be kept out of the cache key.
 ///
 /// The resolved-invocation probe is memoized per *flag set* — `config_args`
-/// strips the source, `-o`/`-Fo` output, and dep-file values so ONE probe
-/// record serves every TU of a build. Absolute paths in the resolved tokens
+/// strips the source path (keeping only its suffix), `-o`/`-Fo` output, and
+/// dep-file values so ONE probe record serves every TU of a build that
+/// shares a source suffix. Absolute paths in the resolved tokens
 /// are already blanked to a sentinel ([`crate::probe`]), and the trailing
 /// source input token too — but a RELATIVE per-TU path that appears as a
 /// flag *value* (`-main-file-name u00.c`, `-o build/u00.o`) survives,
@@ -5691,6 +5741,18 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
 struct CcShadowingNames {
     names: std::collections::BTreeSet<PathBuf>,
     probes: Vec<CcProbedHeader>,
+    /// Each read input relative to every user directory above it: the
+    /// names an include through the search path can have used to reach it.
+    reached_as: std::collections::BTreeSet<PathBuf>,
+    /// A read header has an include whose name the scan cannot place.
+    unplaced: bool,
+    /// Read inputs that use `#include_next` or `__has_include_next`.
+    searches_next: Vec<PathBuf>,
+    /// A command-line definition names `__has_include_next`, for a use no
+    /// scan places.
+    definitions_search_next: bool,
+    /// The read inputs, absolute, for the slower operand check.
+    read_inputs: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -5700,11 +5762,68 @@ struct CcProbedHeader {
     candidates: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 fn cc_shadowing_names(
     parsed: &CcArgs,
     read_inputs: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingNames> {
+    cc_shadowing_names_reusing(parsed, read_inputs, file_hasher, None).map(|(names, _)| names)
+}
+
+/// What [`CcShadowingNames`] takes from the read headers' scans and the
+/// command-line definitions. It depends on their bytes and on no path, so a
+/// memo hit, which has proven every input's bytes, can reuse the one stored
+/// with the memo instead of loading every scan again.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CcShadowingDerivation {
+    /// [`cc_shadowing_derivation_digest`] of what this was derived from.
+    inputs: String,
+    /// Resolved probes by content hash. Contents without probes are absent.
+    probes: std::collections::BTreeMap<String, Vec<CcHeaderProbe>>,
+    /// Probes in the command-line definitions.
+    arguments: Vec<CcHeaderProbe>,
+    /// Contents using `#include_next` or `__has_include_next`.
+    searches_next: std::collections::BTreeSet<String>,
+    /// Contents with an include operand the scan cannot place.
+    unplaced: std::collections::BTreeSet<String>,
+    /// The command-line definitions use `__has_include_next`.
+    arguments_search_next: bool,
+}
+
+/// Bump when alias, paste or probe resolution changes what a scan derives.
+/// The release version is folded in as well.
+const CC_SHADOWING_DERIVATION: &[u8] = b"cc-shadowing-derivation-v2";
+
+/// Identity of a derivation's inputs. Sorted, because aliases, the paste
+/// check and each header's probes depend on which bytes were read, not on
+/// the order they were listed in.
+fn cc_shadowing_derivation_digest(contents: &[String], definitions: &str) -> String {
+    let mut sorted = contents.iter().map(String::as_str).collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    fold_cc_memo_field(&mut hasher, b"schema", CC_SHADOWING_DERIVATION);
+    fold_cc_memo_field(&mut hasher, b"kache", crate::version::VERSION.as_bytes());
+    fold_cc_memo_field(
+        &mut hasher,
+        b"scan-version",
+        &CC_HEADER_SCAN_VERSION.to_le_bytes(),
+    );
+    for content in sorted {
+        fold_cc_memo_field(&mut hasher, b"content", content.as_bytes());
+    }
+    fold_cc_memo_field(&mut hasher, b"definitions", definitions.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// [`cc_shadowing_names`], reusing `stored` when it was derived from exactly
+/// these inputs. Returns a new derivation to store when it computed one.
+fn cc_shadowing_names_reusing(
+    parsed: &CcArgs,
+    read_inputs: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    stored: Option<&str>,
+) -> Result<(CcShadowingNames, Option<String>)> {
     let cwd = parsed
         .invocation_env
         .cwd()
@@ -5737,42 +5856,46 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = file_hasher.cc_header_scans(&read_inputs, 6, &|path| {
-        let bytes = fs::read(path)
-            .with_context(|| format!("reading header availability input {}", path.display()))?;
-        let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
-        Ok((
-            blake3::hash(&bytes).to_hex().to_string(),
-            serde_json::to_string(&probes)?,
-        ))
-    })?;
-    let scans = scans
-        .iter()
-        .map(|scan| serde_json::from_str::<Option<CcHeaderProbeScan>>(scan))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     let definitions = parsed
         .defines
         .iter()
         .map(|(name, value)| format!("#define {name} {}\n", value.as_deref().unwrap_or("1")))
         .collect::<String>();
-    let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
-        .context("cc: unresolved header availability probe in command-line definitions")?;
-    let all_scans = || {
-        scans
-            .iter()
-            .flatten()
-            .chain(std::iter::once(&argument_scan))
+    let contents = file_hasher.cc_input_contents(&read_inputs)?;
+    let digest = cc_shadowing_derivation_digest(&contents, &definitions);
+    let reused = stored
+        .and_then(|stored| serde_json::from_str::<CcShadowingDerivation>(stored).ok())
+        .filter(|derivation| derivation.inputs == digest);
+    let (derivation, fresh) = match reused {
+        Some(derivation) => (derivation, false),
+        None => (
+            cc_derive_shadowing(
+                &read_inputs,
+                &cc_absolute_sources(parsed, cwd),
+                &contents,
+                &definitions,
+                digest,
+                file_hasher,
+            )?,
+            true,
+        ),
     };
-    let aliases = cc_header_probe_aliases(all_scans());
-    anyhow::ensure!(
-        cc_header_probe_pastes_are_resolved(all_scans(), &aliases)?,
-        "cc: token pasting may construct a header availability probe"
-    );
-    let argument_probes = cc_resolve_header_probes(&argument_scan, &aliases)
-        .context("cc: unresolved header availability probe in command-line definitions")?;
-    let mut result = CcShadowingNames::default();
-    for (input, scan) in read_inputs.iter().zip(scans) {
-        let absolute = absolutize_path(cwd, input);
+    let mut result = CcShadowingNames {
+        definitions_search_next: derivation.arguments_search_next,
+        ..CcShadowingNames::default()
+    };
+    for (absolute, content) in read_inputs.iter().zip(&contents) {
+        for dir in &dirs {
+            if let Ok(relative) = absolute.strip_prefix(dir) {
+                result.reached_as.insert(relative.to_path_buf());
+            }
+        }
+        if derivation.unplaced.contains(content) {
+            result.unplaced = true;
+        }
+        if derivation.searches_next.contains(content) {
+            result.searches_next.push(absolute.clone());
+        }
         // Keep the ordinary shadowing names as before: the most specific
         // relative path and the basename can both be used by an include.
         if let Some(relative) = dirs
@@ -5785,15 +5908,11 @@ fn cc_shadowing_names(
         if let Some(file_name) = absolute.file_name() {
             result.names.insert(PathBuf::from(file_name));
         }
-        let probes = scan.and_then(|scan| cc_resolve_header_probes(&scan, &aliases));
-        let Some(probes) = probes else {
-            anyhow::bail!(
-                "cc: a header availability probe (__has_include) in {} cannot be resolved \
-                 from literal source text",
-                input.display()
-            );
-        };
-        for probe in probes.iter().chain(&argument_probes) {
+        let probes = derivation
+            .probes
+            .get(content)
+            .map_or(&[][..], Vec::as_slice);
+        for probe in probes.iter().chain(&derivation.arguments) {
             let mut candidates = Vec::new();
             if probe.quoted
                 && let Some(parent) = absolute.parent()
@@ -5807,7 +5926,459 @@ fn cc_shadowing_names(
             });
         }
     }
-    Ok(result)
+    result.read_inputs = read_inputs;
+    let fresh = fresh
+        .then(|| serde_json::to_string(&derivation))
+        .transpose()?;
+    Ok((result, fresh))
+}
+
+/// Derive from the scans of `read_inputs`, whose content hashes are
+/// `contents`.
+fn cc_derive_shadowing(
+    read_inputs: &[PathBuf],
+    sources: &[PathBuf],
+    contents: &[String],
+    definitions: &str,
+    digest: String,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<CcShadowingDerivation> {
+    let mut scans = cc_parsed_header_scans(read_inputs, sources, file_hasher)?;
+    let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
+        .context("cc: unresolved header availability probe in command-line definitions")?;
+    // The scans must describe the bytes the digest names.
+    let ensure_scans_describe = |scans: &[(String, CcParsedScan)]| {
+        anyhow::ensure!(
+            scans.len() == contents.len()
+                && scans
+                    .iter()
+                    .zip(contents)
+                    .all(|((scanned, _), content)| scanned == content),
+            "cc: a header changed while its probes were derived"
+        );
+        Ok(())
+    };
+    ensure_scans_describe(&scans)?;
+    let trace_pastes = crate::phase_trace::phase("cc_shadow_pastes");
+    let reached = match cc_reached_macro_uses(&scans, &argument_scan, file_hasher)? {
+        Ok(reached) => reached,
+        // Rare: start the shared scans over and read these from the store,
+        // or scan them again.
+        Err(_) => {
+            let dropped = std::mem::take(&mut *cc_parsed_scans());
+            drop(dropped);
+            scans = cc_parsed_header_scans(read_inputs, sources, file_hasher)?;
+            ensure_scans_describe(&scans)?;
+            cc_reached_macro_uses(&scans, &argument_scan, file_hasher)??
+        }
+    };
+    let all_scans = || {
+        scans
+            .iter()
+            .filter_map(|(_, scan)| scan.as_ref().as_ref())
+            .chain(std::iter::once(&argument_scan))
+    };
+    let aliases = cc_header_probe_aliases(all_scans());
+    let macro_uses = cc_macro_uses_in_order(&scans, &argument_scan, &reached);
+    anyhow::ensure!(
+        cc_header_probe_pastes_are_resolved(all_scans(), &macro_uses, &aliases)?,
+        "cc: token pasting may construct a header availability probe"
+    );
+    drop(trace_pastes);
+    let arguments = cc_resolve_header_probes(&argument_scan, &aliases)
+        .context("cc: unresolved header availability probe in command-line definitions")?;
+    let mut probes = std::collections::BTreeMap::new();
+    let mut searches_next = std::collections::BTreeSet::new();
+    let mut unplaced = std::collections::BTreeSet::new();
+    for (content, scan) in &scans {
+        if let Some(scan) = scan.as_ref().as_ref() {
+            if scan.searches_next {
+                searches_next.insert(content.clone());
+            }
+            if scan.unplaced_include {
+                unplaced.insert(content.clone());
+            }
+        }
+    }
+    for (input, (content, scan)) in read_inputs.iter().zip(&scans) {
+        let resolved = scan
+            .as_ref()
+            .as_ref()
+            .and_then(|scan| cc_resolve_header_probes(scan, &aliases));
+        let Some(resolved) = resolved else {
+            anyhow::bail!(
+                "cc: a header availability probe (__has_include) in {} cannot be resolved \
+                 from literal source text",
+                input.display()
+            );
+        };
+        if !resolved.is_empty() {
+            probes.insert(content.clone(), resolved);
+        }
+    }
+    Ok(CcShadowingDerivation {
+        inputs: digest,
+        probes,
+        arguments,
+        searches_next,
+        unplaced,
+        arguments_search_next: argument_scan.searches_next,
+    })
+}
+
+/// A stored macro definition: formals, then the uses in its body.
+type CcStoredMacroBody = (Vec<String>, Vec<CcHeaderMacroUse>);
+
+/// The stored macro definitions the paste proof can look up, by content and
+/// name. The proof reads a definition only for a name it meets in a
+/// conditional, or in the body of a definition it read, either as the name
+/// of a use or as a token of its arguments; so starting from every
+/// conditional and following those names finds all it can need. Definitions
+/// held in hand (fresh scans, the command line) are followed too, as they
+/// can name a stored macro.
+fn cc_reached_macro_uses(
+    scans: &[(String, CcParsedScan)],
+    argument_scan: &CcHeaderProbeScan,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<std::result::Result<CcReachedMacros, CcMacrosMissing>> {
+    let mut reached = std::collections::HashMap::new();
+    let held = || {
+        scans
+            .iter()
+            .filter_map(|(_, scan)| scan.as_ref().as_ref())
+            .chain(std::iter::once(argument_scan))
+    };
+    let mut apart: Vec<&str> = scans
+        .iter()
+        .filter(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart))
+        .map(|(content, _)| content.as_str())
+        .collect();
+    apart.sort_unstable();
+    apart.dedup();
+    if apart.is_empty() {
+        return Ok(Ok(reached));
+    }
+    let mut inline = std::collections::HashMap::<&str, Vec<&[CcHeaderMacroUse]>>::new();
+    for (name, _, uses) in held().flat_map(|scan| &scan.macro_uses) {
+        inline.entry(name).or_default().push(uses);
+    }
+    fn names_in<'u>(used: &'u CcHeaderMacroUse, into: &mut Vec<&'u str>) {
+        into.push(&used.name);
+        for argument in used.arguments.iter().flatten() {
+            into.extend(argument.iter().map(String::as_str));
+        }
+    }
+    let mut seen = HashSet::<String>::new();
+    let mut frontier = Vec::new();
+    for used in held().flat_map(|scan| &scan.conditionals) {
+        names_in(used, &mut frontier);
+    }
+    let mut frontier: Vec<String> = frontier.into_iter().map(str::to_owned).collect();
+    while !frontier.is_empty() {
+        frontier.retain(|name| seen.insert(name.clone()));
+        if frontier.is_empty() {
+            break;
+        }
+        let mut names: Vec<&str> = frontier.iter().map(String::as_str).collect();
+        names.push(CC_MACROS_PRESENT);
+        let rows = file_hasher.cc_header_macros(CC_HEADER_SCAN_VERSION, &apart, &names)?;
+        names.pop();
+        // Rows of one content come and go together, so a round that sees
+        // the marker saw every definition it asked for.
+        let present: HashSet<&str> = rows
+            .iter()
+            .filter(|(_, name, _)| name == CC_MACROS_PRESENT)
+            .map(|(content, _, _)| content.as_str())
+            .collect();
+        let missing: Vec<String> = apart
+            .iter()
+            .filter(|content| !present.contains(*content))
+            .map(|content| (*content).to_owned())
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Err(CcMacrosMissing(missing)));
+        }
+        let mut next = Vec::new();
+        for name in &names {
+            for uses in inline.get(name).into_iter().flatten() {
+                for used in *uses {
+                    names_in(used, &mut next);
+                }
+            }
+        }
+        let mut next: Vec<String> = next.into_iter().map(str::to_owned).collect();
+        for (content, name, bodies) in rows {
+            if name == CC_MACROS_PRESENT {
+                continue;
+            }
+            let bodies: Vec<CcStoredMacroBody> = serde_json::from_str(&bodies)?;
+            let mut found = Vec::new();
+            for (_, uses) in &bodies {
+                for used in uses {
+                    names_in(used, &mut found);
+                }
+            }
+            next.extend(found.into_iter().map(str::to_owned));
+            reached.insert((content, name), bodies);
+        }
+        frontier = next;
+    }
+    Ok(Ok(reached))
+}
+
+/// Stored definitions by content and name.
+type CcReachedMacros = std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>;
+
+/// Every macro definition the paste proof sees, in the order of the inputs
+/// that hold them, then the command line: in-hand definitions as scanned,
+/// stored ones as `reached` found them.
+fn cc_macro_uses_in_order<'a>(
+    scans: &'a [(String, CcParsedScan)],
+    argument_scan: &'a CcHeaderProbeScan,
+    reached: &'a CcReachedMacros,
+) -> Vec<CcMacroDefinition<'a>> {
+    let mut by_content =
+        std::collections::HashMap::<&str, Vec<(&str, &[CcStoredMacroBody])>>::new();
+    for ((content, name), bodies) in reached {
+        by_content.entry(content).or_default().push((name, bodies));
+    }
+    for names in by_content.values_mut() {
+        names.sort_unstable_by_key(|(name, _)| *name);
+    }
+    let mut macro_uses = Vec::new();
+    for (content, scan) in scans {
+        let Some(scan) = scan.as_ref().as_ref() else {
+            continue;
+        };
+        if !scan.macros_apart {
+            macro_uses.extend(cc_inline_macro_uses(std::iter::once(scan)));
+            continue;
+        }
+        for (name, bodies) in by_content.get(content.as_str()).into_iter().flatten() {
+            for (parameters, uses) in *bodies {
+                macro_uses.push((*name, parameters.as_slice(), uses.as_slice()));
+            }
+        }
+    }
+    macro_uses.extend(cc_inline_macro_uses(std::iter::once(argument_scan)));
+    macro_uses
+}
+
+/// One header's probe scan, or `None` for text the scanner cannot resolve.
+type CcParsedScan = std::sync::Arc<Option<CcHeaderProbeScan>>;
+
+/// Parsed scans by content hash, shared by every unit this process keys. A
+/// scan depends only on the bytes, so an entry never goes stale. Headers
+/// recur across a build's units, and loading and parsing their scans again
+/// for each unit was a large part of a warm C++ hit.
+#[derive(Default)]
+struct CcParsedScans {
+    scans: foldhash::HashMap<String, CcParsedScan>,
+    /// Estimated memory of the held scans, from their serialized size.
+    weight: usize,
+}
+
+/// 7: repeated uses without a probe, and repeated conditionals, are kept once.
+/// 8: macro definitions are stored apart, by name.
+/// 9: include operands and the includes the search order can redirect.
+const CC_HEADER_SCAN_VERSION: i64 = 9;
+const CC_PARSED_SCANS_WEIGHT: usize = 64 << 20;
+static CC_PARSED_SCANS: std::sync::LazyLock<std::sync::Mutex<CcParsedScans>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn cc_parsed_scans() -> std::sync::MutexGuard<'static, CcParsedScans> {
+    CC_PARSED_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The unit's own sources, as absolute paths.
+fn cc_absolute_sources(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
+    parsed
+        .sources
+        .iter()
+        .map(|source| absolutize_path(cwd, source))
+        .collect()
+}
+
+/// The content hash and probe scan of each read input, in order. Scans of
+/// `sources` are not stored.
+fn cc_parsed_header_scans(
+    read_inputs: &[PathBuf],
+    sources: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<Vec<(String, CcParsedScan)>> {
+    let mut held = foldhash::HashMap::<String, CcParsedScan>::default();
+    // Scans made here keep their macro definitions in hand; the store gets
+    // them apart, by name.
+    // Each with the stored size of its definitions, for the cache weight.
+    let fresh =
+        std::cell::RefCell::new(foldhash::HashMap::<String, (CcParsedScan, usize)>::default());
+    let fetched = file_hasher.cc_header_scans_except(
+        read_inputs,
+        CC_HEADER_SCAN_VERSION,
+        &mut |content| {
+            if held.contains_key(content) {
+                return true;
+            }
+            let Some(scan) = cc_parsed_scans().scans.get(content).cloned() else {
+                return false;
+            };
+            held.insert(content.to_owned(), scan);
+            true
+        },
+        &|path| {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading header availability input {}", path.display()))?;
+            let content = blake3::hash(&bytes).to_hex().to_string();
+            let scan = cc_header_probe_scan(&cc_splice_lines(&bytes));
+            let (core, macros) = cc_stored_header_scan(scan.as_ref())?;
+            let defined = cc_stored_macros_len(&macros);
+            fresh
+                .borrow_mut()
+                .insert(content.clone(), (CcParsedScan::new(scan), defined));
+            Ok((content, core, macros))
+        },
+        &|path| sources.iter().any(|source| source == path),
+    )?;
+    let fresh = fresh.into_inner();
+    let mut learned = Vec::new();
+    let mut scans = Vec::with_capacity(fetched.len());
+    for (content, json) in fetched {
+        let scan = match held.get(&content) {
+            Some(scan) => scan.clone(),
+            None => {
+                let json = json.context("cc: a held header scan went missing")?;
+                let (scan, defined) = match fresh.get(&content) {
+                    Some((scan, defined)) => (scan.clone(), *defined),
+                    None => (CcParsedScan::new(serde_json::from_str(&json)?), 0),
+                };
+                held.insert(content.clone(), scan.clone());
+                let weight = cc_parsed_scan_weight(&content, &json, defined);
+                learned.push((content.clone(), scan.clone(), weight));
+                scan
+            }
+        };
+        scans.push((content, scan));
+    }
+    // Full maps are dropped after the lock is released.
+    let mut evicted = Vec::new();
+    if !learned.is_empty() {
+        let mut shared = cc_parsed_scans();
+        for (content, scan, weight) in learned {
+            evicted.extend(shared.admit(content, scan, weight, CC_PARSED_SCANS_WEIGHT));
+        }
+    }
+    drop(evicted);
+    Ok(scans)
+}
+
+/// A scan as stored: the scan without its macro definitions, marked as
+/// keeping them apart, and the definitions grouped by name in source order.
+/// A header that defines thousands of macros (a symbol prefix table) would
+/// otherwise be loaded whole by every unit that includes it.
+fn cc_stored_header_scan(
+    scan: Option<&CcHeaderProbeScan>,
+) -> Result<(String, Vec<(String, String)>)> {
+    let Some(scan) = scan else {
+        return Ok((
+            serde_json::to_string(&None::<CcHeaderProbeScan>)?,
+            Vec::new(),
+        ));
+    };
+    let mut by_name = std::collections::BTreeMap::<&str, Vec<_>>::new();
+    for (name, parameters, uses) in &scan.macro_uses {
+        by_name.entry(name).or_default().push((parameters, uses));
+    }
+    let mut macros = by_name
+        .into_iter()
+        .map(|(name, bodies)| Ok((name.to_owned(), serde_json::to_string(&bodies)?)))
+        .collect::<Result<Vec<_>>>()?;
+    // Written and removed with the definitions: a reader that finds it has
+    // them all, and one that does not knows they are gone.
+    macros.push((CC_MACROS_PRESENT.to_owned(), "[]".to_owned()));
+    let core = CcHeaderProbeScanCore {
+        macros_apart: true,
+        aliases: &scan.aliases,
+        uses: &scan.uses,
+        conditionals: &scan.conditionals,
+        pastes: &scan.pastes,
+        paste_forwarders: &scan.paste_forwarders,
+        includes: &scan.includes,
+        searches_next: scan.searches_next,
+        unplaced_include: scan.unplaced_include,
+    };
+    Ok((serde_json::to_string(&Some(core))?, macros))
+}
+
+/// A row no identifier can name, stored with every scan's definitions.
+const CC_MACROS_PRESENT: &str = "";
+
+/// Stored definitions a cached core relied on are gone (pruned, or a core
+/// from another store): reload those scans, or rescan them.
+#[derive(Debug)]
+struct CcMacrosMissing(Vec<String>);
+
+impl std::fmt::Display for CcMacrosMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cc: stored macro definitions of {} header scans are missing",
+            self.0.len()
+        )
+    }
+}
+
+impl std::error::Error for CcMacrosMissing {}
+
+/// The stored form of [`CcHeaderProbeScan`], which reads it back with no
+/// macro definitions and `macros_apart` set.
+#[derive(serde::Serialize)]
+struct CcHeaderProbeScanCore<'a> {
+    macros_apart: bool,
+    aliases: &'a [(String, String)],
+    uses: &'a [(String, Option<CcHeaderProbe>)],
+    conditionals: &'a [CcHeaderMacroUse],
+    pastes: &'a [(String, String)],
+    paste_forwarders: &'a [CcHeaderPasteForwarder],
+    includes: &'a [(String, bool)],
+    searches_next: bool,
+    unplaced_include: bool,
+}
+
+/// Estimated memory of one held scan: parsed vectors and the key cost more
+/// than the serialized text.
+fn cc_parsed_scan_weight(content: &str, json: &str, defined: usize) -> usize {
+    content.len() + 2 * (json.len() + defined) + 128
+}
+
+/// The stored size of a scan's definitions, which a fresh scan holds in
+/// hand on top of its stored core.
+fn cc_stored_macros_len(macros: &[(String, String)]) -> usize {
+    macros
+        .iter()
+        .map(|(name, bodies)| name.len() + bodies.len())
+        .sum()
+}
+
+impl CcParsedScans {
+    /// Hold `scan` within `limit`, starting over when it would not fit.
+    /// Returns the map that made room, for the caller to drop.
+    fn admit(
+        &mut self,
+        content: String,
+        scan: CcParsedScan,
+        weight: usize,
+        limit: usize,
+    ) -> Option<Self> {
+        if weight > limit || self.scans.contains_key(&content) {
+            return None;
+        }
+        let evicted = (self.weight + weight > limit).then(|| std::mem::take(self));
+        self.scans.insert(content, scan);
+        self.weight += weight;
+        evicted
+    }
 }
 
 /// A header name an availability probe tests for.
@@ -5825,12 +6396,29 @@ struct CcHeaderProbe {
 /// every possible literal probe participates in the availability guard.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct CcHeaderProbeScan {
+    /// Read from the store: `macro_uses` is empty and the definitions are
+    /// loaded by name ([`cc_reached_macro_uses`]).
+    #[serde(default)]
+    macros_apart: bool,
     aliases: Vec<(String, String)>,
     uses: Vec<(String, Option<CcHeaderProbe>)>,
+    #[serde(default)]
     macro_uses: Vec<(String, Vec<String>, Vec<CcHeaderMacroUse>)>,
     conditionals: Vec<CcHeaderMacroUse>,
     pastes: Vec<(String, String)>,
     paste_forwarders: Vec<CcHeaderPasteForwarder>,
+    /// Literal `#include`/`#import` operands: the name and whether a lookup
+    /// starts beside the includer (quoted, and not `_next`).
+    #[serde(default)]
+    includes: Vec<(String, bool)>,
+    /// `#include_next` or `__has_include_next`: resolution continues after
+    /// the directory the header was found in.
+    #[serde(default)]
+    searches_next: bool,
+    /// An include whose name the scan cannot place: a computed operand, or
+    /// one with a `..` component.
+    #[serde(default)]
+    unplaced_include: bool,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -5877,16 +6465,20 @@ fn cc_resolve_header_probes(
 }
 
 /// A macro can manufacture an operator or alias with `##`. Refuse when a
-/// conditional can reach such a constructor. Fixed pasted prefixes, such as
-/// glibc's `__GLIBC_USE_ ## feature`, cannot spell unrelated probe aliases.
+/// conditional can reach such a constructor and the operands visible there
+/// can spell a probe alias, or are not literals the scanner can see. Fixed
+/// pasted prefixes, such as glibc's `__GLIBC_USE_ ## feature`, cannot spell
+/// unrelated probe aliases. An indirect paste of two literals, such as
+/// `CAT(1, 0)` through `CAT_`, is held to that same proof.
 fn cc_header_probe_pastes_are_resolved<'a>(
     scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+    macro_uses: &[CcMacroDefinition<'a>],
     aliases: &HashSet<String>,
 ) -> Result<bool> {
     let scans = scans.collect::<Vec<_>>();
     let mut definitions = std::collections::HashMap::<&str, usize>::new();
     let mut forwarders = std::collections::HashMap::<&str, Vec<&CcHeaderPasteForwarder>>::new();
-    for (name, _, _) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+    for &(name, _, _) in macro_uses {
         *definitions.entry(name).or_default() += 1;
     }
     for forwarder in scans.iter().flat_map(|scan| &scan.paste_forwarders) {
@@ -5895,18 +6487,69 @@ fn cc_header_probe_pastes_are_resolved<'a>(
             .or_default()
             .push(forwarder);
     }
+    let mut macro_bodies = std::collections::HashMap::<&str, CcPasteMacroBodies>::new();
+    for &(name, parameters, uses) in macro_uses {
+        macro_bodies
+            .entry(name)
+            .or_default()
+            .push((parameters, uses));
+    }
+    let mut paste_patterns = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
+        paste_patterns
+            .entry(name.as_str())
+            .or_default()
+            .push(pattern.as_str());
+    }
+    let forwarding = CcPasteForwarding {
+        macros: &macro_bodies,
+        pastes: &paste_patterns,
+        verdicts: Default::default(),
+    };
+    // Only a macro a conditional can reach through bodies can carry a
+    // constructor to it. A header that defines thousands of macros nothing
+    // tests (a symbol prefix table) is then never examined.
+    let mut reachable = HashSet::<&str>::new();
+    let mut pending: Vec<&str> = scans
+        .iter()
+        .flat_map(|scan| &scan.conditionals)
+        .map(|used| used.name.as_str())
+        .collect();
+    while let Some(name) = pending.pop() {
+        if reachable.insert(name)
+            && let Some(bodies) = macro_bodies.get(name)
+        {
+            pending.extend(
+                bodies
+                    .iter()
+                    .flat_map(|(_, uses)| uses.iter())
+                    .map(|used| used.name.as_str()),
+            );
+        }
+    }
+    let mut visiting = HashSet::new();
     let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
-    for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+    for &(name, parameters, uses) in macro_uses {
+        if !reachable.contains(name) {
+            continue;
+        }
         for used in uses {
-            if cc_paste_use_can_name_probe(used, parameters, &definitions, &forwarders, aliases)? {
+            if cc_paste_use_can_name_probe(
+                used,
+                parameters,
+                &definitions,
+                &forwarders,
+                aliases,
+                &forwarding,
+                &mut visiting,
+            )? {
                 edges.entry(&used.name).or_default().push(name);
             }
         }
     }
     let mut pending = Vec::new();
     for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
-        let pattern = regex::Regex::new(pattern)?;
-        if aliases.iter().any(|alias| pattern.is_match(alias)) {
+        if reachable.contains(name.as_str()) && forwarding.spells_alias(pattern, aliases)? {
             pending.push(name.as_str());
         }
     }
@@ -5920,7 +6563,15 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     }
     for used in scans.iter().flat_map(|scan| &scan.conditionals) {
         if constructors.contains(used.name.as_str())
-            && cc_paste_use_can_name_probe(used, &[], &definitions, &forwarders, aliases)?
+            && cc_paste_use_can_name_probe(
+                used,
+                &[],
+                &definitions,
+                &forwarders,
+                aliases,
+                &forwarding,
+                &mut visiting,
+            )?
         {
             return Ok(false);
         }
@@ -5928,18 +6579,124 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     Ok(true)
 }
 
+/// One macro definition: its name, formals, and the uses in its body.
+type CcMacroDefinition<'a> = (&'a str, &'a [String], &'a [CcHeaderMacroUse]);
+
+/// The macro definitions a scan holds in hand.
+fn cc_inline_macro_uses<'a>(
+    scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+) -> Vec<CcMacroDefinition<'a>> {
+    scans
+        .flat_map(|scan| &scan.macro_uses)
+        .map(|(name, parameters, uses)| (name.as_str(), parameters.as_slice(), uses.as_slice()))
+        .collect()
+}
+
+/// Every definition of one macro: formals, then the uses in that body.
+type CcPasteMacroBodies<'a> = Vec<(&'a [String], &'a [CcHeaderMacroUse])>;
+
+/// Bodies and paste patterns reachable while binding a forwarding macro.
+struct CcPasteForwarding<'a> {
+    macros: &'a std::collections::HashMap<&'a str, CcPasteMacroBodies<'a>>,
+    pastes: &'a std::collections::HashMap<&'a str, Vec<&'a str>>,
+    /// Whether each paste pattern can spell an alias. The same patterns are
+    /// reached from many uses, and compiling them again dominated a C++ hit.
+    verdicts: std::cell::RefCell<foldhash::HashMap<String, bool>>,
+}
+
+impl CcPasteForwarding<'_> {
+    fn spells_alias(&self, pattern: &str, aliases: &HashSet<String>) -> Result<bool> {
+        if let Some(verdict) = self.verdicts.borrow().get(pattern) {
+            return Ok(*verdict);
+        }
+        // `.` does not match a newline; an identifier never holds one.
+        let wildcards = cc_paste_wildcards(pattern)
+            .filter(|_| !aliases.iter().any(|alias| alias.contains('\n')));
+        let verdict = match wildcards {
+            Some(pieces) => aliases
+                .iter()
+                .any(|alias| cc_paste_wildcards_match(&pieces, alias)),
+            None => {
+                let regex = regex::Regex::new(pattern)?;
+                aliases.iter().any(|alias| regex.is_match(alias))
+            }
+        };
+        self.verdicts
+            .borrow_mut()
+            .insert(pattern.to_owned(), verdict);
+        Ok(verdict)
+    }
+}
+
+/// The literal pieces between `.*` wildcards of an anchored paste pattern,
+/// the only shape the scanner builds. `None` sends anything else to `regex`.
+fn cc_paste_wildcards(pattern: &str) -> Option<Vec<String>> {
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let mut pieces = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Exactly what `regex::escape` emits; other escapes have meaning.
+            '\\' => match chars.next() {
+                Some(escaped) if "\\.+*?()|[]{}^$#&-~".contains(escaped) => {
+                    pieces.last_mut()?.push(escaped);
+                }
+                _ => return None,
+            },
+            '.' => {
+                if chars.next() != Some('*') {
+                    return None;
+                }
+                pieces.push(String::new());
+            }
+            '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => return None,
+            c => pieces.last_mut()?.push(c),
+        }
+    }
+    Some(pieces)
+}
+
+/// Whether `text` matches the pieces, with any text between neighbours.
+fn cc_paste_wildcards_match(pieces: &[String], text: &str) -> bool {
+    let [first, middle @ .., last] = pieces else {
+        return pieces.first().is_some_and(|only| only == text);
+    };
+    let Some(mut rest) = text.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    for piece in middle {
+        match rest.find(piece.as_str()) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last.as_str())
+}
+
 /// Bind literal arguments to a pure concatenation helper. Caller parameters
 /// and macros that may expand stay unknown; every alternative definition
-/// must support the same proof before an edge can be discarded.
+/// must support the same proof before an edge can be discarded. A macro
+/// that only forwards its arguments is followed until that helper, so a
+/// paste of literals the scanner can see is not refused wholesale.
 fn cc_paste_use_can_name_probe(
     used: &CcHeaderMacroUse,
     parameters: &[String],
     definitions: &std::collections::HashMap<&str, usize>,
     forwarders: &std::collections::HashMap<&str, Vec<&CcHeaderPasteForwarder>>,
     aliases: &HashSet<String>,
+    forwarding: &CcPasteForwarding<'_>,
+    visiting: &mut HashSet<String>,
 ) -> Result<bool> {
     let Some(candidates) = forwarders.get(used.name.as_str()) else {
-        return Ok(true);
+        return cc_indirect_paste_can_name_probe(
+            used,
+            parameters,
+            definitions,
+            forwarders,
+            aliases,
+            forwarding,
+            visiting,
+        );
     };
     // An alternative definition may construct a name by another route.
     if definitions.get(used.name.as_str()) != Some(&candidates.len()) {
@@ -5973,12 +6730,97 @@ fn cc_paste_use_can_name_probe(
             }
         }
         pattern.push('$');
-        let pattern = regex::Regex::new(&pattern)?;
-        if aliases.iter().any(|alias| pattern.is_match(alias)) {
+        if forwarding.spells_alias(&pattern, aliases)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// A use that is not itself `##`. Follow macros that pass their arguments
+/// on, and refuse when a reachable paste can spell a probe alias or its
+/// operands are not single literals visible here.
+fn cc_indirect_paste_can_name_probe(
+    used: &CcHeaderMacroUse,
+    parameters: &[String],
+    definitions: &std::collections::HashMap<&str, usize>,
+    forwarders: &std::collections::HashMap<&str, Vec<&CcHeaderPasteForwarder>>,
+    aliases: &HashSet<String>,
+    forwarding: &CcPasteForwarding<'_>,
+    visiting: &mut HashSet<String>,
+) -> Result<bool> {
+    if let Some(patterns) = forwarding.pastes.get(used.name.as_str()) {
+        for pattern in patterns {
+            if forwarding.spells_alias(pattern, aliases)? {
+                return Ok(true);
+            }
+        }
+    }
+    let Some(bodies) = forwarding.macros.get(used.name.as_str()) else {
+        return Ok(true);
+    };
+    let Some(actuals) = &used.arguments else {
+        return Ok(true);
+    };
+    if !visiting.insert(used.name.clone()) {
+        return Ok(true);
+    }
+    let mut names_probe = false;
+    for &(formals, uses) in bodies {
+        if formals.len() != actuals.len() {
+            names_probe = true;
+            break;
+        }
+        for body_use in uses {
+            let bound = cc_bind_paste_arguments(body_use, formals, actuals);
+            if cc_paste_use_can_name_probe(
+                &bound,
+                parameters,
+                definitions,
+                forwarders,
+                aliases,
+                forwarding,
+                visiting,
+            )? {
+                names_probe = true;
+                break;
+            }
+        }
+        if names_probe {
+            break;
+        }
+    }
+    visiting.remove(used.name.as_str());
+    Ok(names_probe)
+}
+
+/// Replace each argument that is one formal with the actual tokens from
+/// this invocation. Anything else stays as written, so the paste proof
+/// still treats it as unknown.
+fn cc_bind_paste_arguments(
+    used: &CcHeaderMacroUse,
+    formals: &[String],
+    actuals: &[Vec<String>],
+) -> CcHeaderMacroUse {
+    let arguments = used.arguments.as_ref().map(|arguments| {
+        arguments
+            .iter()
+            .map(|argument| match argument.as_slice() {
+                [token] => {
+                    if let Some(index) = formals.iter().position(|formal| formal == token) {
+                        actuals[index].clone()
+                    } else {
+                        argument.clone()
+                    }
+                }
+                _ => argument.clone(),
+            })
+            .collect()
+    });
+    CcHeaderMacroUse {
+        name: used.name.clone(),
+        arguments,
+    }
 }
 
 /// `bytes` with every backslash-newline removed, the line splice the
@@ -6008,7 +6850,8 @@ fn cc_splice_lines(bytes: &[u8]) -> Vec<u8> {
 fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
     let scan = cc_header_probe_scan(text)?;
     let aliases = cc_header_probe_aliases(std::iter::once(&scan));
-    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &aliases)
+    let macro_uses = cc_inline_macro_uses(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &macro_uses, &aliases)
         .ok()?
         .then(|| cc_resolve_header_probes(&scan, &aliases))?
 }
@@ -6058,7 +6901,38 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
         scanned_to = end;
     }
     cc_scan_header_probe_line(text, &line, &mut scan)?;
+    // A use without a probe matters only by its name: should the name prove
+    // to be an alias, one such use already leaves the header unresolved.
+    // Keep the first of each, and every use with a probe, in order, so the
+    // probes a unit resolves are unchanged. A symbol-prefix header repeats
+    // the same few names thousands of times. Conditionals are only asked
+    // whether any can construct a probe.
+    let mut bare = HashSet::new();
+    scan.uses
+        .retain(|(name, probe)| probe.is_some() || bare.insert(name.clone()));
+    scan.conditionals.sort();
+    scan.conditionals.dedup();
+    scan.includes.sort();
+    scan.includes.dedup();
     Some(scan)
+}
+
+/// The name and quoting of a literal include operand, from the directive's
+/// text after `include`. `None` for a computed operand.
+fn cc_include_operand(operand: &[u8]) -> Option<(String, bool)> {
+    let (close, quoted) = match operand.first()? {
+        b'"' => (b'"', true),
+        b'<' => (b'>', false),
+        _ => return None,
+    };
+    let end = memchr::memchr(close, &operand[1..])?;
+    let name = String::from_utf8_lossy(&operand[1..=end]).into_owned();
+    (!name.is_empty()).then_some((name, quoted))
+}
+
+/// Whether a path, spelled with either separator, steps up a directory.
+fn cc_path_has_parent_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|part| part == "..")
 }
 
 fn cc_scan_header_probe_line(
@@ -6077,6 +6951,29 @@ fn cc_scan_header_probe_line(
         _ => 0,
     };
     let directive = &tokens[offset..];
+    // Wherever it appears, an alias or a probe may use it.
+    scan.searches_next |= tokens.contains(&b"__has_include_next".as_slice());
+    if offset != 0
+        && let Some(kind) = directive.first()
+        && matches!(
+            *kind,
+            b"include" | b"include_next" | b"import" | b"import_next"
+        )
+    {
+        let next = kind.ends_with(b"_next");
+        scan.searches_next |= next;
+        match spans
+            .get(offset + 1)
+            .and_then(|first| cc_include_operand(&text[first.start..spans[spans.len() - 1].end]))
+        {
+            // `#include_next "x.h"` continues the search path; it never
+            // looks beside its includer first.
+            Some((name, quoted)) if !cc_path_has_parent_component(&name) => {
+                scan.includes.push((name, quoted && !next))
+            }
+            _ => scan.unplaced_include = true,
+        }
+    }
     let definition = offset != 0 && directive.first() == Some(&b"define".as_slice());
     if offset != 0 && matches!(directive.first(), Some(&b"ifdef" | &b"ifndef" | &b"undef")) {
         return Some(());
@@ -6323,6 +7220,7 @@ fn cc_skip_probe_trivia(text: &[u8], mut i: usize) -> usize {
 
 /// Digest where each of `names` is first provided in the include search
 /// order, read from the directories as they are now.
+#[cfg(test)]
 fn digest_cc_shadowing_names(parsed: &CcArgs, names: &CcShadowingNames) -> Result<String> {
     digest_cc_shadowing_names_stamped(parsed, names, None).map(|(digest, _)| digest)
 }
@@ -6336,13 +7234,23 @@ fn digest_cc_shadowing_names_stamped(
     names: &CcShadowingNames,
     file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
 ) -> Result<(String, Option<CcListingStamps>)> {
+    digest_cc_shadowing_names_listing(parsed, names, file_hasher, CcDirectoryListings::default())
+}
+
+/// [`digest_cc_shadowing_names_stamped`], adding to `listings` read earlier
+/// for the same key, whose stamps are returned with the rest.
+fn digest_cc_shadowing_names_listing(
+    parsed: &CcArgs,
+    names: &CcShadowingNames,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+    mut listings: CcDirectoryListings,
+) -> Result<(String, Option<CcListingStamps>)> {
     let cwd = parsed
         .invocation_env
         .cwd()
         .context("cc invocation has no working directory")?;
     let dirs = cc_user_include_dirs(parsed, cwd);
     let mut hasher = blake3::Hasher::new();
-    let mut listings = CcDirectoryListings::default();
     for name in &names.names {
         hasher.update(name.as_os_str().as_encoded_bytes());
         hasher.update(b"\x1f");
@@ -6382,16 +7290,18 @@ fn digest_cc_shadowing_names_stamped(
         }
         hasher.update(b"\n");
     }
-    Ok((
-        hasher.finalize().to_hex().to_string(),
-        // A directory stamp cannot prove that an existing symlink still
-        // resolves. Probe candidates are stat'ed again at publication.
-        if names.probes.is_empty() {
-            listings.stamps(&dirs)
-        } else {
-            None
-        },
-    ))
+    // A directory stamp cannot prove that an existing symlink still
+    // resolves, so each probe candidate is stamped with what it answered and
+    // stat'ed again by the check, as a fresh digest would.
+    let stamps = listings.stamps(&dirs).map(|mut stamps| {
+        stamps.extend(
+            availability
+                .into_iter()
+                .map(|(candidate, present)| (candidate, CcListingStamp::Available(present))),
+        );
+        stamps
+    });
+    Ok((hasher.finalize().to_hex().to_string(), stamps))
 }
 
 /// A probe follows symlinks, but a newly created link can make an old
@@ -6448,9 +7358,12 @@ fn cc_header_probe_available(
 enum CcListingStamp {
     Absent,
     Present(crate::cache_key::FileFingerprint),
+    /// A `__has_include` candidate, and whether it was available. Checked
+    /// the way the digest read it, so a symlink that stops resolving shows.
+    Available(bool),
 }
 
-/// Each listed directory with its stamp.
+/// Each listed directory, or probe candidate, with its stamp.
 type CcListingStamps = Vec<(PathBuf, CcListingStamp)>;
 
 /// Two seconds covers the coarsest directory timestamps in use (FAT's).
@@ -6476,21 +7389,25 @@ impl CcListingStamp {
                 Some(Self::Present(fingerprint))
             }
             Ok(_) => None,
-            Err(_) => match std::fs::metadata(directory) {
+            // Not even a dangling symlink: the include-order check reads the
+            // path without following it, so a link appearing must break this.
+            Err(_) => match std::fs::symlink_metadata(directory) {
                 Err(error) if error.kind() == ErrorKind::NotFound => Some(Self::Absent),
                 _ => None,
             },
         }
     }
 
-    /// Whether `directory` still looks exactly as stamped.
-    fn holds(&self, directory: &Path) -> bool {
+    /// Whether `path` still looks exactly as stamped.
+    fn holds(&self, path: &Path) -> bool {
         match self {
-            Self::Absent => {
-                std::fs::metadata(directory).is_err_and(|error| error.kind() == ErrorKind::NotFound)
-            }
-            Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(directory)
+            Self::Absent => std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
+            Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(path)
                 .is_ok_and(|now| now == *fingerprint),
+            Self::Available(was) => {
+                cc_header_probe_available(path, None).is_ok_and(|now| now == *was)
+            }
         }
     }
 }
@@ -6659,12 +7576,27 @@ impl CcDirectoryListings {
         }
         let slot = &mut self.by_position[position];
         if slot.is_none() {
-            *slot = Some(CcStampedListing::read(directory)?);
+            // A listing read by path for the same key, such as by the `-I`
+            // order check, moves here rather than being read again.
+            *slot = Some(match self.listings.remove(directory) {
+                Some(listing) => listing,
+                None => CcStampedListing::read(directory)?,
+            });
         }
         match slot.as_ref().and_then(|stamped| stamped.listing.as_ref()) {
             Some(listing) => listing.provides(directory, file_name),
             None => Ok(false),
         }
+    }
+
+    /// These listings keyed by path, `dirs` being what `by_position` indexes.
+    fn by_path(mut self, dirs: &[PathBuf]) -> Self {
+        for (slot, dir) in std::mem::take(&mut self.by_position).into_iter().zip(dirs) {
+            if let Some(listing) = slot {
+                self.listings.insert(dir.clone(), listing);
+            }
+        }
+        self
     }
 
     /// Every directory listed so far with its stamp; `None` when any of them
@@ -6739,6 +7671,325 @@ fn digest_cc_include_dir_names_capped(parsed: &CcArgs, cap: usize) -> Result<Str
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// A compile whose adjacent `-I` operands can be keyed in a canonical order.
+///
+/// Build scripts that gather include directories in a hash set pass the same
+/// `-I` directories in a new order on every run. The key uses `canonical`,
+/// with each run of adjacent `-I` operands sorted by mapped path, whenever
+/// [`cc_include_order_free`] shows the order cannot change which file an
+/// include resolves to; otherwise it also folds `argv_order`.
+#[derive(Clone)]
+struct CcIncludeOrder {
+    canonical: CcArgs,
+    /// The distinct directories of the reordered runs.
+    run_dirs: Vec<PathBuf>,
+    /// The mapped run directories in argv order.
+    argv_order: Vec<u8>,
+}
+
+/// `None` when no run of two or more adjacent `-I` operands exists, or one
+/// cannot be reordered: a `..` component, `-I-`, a sysroot-relative or
+/// system directory, one directory spelled two ways, or `-I` operands this
+/// parse cannot place in the argv.
+fn cc_include_order(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Option<CcIncludeOrder> {
+    if parsed.family.dialect() != Dialect::Gnu {
+        return None;
+    }
+    let cwd = parsed.invocation_env.cwd()?;
+    let system = cc_system_include_dirs(parsed, cwd);
+    struct Include {
+        value: PathBuf,
+        dir: PathBuf,
+        mapped: Vec<u8>,
+    }
+    let mut segments: Vec<(&[String], Option<Include>)> = Vec::new();
+    let mut rest = parsed.rest.as_slice();
+    // An `-I` handed to a `-Xclang`-style flag belongs to it.
+    let mut forwarding = false;
+    while !rest.is_empty() {
+        let arg = parse_cc_arg_at(rest, 0, Dialect::Gnu);
+        let consumed = arg.as_ref().map_or(1, |arg| arg.consumed);
+        let (tokens, remaining) = rest.split_at(consumed);
+        let include = match arg {
+            Some(arg) if matches!(arg.spec.action, CcArgAction::Include) => {
+                if forwarding {
+                    return None;
+                }
+                let value = arg
+                    .value
+                    .filter(|value| !value.is_empty() && value != "-")?;
+                // `=dir` and `$SYSROOT/dir` are under the sysroot, not here.
+                if cc_path_has_parent_component(&value)
+                    || value.starts_with('=')
+                    || value.starts_with("$SYSROOT")
+                {
+                    return None;
+                }
+                let dir = absolutize_path(cwd, Path::new(&value));
+                let mapped = apply_cc_prefix_maps_to_bytes(
+                    dir.as_os_str().as_encoded_bytes().to_vec(),
+                    prefix_maps,
+                );
+                Some(Include {
+                    value: PathBuf::from(value),
+                    dir,
+                    mapped,
+                })
+            }
+            _ => None,
+        };
+        forwarding = tokens.len() == 1 && tokens[0].starts_with("-X") && !tokens[0].contains('=');
+        segments.push((tokens, include));
+        rest = remaining;
+    }
+    let found = segments.iter().filter(|(_, include)| include.is_some());
+    if found.count() != parsed.includes.len() {
+        return None;
+    }
+    let mut canonical_rest = Vec::with_capacity(parsed.rest.len());
+    let mut includes = Vec::with_capacity(parsed.includes.len());
+    let mut run_dirs: Vec<PathBuf> = Vec::new();
+    let mut spellings: Vec<(&PathBuf, &PathBuf)> = Vec::new();
+    let mut argv_order = Vec::new();
+    for group in segments.chunk_by(|a, b| a.1.is_some() && b.1.is_some()) {
+        let mut group = group.iter().collect::<Vec<_>>();
+        if group.len() >= 2 {
+            for (_, include) in &group {
+                let include = include.as_ref()?;
+                if cc_system_path(&include.dir.to_string_lossy())
+                    || system.iter().any(|root| include.dir.starts_with(root))
+                {
+                    return None;
+                }
+                argv_order.extend_from_slice(&(include.mapped.len() as u64).to_le_bytes());
+                argv_order.extend_from_slice(&include.mapped);
+                // The first spelling of a repeated directory is the one
+                // `__FILE__` and dependency output carry.
+                match spellings.iter().find(|(dir, _)| *dir == &include.dir) {
+                    Some((_, value)) if *value != &include.value => return None,
+                    Some(_) => {}
+                    None => {
+                        spellings.push((&include.dir, &include.value));
+                        run_dirs.push(include.dir.clone());
+                    }
+                }
+            }
+            group.sort_by(|a, b| {
+                let mapped = |segment: &(&[String], Option<Include>)| {
+                    segment.1.as_ref().map(|include| include.mapped.clone())
+                };
+                mapped(a).cmp(&mapped(b)).then_with(|| a.0.cmp(b.0))
+            });
+        }
+        for (tokens, include) in group {
+            canonical_rest.extend_from_slice(tokens);
+            includes.extend(include.as_ref().map(|include| include.value.clone()));
+        }
+    }
+    if run_dirs.is_empty() {
+        return None;
+    }
+    let mut canonical = parsed.clone();
+    canonical.rest = canonical_rest;
+    canonical.includes = includes;
+    Some(CcIncludeOrder {
+        canonical,
+        run_dirs,
+        argv_order,
+    })
+}
+
+/// How many run directories provide `name`. `listings` positions are the
+/// run directories' own.
+fn cc_run_providers(
+    run_dirs: &[PathBuf],
+    name: &Path,
+    listings: &mut CcDirectoryListings,
+) -> Result<usize> {
+    // `./x.h` names `x.h`; the top-level check below must not look up `.`.
+    let name = cc_lexically_normal(name);
+    let Some(file_name) = name.file_name() else {
+        return Ok(0);
+    };
+    let parent = name
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let first = name.components().next().map(|first| first.as_os_str());
+    let mut providers = 0;
+    for (position, dir) in run_dirs.iter().enumerate() {
+        let provided = match (parent, first) {
+            // Most nested names do not start at a run directory's top level;
+            // its listing answers that without joining a path.
+            (Some(parent), Some(first)) => {
+                listings.contains_at(position, dir, first)?
+                    && listings.contains(&dir.join(parent), file_name)?
+            }
+            _ => listings.contains_at(position, dir, file_name)?,
+        };
+        providers += usize::from(provided);
+    }
+    Ok(providers)
+}
+
+/// Whether reordering the `-I` runs keeps every include resolving to the same
+/// file: at most one run directory provides any name a search-path include
+/// can have used. Checked first against every name the read inputs can be
+/// reached by, which needs no scan; an operand the scan cannot place, or a
+/// name two directories provide, falls back to the include operands.
+fn cc_include_order_free(
+    parsed: &CcArgs,
+    order: &CcIncludeOrder,
+    names: &CcShadowingNames,
+    listings: &mut CcDirectoryListings,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<bool> {
+    // A symlink can stand for another run directory, and a file operand (a
+    // header map) can send a name anywhere.
+    for dir in &order.run_dirs {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            // An absent directory provides nothing; one appearing later
+            // changes the listing the store-time check compares.
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            _ => return Ok(false),
+        }
+    }
+    // `#include_next` continues after the directory its header was found
+    // in, which the order moves when that directory is in a run. From
+    // anywhere else it is an ordinary lookup of a read file.
+    if names.definitions_search_next
+        || names
+            .searches_next
+            .iter()
+            .any(|input| order.run_dirs.iter().any(|dir| input.starts_with(dir)))
+    {
+        return Ok(false);
+    }
+    if !names.unplaced {
+        let mut unique = true;
+        for name in names.names.iter().chain(&names.reached_as) {
+            if cc_run_providers(&order.run_dirs, name, listings)? > 1 {
+                unique = false;
+                break;
+            }
+        }
+        if unique {
+            return Ok(true);
+        }
+    }
+    cc_include_operands_free(parsed, order, names, listings, file_hasher)
+}
+
+/// The operand check: every include a read header makes through the search
+/// path names something at most one run directory provides. A quoted include
+/// whose file beside the includer was read never reached the search path.
+fn cc_include_operands_free(
+    parsed: &CcArgs,
+    order: &CcIncludeOrder,
+    names: &CcShadowingNames,
+    listings: &mut CcDirectoryListings,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<bool> {
+    let cwd = parsed
+        .invocation_env
+        .cwd()
+        .context("cc invocation has no working directory")?;
+    let sources = cc_absolute_sources(parsed, cwd);
+    let fallback;
+    let file_hasher = match file_hasher {
+        Some(file_hasher) => file_hasher,
+        None => {
+            fallback = crate::cache_key::FileHasher::new_for(&parsed.invocation_env);
+            &fallback
+        }
+    };
+    let scans = cc_parsed_header_scans(&names.read_inputs, &sources, file_hasher)?;
+    let read = names
+        .read_inputs
+        .iter()
+        .map(|path| cc_lexically_normal(path))
+        .collect::<HashSet<_>>();
+    for (input, (_, scan)) in names.read_inputs.iter().zip(&scans) {
+        let Some(scan) = scan.as_ref().as_ref() else {
+            return Ok(false);
+        };
+        if scan.unplaced_include {
+            return Ok(false);
+        }
+        for (operand, quoted) in &scan.includes {
+            let operand = Path::new(operand);
+            if operand.is_absolute() {
+                continue;
+            }
+            if *quoted
+                && input
+                    .parent()
+                    .is_some_and(|dir| read.contains(&cc_lexically_normal(&dir.join(operand))))
+            {
+                continue;
+            }
+            if cc_run_providers(&order.run_dirs, operand, listings)? > 1 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `path` without `.` components.
+fn cc_lexically_normal(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
+}
+
+/// The resolution digest folded into the key, with the `-I` order decided:
+/// the canonical order when it cannot matter, else the argv order folded in.
+/// Without an [`CcIncludeOrder`] this is [`digest_cc_shadowing_names_stamped`].
+fn digest_cc_resolution(
+    parsed: &CcArgs,
+    order: Option<&CcIncludeOrder>,
+    names: &CcShadowingNames,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<(String, Option<CcListingStamps>)> {
+    let Some(order) = order else {
+        return digest_cc_shadowing_names_stamped(parsed, names, file_hasher);
+    };
+    let mut run_listings = CcDirectoryListings::default();
+    let free = cc_include_order_free(parsed, order, names, &mut run_listings, file_hasher)?;
+    let listings = run_listings.by_path(&order.run_dirs);
+    let (digest, stamps) = digest_cc_shadowing_names_listing(
+        if free { &order.canonical } else { parsed },
+        names,
+        file_hasher,
+        listings,
+    )?;
+    Ok((cc_include_order_digest(order, free, &digest), stamps))
+}
+
+/// [`digest_cc_include_dir_names`] with the argv order of any `-I` run folded
+/// in: a walk proves nothing about which name an include used.
+fn digest_cc_walked_resolution(parsed: &CcArgs, order: Option<&CcIncludeOrder>) -> Result<String> {
+    let digest = digest_cc_include_dir_names(parsed)?;
+    Ok(match order {
+        Some(order) => cc_include_order_digest(order, false, &digest),
+        None => digest,
+    })
+}
+
+fn cc_include_order_digest(order: &CcIncludeOrder, free: bool, digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cc-include-order.v1\0");
+    if free {
+        hasher.update(b"free\0");
+    } else {
+        hasher.update(b"argv\0");
+        hasher.update(&order.argv_order);
+    }
+    hasher.update(digest.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn cc_user_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut seen = HashSet::new();
@@ -6757,6 +8008,13 @@ fn cc_user_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
     }
     for include in &parsed.includes {
         push(include.clone());
+    }
+    if parsed.family == ToolFamily::Msvc
+        && let Some(includes) = parsed.invocation_env.var_os("INCLUDE")
+    {
+        for include in std::env::split_paths(&includes) {
+            push(include);
+        }
     }
     dirs
 }
@@ -6895,6 +8153,8 @@ struct PendingCcPreprocessMemo {
     /// The inputs came from a compile's own read set, fingerprinted after
     /// it ran, rather than from a preprocess that preceded the compile.
     captured: bool,
+    /// The include-shadowing derivation to store with the memo.
+    shadowing: Option<String>,
 }
 
 /// How the key learns what the translation unit reads.
@@ -6968,10 +8228,19 @@ fn cc_memo_identity_portable(parsed: &CcArgs, cwd: &Path, prefix_maps: &[CcPrefi
 }
 
 /// A path the toolchain owns, the same on every checkout of one machine.
+/// Under `/nix` only the store and profiles qualify: Nix builds a package in
+/// a per-build directory below `/nix/var/nix/builds`.
 fn cc_system_path(path: &str) -> bool {
-    ["/usr/", "/opt/", "/Library/", "/Applications/", "/nix/"]
-        .iter()
-        .any(|root| path.starts_with(root))
+    [
+        "/usr/",
+        "/opt/",
+        "/Library/",
+        "/Applications/",
+        "/nix/store/",
+        "/nix/var/nix/profiles/",
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
 }
 
 /// Hash each mapped input name with its content, preserving their association
@@ -7029,6 +8298,11 @@ const CC_DIRECT_CAPTURE_TARGET: &str = "__kache_direct_capture";
 /// expansion: the invocation has the right shape and the driver is known
 /// to accept the flags the capture adds.
 pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
+    if parsed.family == ToolFamily::Msvc {
+        // The native key path verifies the toolset once before injecting
+        // /sourceDependencies. The wrapper has already admitted the shape.
+        return true;
+    }
     cc_direct_key_shape_ok(parsed)
         && crate::config::probe_memo_dir_for(&parsed.invocation_env).is_ok_and(|memo| {
             cc_driver_captures_dependencies_for(&parsed.program, &memo, &parsed.invocation_env)
@@ -7186,14 +8460,48 @@ fn cc_inputs_hide_assembler_input(paths: &[PathBuf]) -> Option<&'static str> {
 /// definition, as in every libc's symbol-aliasing headers, not a hidden
 /// string.
 fn cc_raw_assembler_hidden_input(text: &[u8]) -> Option<&'static str> {
-    if let Some(found) = cc_assembler_text_hidden_input(text) {
-        return Some(found);
+    // The preprocessor joins a line ending in a backslash to the next one
+    // before anything else, so `.inc\` and `bin` on two lines are `.incbin`.
+    // A plain `.s` file is not preprocessed, so both readings are checked.
+    let joined = cc_join_continued_lines(text);
+    std::iter::once(text)
+        .chain(joined.as_deref())
+        .find_map(|text| {
+            cc_assembler_text_hidden_input(text).or_else(|| {
+                let literals = cc_string_literals(text);
+                if literals.named_escape {
+                    return Some(r"\N{...}");
+                }
+                cc_assembler_text_hidden_input(&literals.text)
+            })
+        })
+}
+
+/// `text` with each backslash-newline removed, or `None` when it has none.
+/// GCC and clang also join when blanks sit between the two.
+fn cc_join_continued_lines(text: &[u8]) -> Option<Vec<u8>> {
+    let mut joined = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.iter().position(|byte| *byte == b'\\') {
+        let (before, from) = rest.split_at(at);
+        joined.extend_from_slice(before);
+        let Some((_, after)) = from.split_first() else {
+            break;
+        };
+        let blanks = after
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        rest = match &after[blanks..] {
+            [b'\n', next @ ..] | [b'\r', b'\n', next @ ..] => next,
+            _ => {
+                joined.push(b'\\');
+                after
+            }
+        };
     }
-    let literals = cc_string_literals(text);
-    if literals.named_escape {
-        return Some(r"\N{...}");
-    }
-    cc_assembler_text_hidden_input(&literals.text)
+    joined.extend_from_slice(rest);
+    (joined.len() != text.len()).then_some(joined)
 }
 
 pub struct CcCompiler {
@@ -7226,6 +8534,8 @@ struct PendingIncludeDirDigest {
     /// Stamps of the directories the digest listed, when all could vouch
     /// for their listing.
     stamps: Option<CcListingStamps>,
+    /// The `-I` order the digest decided on.
+    order: Option<CcIncludeOrder>,
 }
 
 fn named_tool_family(name: &str) -> Option<ToolFamily> {
@@ -7386,6 +8696,15 @@ impl CcCompiler {
             &pending.fingerprints,
             &|path| cc_mapped_content_hash(path, &pending.prefix_maps),
         );
+        // The value names its inputs, so a row replaced meanwhile at worst
+        // recomputes it.
+        if let Some(shadowing) = &pending.shadowing {
+            file_hasher.cc_preprocess_memo_set_shadowing(
+                &pending.memo_key,
+                &pending.preprocessed_hash,
+                shadowing,
+            );
+        }
     }
 
     /// The memo a deferred compile would publish, for a daemon to record in
@@ -7445,8 +8764,9 @@ impl CcCompiler {
         // against a different set of names than the key used would compare
         // two unrelated digests and refuse every store.
         let now = match &pending.names {
-            Some(names) => digest_cc_shadowing_names(parsed, names),
-            None => digest_cc_include_dir_names(parsed),
+            Some(names) => digest_cc_resolution(parsed, pending.order.as_ref(), names, None)
+                .map(|(digest, _)| digest),
+            None => digest_cc_walked_resolution(parsed, pending.order.as_ref()),
         };
         now.is_ok_and(|now| now == pending.digest)
     }
@@ -7468,7 +8788,7 @@ impl CcCompiler {
 
     /// Compiler names accepted without executing a family probe.
     pub(crate) fn recognizes_name(program: &str) -> bool {
-        kache_shims::is_cc_compiler_name(program)
+        (cfg!(windows) && msvc::is_driver(program)) || kache_shims::is_cc_compiler_name(program)
     }
 
     pub(crate) fn recognizes_for(args: &[String], env: &InvocationEnv) -> bool {
@@ -7800,6 +9120,11 @@ impl CcCompiler {
             );
         }
 
+        // Keyed in a canonical `-I` order; the resolution digest below folds
+        // the argv order back in whenever it can change what an include finds.
+        let order = cc_include_order(parsed, &prefix_maps);
+        let key_parsed = order.as_ref().map_or(parsed, |order| &order.canonical);
+
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
@@ -7868,41 +9193,47 @@ impl CcCompiler {
         // Compiler probe, memoized: the version line (`cc --version`,
         // compiler identity) and the resolved invocation (`cc -###`,
         // the driver's fully-expanded `-cc1` line). One probe per build
-        // per flag set; the rest of the build reads the record.
-        let config_args = parsed.config_args();
-        let probe_args = parsed.probe_args();
+        // per flag set and source suffix. The rest of the build reads the
+        // record.
+        let config_args = key_parsed.config_args();
+        let probe_args = key_parsed.probe_args();
         // Per-TU paths to blank from the shared probe record's resolved
         // tokens, so the record is invariant across the build's TUs and
         // parallel builds don't race on whose paths it holds (#keyrace).
-        let per_tu_paths = cc_resolved_per_tu_paths(parsed);
+        let per_tu_paths = cc_resolved_per_tu_paths(key_parsed);
         let trace_probe = crate::phase_trace::phase("cc_probe");
-        let resolved = crate::probe::probe_for(
-            ctx.cache_dir,
-            &crate::probe::CcProber,
-            &crate::probe::ProbeRequest {
-                compiler: &parsed.program,
-                args: &probe_args,
-                key_args: &config_args,
-                per_tu_paths: &per_tu_paths,
-                // Sentinel Windows paths only for gnu/clang (objects are
-                // remapped via -ffile-prefix-map). clang-cl keeps raw
-                // native paths → key stays path-literal (#299/#312).
-                windows_aware: parsed.family.dialect() != Dialect::Cl,
-            },
-            &parsed.invocation_env,
-        )?;
+        let native_msvc = parsed.family == ToolFamily::Msvc;
+        let (version_line, resolved_tokens) = if native_msvc {
+            let identity = msvc::identity(parsed, ctx.file_hasher)?;
+            (identity, None)
+        } else {
+            let resolved = crate::probe::probe_for(
+                ctx.cache_dir,
+                &crate::probe::CcProber,
+                &crate::probe::ProbeRequest {
+                    compiler: &parsed.program,
+                    args: &probe_args,
+                    key_args: &config_args,
+                    per_tu_paths: &per_tu_paths,
+                    // clang-cl keeps native paths (#299/#312).
+                    windows_aware: parsed.family.dialect() != Dialect::Cl,
+                },
+                &parsed.invocation_env,
+            )?;
+            (resolved.version_line, resolved.resolved_tokens)
+        };
         drop(trace_probe);
-        if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
+        if !native_msvc && resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
             anyhow::bail!("cc: resolved invocation unavailable for probe-captured flags");
         }
         hasher.update(b"compiler_version:");
-        hasher.update(resolved.version_line.as_bytes());
+        hasher.update(version_line.as_bytes());
         hasher.update(b"\n");
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] compiler_version={}",
             trace_name,
-            resolved.version_line
+            version_line
         );
 
         // Resolved compiler invocation: the `cc -###` `-cc1` line with
@@ -7923,7 +9254,7 @@ impl CcCompiler {
         // that happen to resolve to the same object (same tokens,
         // different order) get different keys — a cache miss, never a
         // miscache. That is the safe direction.
-        if let Some(tokens) = &resolved.resolved_tokens {
+        if let Some(tokens) = &resolved_tokens {
             hasher.update(b"resolved:");
             for tok in tokens {
                 // Resolved `cc -###` tokens carry absolute build paths —
@@ -7949,6 +9280,20 @@ impl CcCompiler {
             }
             hasher.update(b"\n");
         }
+
+        // The mode decides what the entry holds (an object, or preprocessor
+        // output). The resolved tokens cannot tell them apart: gcc's first
+        // cc1 line for `-c t.S` is the same `-E -lang-asm` preprocess that
+        // `-E t.S` runs (#1946).
+        hasher.update(b"mode:");
+        hasher.update(format!("{:?}", parsed.mode).as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] mode={:?}",
+            trace_name,
+            parsed.mode
+        );
 
         // Target architecture.
         let arch = cc_target_arch(parsed);
@@ -8156,7 +9501,7 @@ impl CcCompiler {
         let memo_key = ctx
             .file_hasher
             .supports_cc_preprocess_memo()
-            .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
+            .then(|| cc_preprocess_memo_key(key_parsed, &prefix_maps, &version_line))
             .flatten();
         drop(trace_memo_key);
         // A content-matching read set is not enough: a formerly absent
@@ -8169,7 +9514,7 @@ impl CcCompiler {
         } else {
             memo_key.as_ref().and_then(|key| {
                 let _trace = crate::phase_trace::phase("cc_memo_lookup");
-                ctx.file_hasher.cc_preprocess_memo_lookup(
+                ctx.file_hasher.cc_preprocess_memo_lookup_shadowing(
                     key,
                     |name| cc_unmapped_path_candidates(name, &prefix_maps),
                     &|path| cc_mapped_content_hash(path, &prefix_maps),
@@ -8177,15 +9522,27 @@ impl CcCompiler {
             })
         };
         let memo_hit = memo_hit
-            .map(|(hash, inputs)| -> Result<_> {
-                let Some((hash, expected_resolution)) = hash.split_once('@') else {
+            .map(|(memo_hash, inputs, stored)| -> Result<_> {
+                let Some((hash, expected_resolution)) = memo_hash.split_once('@') else {
                     return Ok(None);
                 };
-                let names = cc_shadowing_names(parsed, &inputs, ctx.file_hasher)?;
+                let trace_names = crate::phase_trace::phase("cc_shadow_names");
+                let (names, derived) = cc_shadowing_names_reusing(
+                    key_parsed,
+                    &inputs,
+                    ctx.file_hasher,
+                    stored.as_deref(),
+                )?;
+                drop(trace_names);
+                let _trace_digest = crate::phase_trace::phase("cc_shadow_digest");
                 let (resolution, stamps) =
-                    digest_cc_shadowing_names_stamped(parsed, &names, Some(ctx.file_hasher))?;
+                    digest_cc_resolution(parsed, order.as_ref(), &names, Some(ctx.file_hasher))?;
                 if resolution != expected_resolution {
                     return Ok(None);
+                }
+                if let (Some(derived), Some(key)) = (derived, memo_key.as_deref()) {
+                    ctx.file_hasher
+                        .cc_preprocess_memo_set_shadowing(key, &memo_hash, &derived);
                 }
                 memo_shadowing = Some((names, resolution, stamps));
                 Ok(Some((hash.to_string(), inputs)))
@@ -8200,6 +9557,7 @@ impl CcCompiler {
             // of that read set stands where the expansion hash would, and
             // the memo records it under the same identity.
             let digest = cc_direct_inputs_digest(&captured.fingerprints);
+            ctx.file_hasher.adopt_observed(&captured.fingerprints);
             self.key_path_bound.set(captured.path_bound);
             let read_inputs = captured
                 .fingerprints
@@ -8215,6 +9573,7 @@ impl CcCompiler {
                         fingerprints: captured.fingerprints,
                         prefix_maps: prefix_maps.clone(),
                         captured: true,
+                        shadowing: None,
                     });
             }
             tracing::trace!(
@@ -8232,6 +9591,11 @@ impl CcCompiler {
                 trace_name
             );
             (memo_hash.to_string(), Some(satisfied))
+        } else if native_msvc {
+            let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (discovery, memo_key) else {
+                anyhow::bail!("native MSVC requires compile-first dependency capture");
+            };
+            return Ok(CcKeyOutcome::Deferred(CcDeferredKey { memo_key }));
         } else if let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (&discovery, &memo_key)
             && cc_direct_key_eligible(parsed)
             && parsed
@@ -8280,6 +9644,7 @@ impl CcCompiler {
                         fingerprints,
                         prefix_maps: prefix_maps.clone(),
                         captured: false,
+                        shadowing: None,
                     });
             }
             tracing::trace!(
@@ -8335,20 +9700,33 @@ impl CcCompiler {
         let (names, include_dir_digest, stamps, include_dir_mode) = match memo_shadowing {
             Some((names, digest, stamps)) => (Some(names), digest, stamps, "resolved"),
             None => {
-                let names = read_inputs
+                let derived = read_inputs
                     .as_deref()
-                    .map(|inputs| cc_shadowing_names(parsed, inputs, ctx.file_hasher))
+                    .map(|inputs| {
+                        cc_shadowing_names_reusing(key_parsed, inputs, ctx.file_hasher, None)
+                    })
                     .transpose()?;
+                let names = derived.map(|(names, derivation)| {
+                    if let Some(pending) = self.pending_preprocess_memo.borrow_mut().as_mut() {
+                        pending.shadowing = derivation;
+                    }
+                    names
+                });
                 let (digest, stamps, mode) = match &names {
                     Some(names) => {
-                        let (digest, stamps) = digest_cc_shadowing_names_stamped(
+                        let (digest, stamps) = digest_cc_resolution(
                             parsed,
+                            order.as_ref(),
                             names,
                             Some(ctx.file_hasher),
                         )?;
                         (digest, stamps, "resolved")
                     }
-                    None => (digest_cc_include_dir_names(parsed)?, None, "walked"),
+                    None => (
+                        digest_cc_walked_resolution(parsed, order.as_ref())?,
+                        None,
+                        "walked",
+                    ),
                 };
                 (names, digest, stamps, mode)
             }
@@ -8364,6 +9742,7 @@ impl CcCompiler {
                 digest: include_dir_digest.clone(),
                 names,
                 stamps,
+                order,
             });
         hasher.update(b"include_dir_names:");
         hasher.update(include_dir_digest.as_bytes());
@@ -8443,7 +9822,15 @@ impl CcCompiler {
             .as_ref()
             .map(|dir| dir.path().join("inputs.d"))
             .filter(|path| path.to_str().is_some());
+        let private_path = if parsed.family == ToolFamily::Msvc
+            && !msvc::supports_capture(parsed, file_hasher).unwrap_or(false)
+        {
+            None
+        } else {
+            private_path
+        };
         let extra = match &private_path {
+            Some(path) if parsed.family == ToolFamily::Msvc => msvc::capture_args(path),
             Some(path) => vec![
                 "-MD".to_string(),
                 "-MF".to_string(),
@@ -8455,6 +9842,11 @@ impl CcCompiler {
         };
         let (result, path_bound) = self.execute_with_extra_args(parsed, extra, true)?;
         if result.exit_code != 0 {
+            if parsed.family == ToolFamily::Msvc && private_path.is_some() {
+                // Older toolsets or unusual build settings can reject the
+                // injected switch. Only report the original command's result.
+                return Ok((self.execute(parsed)?, None));
+            }
             return Ok((result, None));
         }
         let depfile = match (caller_depfile, private_path) {
@@ -8492,7 +9884,12 @@ impl CcCompiler {
             }
         };
         let cwd = parsed.invocation_env.cwd()?;
-        let mut paths = match parse_preprocess_dependencies(&raw, cwd) {
+        let dependencies = if parsed.family == ToolFamily::Msvc {
+            msvc::read_dependencies(&raw, &absolutize_path(cwd, &parsed.sources[0]))
+        } else {
+            parse_preprocess_dependencies(&raw, cwd)
+        };
+        let mut paths = match dependencies {
             Ok(paths) => paths,
             Err(error) => {
                 tracing::debug!("cc capture depfile unusable: {error:#}");
@@ -8501,32 +9898,40 @@ impl CcCompiler {
         };
         // The depfile lists the source itself; adding it again is harmless,
         // the fingerprints are deduplicated by name.
-        for source in &parsed.sources {
-            paths.push(if source.is_absolute() {
-                source.clone()
-            } else {
-                cwd.join(source)
-            });
+        let sources: Vec<PathBuf> = parsed
+            .sources
+            .iter()
+            .map(|source| absolutize_path(cwd, source))
+            .collect();
+        paths.extend(sources.iter().cloned());
+        if parsed.family == ToolFamily::Msvc && msvc::has_external_dependencies(&paths) {
+            return None;
         }
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let mapped: Vec<(String, PathBuf)> = paths
             .into_iter()
             .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
             .collect();
-        let inputs = file_hasher.cc_preprocess_fingerprints(
+        let inputs = file_hasher.cc_preprocess_fingerprints_recording(
             &mapped,
             &cc_prefix_maps_key(&prefix_maps),
             &|path| cc_mapped_content_hash(path, &prefix_maps),
+            &|path| sources.iter().any(|source| source == path),
         )?;
+        file_hasher.forget_pending_memo(&|path| sources.iter().any(|source| source == path));
         // After the fingerprints: the scan is memoised by the content hash
         // they carry, so a header shared by every unit is read once.
-        if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(&inputs, &|path| {
-            let bytes = fs::read(path).ok()?;
-            Some((
-                blake3::hash(&bytes).to_hex().to_string(),
-                cc_raw_assembler_hidden_input(&bytes),
-            ))
-        }) {
+        if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(
+            &inputs,
+            &|path| {
+                let bytes = fs::read(path).ok()?;
+                Some((
+                    blake3::hash(&bytes).to_hex().to_string(),
+                    cc_raw_assembler_hidden_input(&bytes),
+                ))
+            },
+            &|path| sources.iter().any(|source| source == path),
+        ) {
             let why = if found == crate::cache_key::CC_INPUT_CHANGED_WHILE_SCANNED {
                 found
             } else {
@@ -8571,7 +9976,9 @@ impl CcCompiler {
         // normalization (we already rewrite paths via -ffile-prefix-map); pinning
         // the date is the same stance. Opt out with
         // KACHE_CC_SOURCE_DATE_EPOCH=passthrough (#423).
-        if let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env) {
+        if parsed.family != ToolFamily::Msvc
+            && let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env)
+        {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         let output = command

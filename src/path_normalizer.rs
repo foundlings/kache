@@ -295,11 +295,7 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
             .and_then(|path| resolve(&path));
-        push_rule_with_variants(
-            &mut rules,
-            cargo_home.and_then(|p| canonical_string(&p)),
-            "<CARGO_HOME>",
-        );
+        push_rule_spellings(&mut rules, cargo_home, "<CARGO_HOME>");
 
         // Same default-fallback story for RUSTUP_HOME. rustup paths
         // appear in -L flags and toolchain refs — without this rule,
@@ -310,19 +306,9 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".rustup")))
             .and_then(|path| resolve(&path));
-        push_rule_with_variants(
-            &mut rules,
-            rustup_home.and_then(|p| canonical_string(&p)),
-            "<RUSTUP_HOME>",
-        );
+        push_rule_spellings(&mut rules, rustup_home, "<RUSTUP_HOME>");
 
-        push_rule_with_variants(
-            &mut rules,
-            env.home_dir()
-                .and_then(resolve)
-                .and_then(|path| canonical_string(&path)),
-            "<HOME>",
-        );
+        push_rule_spellings(&mut rules, env.home_dir().and_then(resolve), "<HOME>");
 
         // Windows-specific rules: cargo / rustup paths often live
         // under %APPDATA% / %LOCALAPPDATA% (e.g. CARGO_HOME defaults
@@ -336,11 +322,10 @@ impl PathNormalizer {
             ("LOCALAPPDATA", "<LOCALAPPDATA>"),
             ("PROGRAMFILES", "<PROGRAMFILES>"),
         ] {
-            push_rule_with_variants(
+            push_rule_spellings(
                 &mut rules,
                 env.var_os(env_key)
-                    .and_then(|value| resolve(Path::new(&value)))
-                    .and_then(|path| canonical_string(&path)),
+                    .and_then(|value| resolve(Path::new(&value))),
                 sentinel,
             );
         }
@@ -349,11 +334,7 @@ impl PathNormalizer {
         // segment on macOS like `/var/folders/1z/.../T`). Build
         // artifacts from build.rs scripts often pass through tempdirs
         // for intermediate output.
-        push_rule_with_variants(
-            &mut rules,
-            resolve(env.temp_dir()).and_then(|path| canonical_string(&path)),
-            "<TMPDIR>",
-        );
+        push_rule_spellings(&mut rules, resolve(env.temp_dir()), "<TMPDIR>");
 
         // De-dupe: if (e.g.) CARGO_HOME == workspace_root, the second
         // entry would never fire. Keep order stable so the first-listed
@@ -781,29 +762,27 @@ impl PathNormalizer {
     /// [`Self::from_env`] — see that method's docs. The matching
     /// here is a byte-literal pass over every variant.
     ///
-    /// **Unicode normalization to NFC** is applied to the input
-    /// before matching, because rule prefixes are stored in NFC
-    /// (see [`canonical_string`]). This handles the macOS HFS+/APFS
-    /// case where filesystem APIs may return paths in NFD (`é` as
-    /// `e` + combining accent) while env vars set by other tools
-    /// use NFC (`é` as a single codepoint). Same character to the
-    /// eye, different bytes — without this, a user `José` would
-    /// silently lose cross-machine cache sharing while ASCII-named
-    /// users got it for free. NFC is semantic-preserving for path
-    /// strings (composed and decomposed forms are equivalent path
-    /// representations); the normalize step is a no-op on inputs
-    /// that are already NFC (the common case).
+    /// A non-ASCII prefix also matches in its NFC and NFD forms. macOS
+    /// APIs may return `é` decomposed (`e` + combining accent) while an
+    /// env var spells it composed, so a user named `José` still gets the
+    /// rule. The input itself is never normalized: canonically
+    /// equivalent text outside a prefix keeps its bytes, because tools
+    /// copy those bytes into outputs (a SONAME, a debug path) and two
+    /// spellings must not share a key.
     pub fn normalize<S: AsRef<str>>(&self, s: S) -> String {
-        let mut out: String = s.as_ref().nfc().collect();
+        let mut out = s.as_ref().to_string();
         for rule in &self.rules {
             if rule.prefix.is_empty() || rule.key_sentinel == PROFILE_SENTINEL {
                 continue;
             }
-            out = if configured_base_dir_index(&rule.key_sentinel).is_some() {
-                replace_configured_path_prefix(&out, &rule.prefix, &rule.key_sentinel)
-            } else {
-                out.replace(&rule.prefix, &rule.key_sentinel)
-            };
+            let configured = configured_base_dir_index(&rule.key_sentinel).is_some();
+            for prefix in unicode_spellings(&rule.prefix) {
+                out = if configured {
+                    replace_configured_path_prefix(&out, &prefix, &rule.key_sentinel)
+                } else {
+                    out.replace(prefix.as_ref(), &rule.key_sentinel)
+                };
+            }
         }
         warn_if_path_leaked(&out);
         out
@@ -917,6 +896,19 @@ pub(crate) struct DiagnosticRoot {
     /// The root depends on the crate being compiled (its cwd or workspace),
     /// so another crate's file can carry the same target.
     pub per_crate: bool,
+}
+
+/// `prefix`, then its NFC and NFD forms where they differ. ASCII has one form.
+fn unicode_spellings(prefix: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    let mut spellings = vec![std::borrow::Cow::Borrowed(prefix)];
+    if !prefix.is_ascii() {
+        for form in [prefix.nfc().collect::<String>(), prefix.nfd().collect()] {
+            if !spellings.iter().any(|known| *known == form) {
+                spellings.push(std::borrow::Cow::Owned(form));
+            }
+        }
+    }
+    spellings
 }
 
 /// Whether `text` may hold a path rewritten by [`PathNormalizer::remap_args`].
@@ -1459,6 +1451,25 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     // `/rustc/<hash>` target) goes through `push_rule_with_variants_target`.
     let flag_target = flag_target_for(sentinel);
     push_rule_with_variants_target(rules, prefix, sentinel, &flag_target);
+}
+
+/// Push a root's canonical rule and, when it differs, the spelling it was
+/// named by. A path reached through a symlink (`/var` for `/private/var` on
+/// macOS, a symlinked home) keeps that spelling in compiler output.
+fn push_rule_spellings(rules: &mut Vec<Rule>, path: Option<PathBuf>, sentinel: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    let canonical = canonical_string(&path);
+    let given = canonical_form(&path)
+        .filter(|given| Some(given) != canonical.as_ref() && !is_filesystem_root_prefix(given));
+    // Longer first, so a spelling that is a prefix of the other cannot take
+    // the other's paths.
+    let mut spellings: Vec<String> = canonical.into_iter().chain(given).collect();
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    for spelling in spellings {
+        push_rule_with_variants(rules, Some(spelling), sentinel);
+    }
 }
 
 fn push_rule_with_variants_source(
@@ -3063,10 +3074,9 @@ mod tests {
         //   NFC: U+00E9         → 0xC3 0xA9       (2 bytes)
         //   NFD: U+0065 U+0301  → 0x65 0xCC 0x81  (3 bytes)
         // String::replace is byte-literal so the two forms don't
-        // match each other directly. PathNormalizer normalizes both
-        // sides to NFC before matching, so a rule built from a path
-        // returned in NFD (HFS+ legacy / some macOS APIs) still
-        // matches an input string in NFC (typical env-var form).
+        // match each other directly. A non-ASCII rule prefix is tried
+        // in both forms, so an NFC rule still matches a path that a
+        // macOS API returned in NFD, and the reverse.
         let nfc_prefix = "/Users/Jos\u{00E9}/.cargo"; // single codepoint é
         let nfd_input = "/Users/Jos\u{0065}\u{0301}/.cargo/registry/foo"; // e + combining acute
 
@@ -3076,10 +3086,8 @@ mod tests {
             &nfd_input.as_bytes()[..nfc_prefix.len()]
         );
 
-        // Rule prefix in NFC form — `from_env`'s `canonical_string`
-        // would have produced this. Input arrives in NFD; normalize
-        // converts it to NFC before matching, so the substring hit
-        // fires.
+        // Rule prefix in NFC form, as `canonical_string` produces it.
+        // Input arrives in NFD.
         let n = pn_with_rules(vec![(nfc_prefix, "<CARGO_HOME>")]);
         let out = n.normalize(nfd_input);
         assert_eq!(out, "<CARGO_HOME>/registry/foo");
@@ -3147,10 +3155,8 @@ mod tests {
 
     #[test]
     fn canonical_string_normalizes_to_nfc() {
-        // Rule construction must produce NFC-form prefixes so that
-        // the NFC normalization in `normalize` can match. Even if
-        // the underlying path uses non-NFC bytes (which canonicalize
-        // may return on macOS), the stored prefix must be NFC.
+        // Rule prefixes are stored in NFC even when canonicalize
+        // returns other bytes on macOS.
         let dir = TempDir::new().unwrap();
         let nfc_name = "Jos\u{00E9}";
         let subdir = dir.path().join(nfc_name);
@@ -3162,6 +3168,20 @@ mod tests {
         assert_eq!(
             result, renormalized,
             "canonical_string output must be in NFC form, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_equivalent_spellings_apart_outside_a_prefix() {
+        let n = pn_with_rules(vec![("/Users/Jos\u{0065}\u{0301}", "<HOME>")]);
+        // An NFD rule still matches the NFC spelling of its prefix.
+        assert_eq!(n.normalize("/Users/Jos\u{00E9}/x"), "<HOME>/x");
+        // Text past the prefix keeps its bytes, so a composed and a
+        // decomposed name stay distinct.
+        assert_eq!(n.normalize("-Wl,-soname,\u{00E9}"), "-Wl,-soname,\u{00E9}");
+        assert_eq!(
+            n.normalize("/Users/Jos\u{00E9}/e\u{0301}"),
+            "<HOME>/e\u{0301}"
         );
     }
 
@@ -3338,7 +3358,7 @@ mod tests {
             crate::link::DepInfoMode::Relativize,
         );
         assert!(
-            stored.contains("__kache_base_dir_0__/src\\value.rs"),
+            stored.contains("__kache_base_dir_0__/src/value.rs"),
             "{stored}"
         );
         let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
@@ -4010,6 +4030,7 @@ mod tests {
         let normalizer = PathNormalizer::from_env(Some(&workspace))
             .with_base_dirs(&[configured.to_string_lossy().into_owned()]);
         let relative = source.strip_prefix(&configured).unwrap().to_string_lossy();
+        let stored_relative = relative.replace('\\', "/");
         assert_eq!(
             normalizer.source_path_identity(&source).unwrap(),
             format!("<BASE_DIR_0>/{relative}").as_bytes()
@@ -4038,7 +4059,7 @@ mod tests {
             crate::link::DepInfoMode::Relativize,
         );
         assert!(
-            stored.contains(&format!("__kache_base_dir_0__/{relative}")),
+            stored.contains(&format!("__kache_base_dir_0__/{stored_relative}")),
             "{stored}"
         );
         assert!(!stored.contains("__kache_cwd__/"), "{stored}");
@@ -4233,9 +4254,9 @@ mod tests {
                 prop_assert_eq!(n.normalize(&once), once);
             }
 
-            // Expanding every sentinel back to its one root recovers the NFC input,
-            // so two inputs that differ in more than Unicode form never share an
-            // output (and so never share a key).
+            // Expanding every sentinel back to its one root recovers the input,
+            // so two different inputs never share an output (and so never share
+            // a key), even when they differ only in Unicode form.
             #[test]
             fn normalize_is_injective_when_each_sentinel_has_one_root(input in key_text()) {
                 let n = normalizer();
@@ -4248,12 +4269,12 @@ mod tests {
                 for (sentinel, prefix) in &roots {
                     restored = restored.replace(sentinel.as_str(), prefix);
                 }
-                prop_assert_eq!(restored, input.nfc().collect::<String>());
+                prop_assert_eq!(restored, input);
             }
 
             // Relocating a configured root keeps both normalized text and source
-            // identity equal, and the identity carries the path under the root
-            // byte for byte (no NFC, no `.`/`..` folding).
+            // identity equal, and both carry the path under the root byte for
+            // byte (no NFC, no `.`/`..` folding).
             #[test]
             fn configured_root_relocates_losslessly(
                 parent_a in "[a-z]{1,4}",
@@ -4271,7 +4292,7 @@ mod tests {
                 let path_a = format!("{root_a}/{tail}");
                 let path_b = format!("{root_b}/{tail}");
 
-                let expected_text = format!("<BASE_DIR_0>/{}", tail.nfc().collect::<String>());
+                let expected_text = format!("<BASE_DIR_0>/{tail}");
                 prop_assert_eq!(a.normalize(&path_a), expected_text.clone());
                 prop_assert_eq!(b.normalize(&path_b), expected_text);
 
@@ -4286,5 +4307,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_remapped_in_both_spellings_and_a_plain_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("a-longer-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let prefixes = |path: &Path| {
+            let mut rules = Vec::new();
+            push_rule_spellings(&mut rules, Some(path.to_path_buf()), "<HOME>");
+            rules
+                .into_iter()
+                .map(|rule| rule.prefix)
+                .collect::<Vec<_>>()
+        };
+        let both = prefixes(&link);
+        assert_eq!(
+            both,
+            vec![
+                link.to_str().unwrap().to_string(),
+                real.to_str().unwrap().to_string()
+            ],
+            "both spellings, longer first"
+        );
+        assert_eq!(prefixes(&real), vec![real.to_str().unwrap().to_string()]);
+        let mut rules = Vec::new();
+        push_rule_spellings(&mut rules, None, "<HOME>");
+        assert!(rules.is_empty());
     }
 }

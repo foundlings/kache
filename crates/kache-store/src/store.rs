@@ -51,6 +51,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once, just before a lookup reads an entry's durable flag: the
+    /// window in which another build can evict the entry the lookup found.
+    static DURABLE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(all(test, windows))]
 type DurabilityOpenHook = Box<dyn FnOnce(bool)>;
 
@@ -1114,6 +1122,124 @@ fn record_eviction_failure(stats: &mut GcStats, error: &anyhow::Error) {
     }
 }
 
+/// Where an entry removal moves the names it takes out of the store while it
+/// holds the index's write lock, so the files are removed once the lock is
+/// free again. Under the lock a rename takes the name out of the store, as an
+/// unlink did, so no publisher can adopt a file being removed; the unlink
+/// that frees a blob's extents (a filesystem journal commit, longer with
+/// online discard) runs outside it. A name that cannot be moved is removed
+/// under the lock as before.
+pub(crate) struct EvictedTrash {
+    dir: PathBuf,
+    made: bool,
+    taken: Vec<PathBuf>,
+}
+
+/// The trash's folder in `store/`: a name no cache key can have, which the
+/// entry-directory walks skip.
+pub(crate) const EVICTED_TRASH_DIR: &str = "evicted.trash";
+
+impl EvictedTrash {
+    pub(crate) fn new(store_dir: &Path) -> Self {
+        Self {
+            dir: store_dir.join(EVICTED_TRASH_DIR),
+            made: false,
+            taken: Vec::new(),
+        }
+    }
+
+    /// Take `path` out of the store's names. True when it is gone from
+    /// there (moved, or already absent); false when the caller must remove
+    /// it in place.
+    pub(crate) fn take(&mut self, path: &Path) -> bool {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+        if !self.made {
+            if fs::create_dir_all(&self.dir).is_err() {
+                return false;
+            }
+            self.made = true;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let to = self.dir.join(format!(
+            "{name}.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::rename(path, &to).is_err() {
+            return false;
+        }
+        self.taken.push(to);
+        true
+    }
+
+    /// Remove what this removal took. A file left behind (Windows may refuse
+    /// a delete-pending one) goes at the next sweep's [`Self::empty_leftovers`].
+    pub(crate) fn empty(&mut self) {
+        for path in self.taken.drain(..) {
+            remove_trash_item(&path);
+        }
+    }
+
+    /// Remove everything in the trash folder. Returns how many items went.
+    pub(crate) fn empty_leftovers(&self) -> usize {
+        let Ok(items) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        items
+            .flatten()
+            .filter(|item| remove_trash_item(&item.path()))
+            .count()
+    }
+}
+
+/// Remove one trash item. True when it is gone, including when something
+/// else removed it first.
+fn remove_trash_item(path: &Path) -> bool {
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            #[cfg(windows)]
+            if let Ok(files) = fs::read_dir(path) {
+                for file in files.flatten() {
+                    if let Ok(meta) = fs::metadata(file.path()) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(file.path(), perms);
+                    }
+                }
+            }
+            fs::remove_dir_all(path)
+        }
+        Ok(_meta) => {
+            #[cfg(windows)]
+            {
+                let mut perms = _meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+            fs::remove_file(path)
+        }
+        Err(e) => Err(e),
+    };
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "gc: could not remove {} from the trash, left for the next sweep: {e}",
+                path.display()
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Registered blob bytes and blob rows an entry removal released — blobs
 /// whose last reference went away, not the entry's logical size
 /// (kunobi-ninja/kache#608). Denominated in `blobs` TABLE bytes, the same
@@ -1390,6 +1516,17 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
+/// How long one transaction of the tombstone prune deletes rows before it
+/// commits: it holds the index's write lock this long, plus one row and the
+/// commit.
+const PRUNE_LOCK_HOLD: Duration = Duration::from_millis(100);
+
+/// How long the tombstone prune leaves the write lock free before each of
+/// its transactions: a little longer than the longest sleep (100 ms) of
+/// SQLite's default busy handler between tries, the poll interval of a
+/// writer that has already waited a while.
+const PRUNE_LOCK_GAP: Duration = Duration::from_millis(110);
+
 /// Default maximum wait for another process to publish a key it is building.
 pub const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1412,6 +1549,10 @@ pub fn lock_poll_interval(attempt: u32) -> Duration {
 /// locked, and starts over when it does not.
 pub struct StoreLock {
     file: fs::File,
+    path: PathBuf,
+    /// The note this holder left beside the lock ([`StoreLock::mark_note`]),
+    /// removed before the lock is released.
+    note: Option<PathBuf>,
 }
 
 /// Lock guard for a cache key. Dropping it releases the OS lock.
@@ -1419,6 +1560,12 @@ pub type KeyLock = StoreLock;
 
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub type GcLock = StoreLock;
+
+/// The note beside a lock file ([`StoreLock::mark_note`]): a file of its own
+/// because Windows refuses other processes a read of a locked file's bytes.
+fn note_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("note")
+}
 
 /// How often one acquisition reopens a lock file that was unlinked under it.
 /// Each retry needs the sweep to unlink the same path again, and a file this
@@ -1469,13 +1616,17 @@ impl StoreLock {
             .open(path)?)
     }
 
-    fn finish(mut file: fs::File) -> Result<Self> {
+    fn finish(mut file: fs::File, path: &Path) -> Result<Self> {
         // Diagnostic only: lock ownership is determined exclusively by the OS.
         use std::io::{Seek, SeekFrom, Write};
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         write!(file, "{}", std::process::id())?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            note: None,
+        })
     }
 
     /// Open, lock, then confirm the locked file is the one at `path`.
@@ -1498,7 +1649,7 @@ impl StoreLock {
                 kache_fs::handle_identity(&file),
                 kache_fs::file_identity(path),
             ) {
-                return Ok(Some(Self::finish(file)?));
+                return Ok(Some(Self::finish(file, path)?));
             }
             // Closing the handle releases the lock on the unlinked file.
         }
@@ -1534,6 +1685,43 @@ impl StoreLock {
         Self::acquire_current(path, Self::try_lock_file, || {})
     }
 
+    /// Leave `note` beside the lock for peers that find it held
+    /// ([`StoreLock::held_note`]), in place of any note a holder killed
+    /// earlier left there; `None` removes such a note. The note goes when the
+    /// lock is released. Best effort: a note that cannot be written reads as
+    /// none.
+    ///
+    /// Only the scheduler's discovery flights write notes; key and GC locks
+    /// never do. Lock-file sweeps remove lock files only, so a killed
+    /// holder's note stays until the next holder of the same lock replaces
+    /// or removes it, and the temp file of one killed between its write and
+    /// rename stays: small files, left only by holders that died holding.
+    pub fn mark_note(&mut self, note: Option<&str>) {
+        let path = note_path(&self.path);
+        let Some(note) = note else {
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        let tmp = path.with_extension(format!("note.{}", std::process::id()));
+        if fs::write(&tmp, note).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            self.note = Some(path);
+        } else {
+            // A killed holder's note must not stand in for this holder's.
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    /// The note the holder of the lock at `path` left
+    /// ([`StoreLock::mark_note`]), if any. Read while the lock is held, it is
+    /// the current holder's, none yet, or one a holder killed earlier left
+    /// until the current holder replaces it.
+    pub fn held_note(path: &Path) -> Option<String> {
+        fs::read_to_string(note_path(path))
+            .ok()
+            .filter(|note| !note.is_empty())
+    }
+
     fn wait_until_available(
         path: &Path,
         timeout: Duration,
@@ -1560,6 +1748,9 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        if let Some(note) = self.note.take() {
+            let _ = fs::remove_file(note);
+        }
         let _ = self.file.unlock();
     }
 }
@@ -1729,6 +1920,10 @@ fn compute_content_hash(files: &[CachedFile]) -> String {
 
 const STORE_OPEN_MAX_ATTEMPTS: u32 = 6;
 const STORE_OPEN_RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 250];
+/// How many times a compile store tries to open an index write transaction
+/// when that lock is busy. Each attempt waits out the production
+/// `busy_timeout` (5s). A lock that stays taken still fails the put.
+const COMPILE_STORE_LOCK_ATTEMPTS: u32 = 3;
 
 fn sqlite_open_retry_delay(attempt: u32) -> Duration {
     let idx = attempt.saturating_sub(1) as usize;
@@ -1764,7 +1959,11 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
     // Both checks only read.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
+    if generation == INDEX_SCHEMA_GENERATION
+        && crate::file_hash::has_rule_columns(db)?
+        && crate::cc_memo::has_shadowing_column(db)?
+        && crate::cc_memo::has_header_macros_table(db)?
+    {
         return Ok(());
     }
 
@@ -1961,7 +2160,10 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 ///    payload schema. Compiled cache entries are retained.
 /// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
 /// 14: partial index for pending durability counts and ordered flush batches.
-const INDEX_SCHEMA_GENERATION: i64 = 14;
+/// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
+///    the open also checks for the column.
+/// 16: `cc_header_macros`, checked for the same reason.
+const INDEX_SCHEMA_GENERATION: i64 = 16;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -2587,8 +2789,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if self.read_only {
             return;
         }
-        if let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
-            self.file_hash_cache().lookup_cached(path)
+        if let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) = self
+            .file_hash_cache()
+            .lookup_cached_from(path, crate::file_hash::KEY_INPUT_MEMO_MIN_BYTES)
         {
             self.file_hash_cache().record_cached(&fingerprint, hash);
         }
@@ -3107,7 +3310,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // its refcounts until doctor or an index rebuild.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
-        let tx = self.db.unchecked_transaction()?;
+        // IMMEDIATE, and retried: a deferred transaction upgrades at
+        // `release_entry_blob_refs`'s UPDATE, and SQLite returns
+        // SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT for that upgrade without
+        // calling the busy handler. The lock is then held across blob
+        // rematerialization, so a queue of compile stores can outlast one
+        // busy_timeout window.
+        let tx = self.begin_immediate_writer()?;
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -4273,10 +4482,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         rename: impl FnMut() -> std::io::Result<()>,
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let tx = self.begin_immediate_writer()?;
         if blob.is_file() {
             Self::discard_staged_blob(staged);
             return Ok(PublishRename::LostRace);
@@ -4352,6 +4558,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         Ok(())
+    }
+
+    /// Remove what an entry removal left in the trash: a crash between taking
+    /// a name and removing it, or a delete Windows refused. An eviction also
+    /// does this when it starts, but a sweep that evicts nothing never gets
+    /// there, and the store's size does not count these files. Returns how
+    /// many items went.
+    pub fn sweep_evicted_trash(&self) -> usize {
+        if self.read_only {
+            return 0;
+        }
+        EvictedTrash::new(&self.config.store_dir()).empty_leftovers()
     }
 
     /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
@@ -4495,6 +4713,36 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         !self.config.deferred_durability
     }
 
+    /// `BEGIN IMMEDIATE`, retried while the index write lock is busy.
+    ///
+    /// Publishing a blob, registering the entry, and marking it durable hold
+    /// that lock across filesystem work, so a queue of compile stores can
+    /// outlast one `busy_timeout` window (5s). Each attempt waits out that
+    /// window. A lock that stays taken still fails the put.
+    fn begin_immediate_writer(&self) -> Result<rusqlite::Transaction<'_>> {
+        let mut attempt = 1u32;
+        loop {
+            match rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => return Ok(tx),
+                Err(err) => {
+                    let err = anyhow::Error::from(err);
+                    if attempt < COMPILE_STORE_LOCK_ATTEMPTS && is_sqlite_contention(&err) {
+                        tracing::debug!(
+                            attempt,
+                            "retrying a compile-store index write after lock contention: {err:#}"
+                        );
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Strict success requires a verified flush of the current publication,
     /// including shared blobs. A peer may already have completed that flush.
     fn finish_strict_durability(&self, cache_key: &str) -> Result<()> {
@@ -4514,16 +4762,30 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Whether an entry's blobs and metadata have reached disk. Unknown rows
-    /// read as durable: the size check and the verification policy still apply.
+    /// Whether an entry's blobs and metadata have reached disk. A lookup reads
+    /// this after [`Self::contains`] found the entry committed.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
-        self.db
+        #[cfg(test)]
+        if let Some(hook) = DURABLE_READ_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        match self
+            .db
             .query_row(
                 "SELECT durable FROM entries WHERE cache_key = ?1",
                 params![cache_key],
                 |row| row.get::<_, bool>(0),
             )
-            .unwrap_or(true)
+            .optional()
+        {
+            Ok(Some(durable)) => durable,
+            // Gone since `contains` found it: another build evicted it, and
+            // its blob may still be on disk. Hash it rather than trust its size.
+            Ok(None) => false,
+            // An index that cannot say: the size check and the verification
+            // policy still apply.
+            Err(_) => true,
+        }
     }
 
     /// Entries stored without an fsync that no flush has reached yet.
@@ -4620,11 +4882,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 verified.push(blob);
             }
         }
+        // The metadata and its directory are flushed before the writer lock
+        // too: on macOS each flush is an F_FULLFSYNC, and every lookup and
+        // store waits on the lock. Under the lock the identity checks below
+        // prove the flushed handle is still the published file; `meta.json`
+        // is only ever replaced by a rename, never rewritten in place.
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let tx = self.begin_immediate_writer()?;
         let current_hash: Option<String> = tx
             .query_row(
                 "SELECT content_hash FROM entries
@@ -4634,15 +4909,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )
             .optional()?;
         if current_hash.as_deref() != Some(content_hash.as_str()) {
-            return Ok(false);
-        }
-        let mut metadata_file = match open_published_file(&meta_path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        let mut current_meta = Vec::new();
-        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
-        if current_meta != meta_bytes {
             return Ok(false);
         }
         if sequential {
@@ -4663,8 +4929,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        sync_file(&metadata_file).context("flushing entry metadata")?;
-        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         if kache_fs::file_identity(&meta_path).ok()
             != Some(kache_fs::handle_identity(&metadata_file)?)
         {
@@ -5354,6 +5618,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         held: &std::collections::HashMap<String, u64>,
         stop: &mut dyn FnMut() -> bool,
     ) -> GcStats {
+        // What a removal cut short (a crash, a kill) left between taking a
+        // name out of the store and removing the file.
+        EvictedTrash::new(&self.config.store_dir()).empty_leftovers();
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
         let (slice, pause) = self.eviction_pacing;
@@ -5490,13 +5757,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
+        self.evict_with_stop(policy, stop_at, None, probe_held_bytes, origin, &mut || {
+            false
+        })
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        evict_over: Option<u64>,
         probe_held_bytes: bool,
         origin: SweepOrigin,
         stop: &mut dyn FnMut() -> bool,
@@ -5533,6 +5803,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let bytes_held: u64 = held.values().sum();
         let left_out = self.config.held_bytes_budget.left_out(bytes_held);
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
+        // An automatic sweep is asked for by the store's size less what
+        // target directories held at the last sweep, or by the full size when
+        // no recent figure is on record. Target directories take and let go
+        // of many GB between sweeps. Measured again, a store whose own part
+        // is not over `evict_over` has nothing to give back: evicting down to
+        // the target there only throws away entries early.
+        if let (Some(over), Some((own, _))) = (evict_over, stop_at)
+            && probe_held_bytes
+            && own <= over
+        {
+            tracing::info!(
+                "gc: the store's own part is {own} bytes once {bytes_held} held by target \
+                 directories are left out, not over the trigger ({over}): nothing evicted"
+            );
+            return Ok(GcStats {
+                bytes_held,
+                entries_unreclaimable: held.len(),
+                ..GcStats::default()
+            });
+        }
         let shadow = stop_at.map(|(current, target)| {
             use crate::eviction::EvictionPolicy as _;
             let candidate = crate::eviction::ValueDensityPolicy;
@@ -5605,8 +5895,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             })
             .collect::<Vec<_>>()
         };
-        for (key, hash, size, _, _) in last_refs {
-            if crate::filesystem::blob_has_external_retainer(&self.blob_path(&hash)) {
+        let paths: Vec<PathBuf> = last_refs
+            .iter()
+            .map(|(_, hash, _, _, _)| self.blob_path(hash))
+            .collect();
+        let retained = probe_external_retainers(&paths);
+        for ((key, _, size, _, _), retained) in last_refs.into_iter().zip(retained) {
+            if retained {
                 *held.entry(key).or_insert(0) += size.max(0) as u64;
             }
         }
@@ -5646,11 +5941,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // store without re-querying. A removal that frees less than its
         // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
         // same sweep) only makes the sweep continue longer — never stop early.
-        self.evict_with(
+        // An automatic sweep evicts only while the store's own part, as the
+        // probe measures it, is over the trigger; a requested one keeps the
+        // band.
+        self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
+            (origin == SweepOrigin::Automatic).then_some(self.config.max_size),
             true,
             origin,
+            &mut || false,
         )
     }
 
@@ -5665,6 +5965,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
+            None,
             None,
             false,
             SweepOrigin::Automatic,
@@ -6151,17 +6452,72 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Run from the GC sweep. A tombstone's value is the demand signal in the
     /// window after eviction; past that it is only taking up space.
+    ///
+    /// Neither table has an SQL index on its stamp, so finding the old rows
+    /// reads the whole table. That read runs outside a write transaction,
+    /// and the rows then go by key, a short transaction at a time
+    /// ([`PRUNE_LOCK_HOLD`]), each after the write lock was left free for
+    /// [`PRUNE_LOCK_GAP`], so puts get the lock while a long prune runs.
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
         self.refuse_write("prune tombstones")?;
         let cutoff = format!("-{keep_days} days");
-        let removed = self.db.execute(
-            "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
-        self.db.execute(
-            "DELETE FROM shadow_victims WHERE swept_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
+        let removed = self.prune_rows_older_than("eviction_tombstones", "evicted_at", &cutoff)?;
+        self.prune_rows_older_than("shadow_victims", "swept_at", &cutoff)?;
+        Ok(removed)
+    }
+
+    /// Delete the rows of `table` whose `stamp` is older than `cutoff` (an
+    /// SQLite date modifier).
+    fn prune_rows_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<usize> {
+        let keys = self.keys_older_than(table, stamp, cutoff)?;
+        self.delete_old_rows_by_key(table, stamp, &keys, cutoff)
+    }
+
+    /// The keys of `table` whose `stamp` is older than `cutoff`, read
+    /// without the write lock.
+    fn keys_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT cache_key FROM {table} WHERE {stamp} < datetime('now', ?1)"
+        ))?;
+        let keys = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(keys)
+    }
+
+    /// Delete `keys` from `table`, each only while its `stamp` is still older
+    /// than `cutoff`: a key evicted again since the read has a fresh row,
+    /// which stays. Leaves the write lock free for [`PRUNE_LOCK_GAP`] before
+    /// each transaction and commits after [`PRUNE_LOCK_HOLD`].
+    fn delete_old_rows_by_key(
+        &self,
+        table: &str,
+        stamp: &str,
+        keys: &[String],
+        cutoff: &str,
+    ) -> Result<usize> {
+        let delete =
+            format!("DELETE FROM {table} WHERE cache_key = ?1 AND {stamp} < datetime('now', ?2)");
+        let mut removed = 0;
+        let mut keys = keys.iter().peekable();
+        while keys.peek().is_some() {
+            std::thread::sleep(PRUNE_LOCK_GAP);
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let started = std::time::Instant::now();
+            {
+                let mut stmt = tx.prepare_cached(&delete)?;
+                for key in keys.by_ref() {
+                    removed += stmt.execute(params![key, cutoff])?;
+                    if started.elapsed() >= PRUNE_LOCK_HOLD {
+                        break;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
         Ok(removed)
     }
 
@@ -6653,7 +7009,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             |row| row.get(0),
         )?;
 
-        if republished == 0 {
+        // What the pass takes out of the store's names, removed from disk once
+        // the lock is free again (see [`EvictedTrash`]).
+        let mut trash = EvictedTrash::new(&self.config.store_dir());
+        if republished == 0 && !trash.take(&entry_dir) {
             // Remove the entry directory (just meta.json in new format, may
             // have artifacts in legacy entries). Windows can surface external
             // interference as delete-pending errors (sharing violations from
@@ -6711,13 +7070,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 let blob = self.blob_path(&hash);
                 let disk =
                     crate::filesystem::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
-                unlink_blob(&blob);
+                if !trash.take(&blob) {
+                    unlink_blob(&blob);
+                }
                 reclaim.freed_bytes += size.max(0) as u64;
                 reclaim.disk_bytes_reclaimed += disk;
                 reclaim.blobs_unlinked += 1;
             }
         }
         cleanup_tx.commit()?;
+        trash.empty();
 
         // The key's lock file outlives its entry, and only the full GC's
         // capped sweep removed it. Remove it here by the sweep's rules,
@@ -7120,6 +7482,49 @@ fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> 
     }
     Ok(())
 }
+
+/// Probe each blob for a live file outside the store holding its blocks.
+/// A sweep probes every last-reference blob of the store, each probe a
+/// filesystem round trip; spread over a few threads the sweep holds
+/// `gc.lock` for a fraction of the time.
+fn probe_external_retainers(paths: &[PathBuf]) -> Vec<bool> {
+    const MAX_PROBE_THREADS: usize = 8;
+    const MIN_PROBES_PER_THREAD: usize = 256;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_PROBE_THREADS)
+        .min(paths.len().div_ceil(MIN_PROBES_PER_THREAD))
+        .max(1);
+    if threads == 1 {
+        return paths
+            .iter()
+            .map(|path| crate::filesystem::blob_has_external_retainer(path))
+            .collect();
+    }
+    let chunk = paths.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| crate::filesystem::blob_has_external_retainer(path))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests;
 

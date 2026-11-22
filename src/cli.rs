@@ -18,6 +18,7 @@ use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
 mod doctor_daemon;
+mod doctor_keys;
 mod doctor_probe;
 mod doctor_storage;
 pub mod login;
@@ -86,6 +87,7 @@ impl Default for StatsSnapshot {
             entries: Vec::new(),
             event_stats: daemon::EventStatsResponse {
                 local_hits: 0,
+                readonly_hits: 0,
                 prefetch_hits: 0,
                 remote_hits: 0,
                 dups: 0,
@@ -280,7 +282,7 @@ pub(crate) fn snapshot_from_direct_reads(
 ) -> StatsSnapshot {
     let inventory = crate::store_view::read(config, include_entries, sort_by).unwrap_or_default();
 
-    let since = window.cutoff(chrono::Utc::now());
+    let since = window.cutoff(jiff::Timestamp::now());
     let es = events::event_stats_since(&config.event_log_path(), since).unwrap_or_default();
 
     let recent_summaries = if include_summaries {
@@ -301,6 +303,7 @@ pub(crate) fn snapshot_from_direct_reads(
         stores: inventory.stores,
         event_stats: daemon::EventStatsResponse {
             local_hits: es.local_hits,
+            readonly_hits: es.readonly_hits,
             prefetch_hits: es.prefetch_hits,
             remote_hits: es.remote_hits,
             dups: es.dups,
@@ -921,6 +924,9 @@ pub fn stats(
             #[serde(skip_serializing_if = "Option::is_none")]
             longest_scheduler_wait: Option<&'a kache_core::scheduler::SchedulerWait>,
             local_hits: usize,
+            /// Local hits restored from `[cache] readonly_store`; part of
+            /// `local_hits`.
+            readonly_hits: usize,
             prefetch_hits: usize,
             remote_hits: usize,
             dups: usize,
@@ -969,6 +975,7 @@ pub fn stats(
                 total_permit_wait_ms: snap.event_stats.total_permit_wait_ms,
                 longest_scheduler_wait: snap.event_stats.longest_scheduler_wait.as_ref(),
                 local_hits: snap.event_stats.local_hits,
+                readonly_hits: snap.event_stats.readonly_hits,
                 prefetch_hits: snap.event_stats.prefetch_hits,
                 remote_hits: snap.event_stats.remote_hits,
                 dups: snap.event_stats.dups,
@@ -991,7 +998,7 @@ pub fn stats(
     }
 
     let mut extras = StatsExtras {
-        lifetime: lifetime_rows(lifetime.as_ref(), chrono::Local::now().date_naive()),
+        lifetime: lifetime_rows(lifetime.as_ref(), jiff::Zoned::now().date()),
         ..Default::default()
     };
     extras.cache.extend(cloned_targets_row(&disk));
@@ -1033,8 +1040,8 @@ fn prefetch_session_lines(summaries: &[crate::events::BuildSummaryEvent]) -> Vec
         .take(5)
         .map(|s| {
             vec![
-                s.ts.with_timezone(&chrono::Local)
-                    .format("%m-%d %H:%M")
+                s.ts.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%m-%d %H:%M")
                     .to_string(),
                 if s.session_id.is_empty() {
                     "legacy".to_string()
@@ -1106,13 +1113,13 @@ fn machine_rows(machine: &crate::otel::MachineSnapshot) -> Vec<StatsRow> {
         } else {
             gc.source.as_str()
         };
-        let when = chrono::DateTime::parse_from_rfc3339(&gc.last_run)
+        let when = kache_protocol::time::parse_rfc3339(&gc.last_run)
             .map(|at| {
-                at.with_timezone(&chrono::Local)
-                    .format("%b %d %H:%M")
+                at.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%b %d %H:%M")
                     .to_string()
             })
-            .unwrap_or_else(|_| gc.last_run.clone());
+            .unwrap_or_else(|| gc.last_run.clone());
         let mut note = format!(
             "{source}, {} evicted",
             term::count(gc.entries_evicted as u64)
@@ -1182,7 +1189,7 @@ pub(crate) fn render_stats_with(
 /// every total is. Dates are local, like the `Last GC` row.
 fn lifetime_rows(
     totals: Option<&crate::savings::Totals>,
-    today: chrono::NaiveDate,
+    today: jiff::civil::Date,
 ) -> Vec<StatsRow> {
     let Some(totals) = totals else {
         return Vec::new();
@@ -1223,19 +1230,29 @@ fn lifetime_rows(
     if rows.is_empty() {
         return rows;
     }
-    let since = totals.since.with_timezone(&chrono::Local).date_naive();
+    let since = totals.since.to_zoned(jiff::tz::TimeZone::system()).date();
     rows.insert(0, ("Since", since_label(since, today), String::new()));
     rows
 }
 
 /// `Sep 12`, with the year when it is not this year's.
-fn since_label(since: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
-    use chrono::Datelike;
+fn since_label(since: jiff::civil::Date, today: jiff::civil::Date) -> String {
     if since.year() == today.year() {
-        since.format("%b %d").to_string()
+        since.strftime("%b %d").to_string()
     } else {
-        since.format("%b %d %Y").to_string()
+        since.strftime("%b %d %Y").to_string()
     }
+}
+
+/// How many local hits the read-only store served; empty when none did.
+fn readonly_hits_note(readonly_hits: usize) -> String {
+    if readonly_hits == 0 {
+        return String::new();
+    }
+    format!(
+        "{} of the local hits from the read-only store",
+        term::count(readonly_hits as u64)
+    )
 }
 
 /// Hit rate, source counts, weighted hit rate, time saved and miss time.
@@ -1264,7 +1281,7 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
                 term::count(es.dups as u64),
                 term::count(es.misses as u64),
             ),
-            String::new(),
+            readonly_hits_note(es.readonly_hits),
         ),
     ];
     if let Some(weighted) = compile_weighted_hit_rate(es) {
@@ -1825,9 +1842,9 @@ fn format_epoch_ms_utc(ms: u64) -> String {
     if ms == 0 {
         return "unknown time".to_string();
     }
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "unknown time".to_string())
+    jiff::Timestamp::from_millisecond(ms as i64)
+        .map(|dt| dt.strftime("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|_| "unknown time".to_string())
 }
 
 // ── kache report ──────────────────────────────────────────────────────────
@@ -1988,16 +2005,15 @@ pub fn report(
 /// Format a SQLite datetime string (e.g. "2024-03-12 10:30:00") as a
 /// human-readable relative time like "2h ago", "3d ago", etc.
 fn format_relative_time(sqlite_dt: &str) -> String {
-    let parsed = chrono::NaiveDateTime::parse_from_str(sqlite_dt, "%Y-%m-%d %H:%M:%S")
+    let parsed = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", sqlite_dt)
         .ok()
-        .map(|naive| {
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
-        });
+        .and_then(|civil| civil.to_zoned(jiff::tz::TimeZone::UTC).ok())
+        .map(|zoned| zoned.timestamp());
 
     match parsed {
         Some(dt) => {
-            let dur = chrono::Utc::now().signed_duration_since(dt);
-            let secs = dur.num_seconds().max(0);
+            let dur = jiff::Timestamp::now().duration_since(dt);
+            let secs = dur.as_secs().max(0);
             if secs < 60 {
                 "just now".to_string()
             } else if secs < 3600 {
@@ -2797,7 +2813,7 @@ impl<'a> UncachedCompile<'a> {
             &event.passthrough_reason
         };
         Self {
-            ts: event.ts.to_rfc3339(),
+            ts: kache_protocol::time::rfc3339(event.ts),
             result: event.result.to_string(),
             cache_key: &event.cache_key,
             reason,
@@ -7440,6 +7456,8 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Install path"
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
+        || label == doctor_keys::FILE_HASH_MEMO
+        || label == doctor_keys::KEY_TIME
         || label == "Store warning history"
         || label == "Store file limits"
         || label == "Store volume probe"
@@ -7800,6 +7818,21 @@ fn cargo_output_dir_from(
         env.build_dir.as_deref(),
     )?;
     closest_existing(output)
+}
+
+/// Where a Rust build's key inputs live: the workspace, Cargo's registry
+/// sources, and the output directory dependencies are read from.
+fn doctor_memo_roots() -> Vec<(&'static str, std::path::PathBuf)> {
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cargo_workspace_root(&cwd));
+    let mut roots: Vec<_> = workspace
+        .map(|path| ("workspace", path))
+        .into_iter()
+        .collect();
+    roots.push(("Cargo home", cargo_home_dir()));
+    roots.extend(cargo_output_dir().map(|path| ("target directory", path)));
+    roots
 }
 
 /// `$CARGO_HOME`, falling back to the platform's home directory (cargo's
@@ -8182,6 +8215,9 @@ pub fn doctor(
             cfg.target_liveness,
             cargo_output_dir().as_deref(),
         ));
+        if cfg!(windows) {
+            checks.push(doctor_keys::memo_volume_check(&doctor_memo_roots()));
+        }
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
             checks.push(Check {
@@ -8449,6 +8485,11 @@ pub fn doctor(
 
     if let Some(ref cfg) = config
         && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
+    {
+        checks.push(check);
+    }
+    if let Some(ref cfg) = config
+        && let Some(check) = doctor_keys::key_time_check(&cfg.event_log_path())
     {
         checks.push(check);
     }
@@ -9027,7 +9068,19 @@ async fn sync_inner(
     .await
 }
 
-/// List the requested crate prefixes within the same limit as sync transfers.
+/// In-flight sync transfers. The daemon's `s3_concurrency` permit pool is a
+/// separate limit and must not shrink this one.
+const SYNC_TRANSFER_JOBS: usize = 32;
+
+/// How many sync uploads or downloads may run at once.
+///
+/// A daemon pool below [`SYNC_TRANSFER_JOBS`] does not lower the result. A
+/// larger pool is honored.
+fn sync_transfer_jobs(daemon_pool: u32) -> usize {
+    SYNC_TRANSFER_JOBS.max(daemon_pool as usize)
+}
+
+/// List the requested crate prefixes, overlapping up to `concurrency` listings.
 async fn list_remote_crates(
     remote: &dyn crate::cache_remote::CacheRemote,
     crates: &std::collections::HashSet<String>,
@@ -9199,7 +9252,7 @@ async fn sync_with_client(
         return Ok(());
     }
 
-    let max_concurrent = (config.s3_concurrency as usize).max(1);
+    let max_concurrent = sync_transfer_jobs(config.s3_concurrency);
     let mut total_failed = 0;
 
     // ── Pull phase ──────────────────────────────────────────────
@@ -9213,7 +9266,8 @@ async fn sync_with_client(
             // Bounded concurrency: wait for a slot
             while in_flight.len() >= max_concurrent {
                 use futures::StreamExt;
-                in_flight.next().await;
+                let finished = in_flight.next().await;
+                debug_assert!(finished.is_some(), "sync transfer wait made no progress");
                 eprint!(
                     "\r  Downloading: {}/{}",
                     ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -9310,7 +9364,8 @@ async fn sync_with_client(
         for (key, crate_name) in to_push {
             while in_flight.len() >= max_concurrent {
                 use futures::StreamExt;
-                in_flight.next().await;
+                let finished = in_flight.next().await;
+                debug_assert!(finished.is_some(), "sync transfer wait made no progress");
                 eprint!(
                     "\r  Uploading: {}/{}",
                     ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -9635,7 +9690,7 @@ async fn upload_manifest_and_shards(
 ) -> Result<()> {
     let manifest = crate::remote::BuildManifest {
         version: 3,
-        created: chrono::Utc::now().to_rfc3339(),
+        created: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
         manifest_key: key.to_string(),
         entries: entries.clone(),
     };
@@ -10197,6 +10252,10 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
             "Repairing: reclaimed {} stale staging files ({})",
             swept_staging.removed,
             ByteSize(swept_staging.bytes_reclaimed)
+        );
+        println!(
+            "Repairing: removed {} items left in the eviction trash",
+            store.sweep_evicted_trash()
         );
         let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(config, STAGING_SWEEP_GRACE);
         println!(

@@ -1,6 +1,6 @@
 [package]
 name = "kache-store"
-version = "2.1.1"
+version = "2.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Local content-addressed artifact storage for kache."
@@ -20,11 +20,11 @@ name = "bench-cc-memos"
 required-features = ["test-support"]
 
 [dependencies]
-kache-core = { version = "2.1.1", path = "../kache-core", default-features = false }
-kache-format = { version = "2.1.1", path = "../kache-format" }
-kache-fs = { version = "2.1.1", path = "../kache-fs", features = ["staging"] }
+kache-core = { version = "2.3.0", path = "../kache-core", default-features = false }
+kache-format = { version = "2.3.0", path = "../kache-format" }
+kache-fs = { version = "2.3.0", path = "../kache-fs", features = ["staging"] }
 anyhow = "1"
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
@@ -49,6 +49,9 @@ windows-sys = { version = "0.61", features = [
     # GetSystemTimeAsFileTime: the system time NTFS stamps files with, which
     # a build start is read from (file_hash::stamp_clock_ns).
     "Win32_System_SystemInformation",
+    # NtQuerySystemInformation(SystemTimeOfDayInformation): the boot time a
+    # file-hash memo row must postdate (file_hash::windows_boot_time_secs).
+    "Wdk_System_SystemInformation",
 ] }
 blake3 = { version = "1", features = ["pure"] }
 

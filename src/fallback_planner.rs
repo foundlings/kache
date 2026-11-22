@@ -541,10 +541,13 @@ mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            auto_clean_superseded_executables: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
             build_script_omit_cargo_source_dir_mtime: false,
+            build_script_out_dir_max_size:
+                kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
             gc_evict_shared: false,
             held_bytes_budget: Default::default(),
             storage_layout_advice: true,

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 pub use kache_core::scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,8 @@ impl MissReason {
 /// A single build event logged by the wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildEvent {
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub ts: Timestamp,
     pub crate_name: String,
     /// Build tree/root this compiler invocation belongs to.
     ///
@@ -107,6 +108,7 @@ pub struct BuildEvent {
     /// 25 = reasons for compiled results that were not stored.
     /// 26 = successful compilation outputs and captured package identity.
     /// 27 = recorded scheduler decisions and admission outcomes.
+    /// 28 = local hits served from the read-only store.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -275,6 +277,11 @@ pub struct BuildEvent {
     /// state seeded this compile. Empty when none did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub incremental_seed: String,
+    /// How the first private compile of a unit looked for another checkout's
+    /// incremental state: `imported`, `no-donor` or `unportable`. Empty when
+    /// it did not look. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_seed_attempt: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
     /// were then not cached (kunobi-ninja/kache#629).
     ///
@@ -405,6 +412,11 @@ pub struct BuildEvent {
     /// Package a build-script run belongs to. Empty for compiles. Schema 23.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub package: String,
+    /// A `LocalHit` restored from `[cache] readonly_store` rather than from
+    /// this process's own store. Always false on other results. Events before
+    /// schema 28 omit it, so their source is unknown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly_store: bool,
 }
 
 impl BuildEvent {
@@ -500,7 +512,8 @@ impl std::fmt::Display for EventResult {
 /// events by `session_id` + `cache_key` for full attribution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildSummaryEvent {
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub ts: Timestamp,
     pub schema: u32,
     /// Shutdown could not observe every prefetch outcome. Completed counters
     /// remain lower bounds; missing bytes and attempts must not be read as zero.
@@ -569,7 +582,7 @@ impl BuildEvent {
         cache_key: &str,
     ) -> BuildEvent {
         BuildEvent {
-            ts: Utc::now(),
+            ts: crate::time::now(),
             crate_name: crate_name.to_string(),
             root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),
@@ -624,6 +637,7 @@ impl BuildEvent {
             store_error: String::new(),
             store_handed_off: false,
             incremental_seed: String::new(),
+            incremental_seed_attempt: String::new(),
             daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
@@ -640,6 +654,7 @@ impl BuildEvent {
             miss_reason: MissReason::None,
             object_output: String::new(),
             package: String::new(),
+            readonly_store: false,
         }
     }
 }

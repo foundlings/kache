@@ -47,7 +47,7 @@ Kache reads only that one file, plus the [host config](#host-config); a `.kache.
 
 Each process walks up from its own current directory. Cargo compiles packages under the workspace root from the workspace root, but compiles registry and git dependencies, and runs their build scripts, from each package's source directory under `$CARGO_HOME`, so those compiles do not see your project's `.kache.toml`. A daemon that a build starts resolves its file from the directory of the compile that started it, which can be a dependency's source directory. To apply a setting to every compile and to the daemon, put it in your user config or the host config, or point `KACHE_CONFIG` at the file.
 
-If the chosen file is not valid TOML, or a key has the wrong type, compiler configuration resolution falls back to environment variables and defaults for the whole file, including the host overlay. Run `kache doctor` to check the selected file; the editor and file-editing subcommands refuse invalid TOML instead of saving over it. Byte-size settings (`local_max_size`, `restore_max_size`, `event_log_max_size`, `prefetch_max_bytes`, `auto_recover_min_free_bytes`) accept integer bytes or quoted unit strings. `GB` means 1,000,000,000 bytes; `GiB` means 1,073,741,824. Units are case-insensitive; fractional values such as `"1.5GiB"` also work.
+If the chosen file is not valid TOML, or a key has the wrong type, compiler configuration resolution falls back to environment variables and defaults for the whole file, including the host overlay. Run `kache doctor` to check the selected file; the editor and file-editing subcommands refuse invalid TOML instead of saving over it. Byte-size settings (`local_max_size`, `restore_max_size`, `build_script_out_dir_max_size`, `event_log_max_size`, `prefetch_max_bytes`, `auto_recover_min_free_bytes`) accept integer bytes or quoted unit strings. `GB` means 1,000,000,000 bytes; `GiB` means 1,073,741,824. Units are case-insensitive; fractional values such as `"1.5GiB"` also work.
 
 The same units work in environment variables and `kache config set`:
 
@@ -140,11 +140,12 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
-| `KACHE_RESTORE_MAX_SIZE` | `cache.restore_max_size` | `8GiB` | Positive per-entry limit for compressed remote downloads, extracted remote files and unpacked debug bundles. Oversized entries fall back to compilation. Restart the daemon after changing it. |
+| `KACHE_RESTORE_MAX_SIZE` | `cache.restore_max_size` | `8GiB` | Positive per-entry limit for compressed remote downloads, extracted remote files and restored debug bundles. Oversized entries fall back to compilation. Restart the daemon after changing it. |
 | `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10GiB`; `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
+| `KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES` | `cache.auto_clean_superseded_executables` | `0` | Keep this many builds of each test binary, program, example and bench in target directories still in use, and let the daemon remove older ones; `0` disables it. See [Superseded executables](#superseded-executables). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
@@ -155,7 +156,8 @@ local_max_size = "200GiB"
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_BLAZE` | `cache.blaze` | `false` | Route eligible local Cargo commands through an installed Blaze client. See [Optional Blaze builds](#optional-blaze-builds). |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
-| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. On GitHub Actions and GitLab CI, every job except a push to a protected branch is also forced read-only, and `=0` does not turn that off. A pull request job with `pull_request_prefix` set writes under that prefix instead, unless this setting is on or the remote is OCI. See [Who may write](/docs/remote-cache/ci#who-may-write). |
+| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. `=0` still respects the [CI write policy](/docs/remote-cache/ci#who-may-write). |
+| `KACHE_GITHUB_SCHEDULE_WRITES` | none | `false` | Allow a scheduled GitHub Actions job on a protected branch to write to its remote cache. Set `1` in that job's environment. The job needs write access to the backend, and read-only mode still takes precedence. |
 | `KACHE_DAEMON_EXECUTION_CONCURRENCY` | `cache.daemon_execution_concurrency` | automatic | Concurrent daemon pipeline requests: four per available CPU, at least 32. A positive integer overrides that default; `0` selects automatic sizing. On Unix, the daemon can lower the count to fit its open-file limit and logs the reduction. RPC and blocking-thread capacity grow with this setting. It does not change compiler scheduler permits. Restart the daemon after changing it; an installed service reads its own environment and config. |
 | `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. With the [test runner](#test-runner), it paces test binaries too. |
 | `KACHE_SCHEDULER_MEMORY_PRESSURE` | `cache.scheduler_memory_pressure` | `true` | Reduce ordinary compiler concurrency under memory pressure. See [Limits](/docs/how-it-works/limits) for the shared ceiling and recovery admission. |
@@ -257,7 +259,7 @@ While a daemon is running, it does the sweeping. A build that finds the store ov
 
 Every automatic sweep records the store size it ended at, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
 
-`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. By default, for 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
+`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. By default, for 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew. An automatic sweep whose fresh measurement finds the store minus held bytes not over `local_max_size` evicts nothing and records the new figure. `kache gc` still evicts down to 90%.
 
 Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that downloads entries from the remote and then runs several cargo commands keeps them for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
 
@@ -324,6 +326,7 @@ The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The va
 - Kache skips index writes, hit stamps and maintenance there. A damaged or legacy entry is a miss. A rejected hit compiles and caches in your own writable store.
 - Its owner must keep the WAL side files available. A WAL-mode index without `index.db-wal` and `index.db-shm` is skipped with a warning. A read-only mount is required to prevent SQLite from creating side files if the owner removes them during an open. The connection alone cannot enforce that protection on a writable mount.
 - With a read-only store set, a unit with no record in the local store is keyed before it compiles, so it can still hit there.
+- `kache stats` and `kache report` count its hits as local hits and also report them on their own as `readonly_hits`, so you can see how much of the local hit count the shared store served. Hits logged by older versions of kache are not marked.
 
 The read-only path is used as configured. `KACHE_TRUST_DOMAIN` isolates your writable store and runtime, but does not change this path. Mount a store that the job is allowed to read for its trust domain.
 
@@ -467,6 +470,21 @@ The same pass reclaims idle graphs under `incremental.kache-auto`, including gra
 
 Terminal width, color and diagnostic format share one incremental directory. Cached diagnostics still use separate cache keys.
 
+### Superseded executables
+
+Frequent `cargo test` runs fill `target/debug/deps` with old test binaries. A change of features, a dependency update or a new toolchain gives a test binary a new unit hash, and Cargo keeps the old build beside it. Agents that test after every edit can collect gigabytes of these within a day, long before unused-unit cleanup would notice them.
+
+Set how many builds of each executable to keep, and the same hourly check removes the older ones from every tracked target directory that stays:
+
+```toml
+[cache]
+auto_clean_superseded_executables = 2
+```
+
+Builds of one executable are those of the same package and target in the same profile, such as the unit tests of one library or one integration test. They are ranked by when Cargo last built them. Keep at least `2` when you alternate commands that build a target with different features, such as `cargo test -p app` and `cargo test --workspace`; with `1`, each command would remove the other's build. Only test binaries, programs, examples and benches count. Libraries, build scripts and `cargo check` output are left to unused-unit cleanup.
+
+Nothing is removed while a command through kache uses the target directory, from a profile a build holds, or from a directory Cargo did not tag as its own. A build that is removed and needed again is restored from the cache or built again.
+
 ### Recorded-command cleanup
 
 Enable receipts for an active workspace, then preview its obsolete build units:
@@ -513,6 +531,7 @@ Missing, changed or incomplete evidence keeps the units. Unsupported layouts, sy
 | `KACHE_VERIFY_INPUT_PREDICTIONS` | none | off | `sampled` or `always`: also run the dep-info pre-pass for a validated prediction and count disagreements in the report. The pre-pass result is the one used |
 | `KACHE_BUILD_SCRIPT_HERMETIC` | `cache.build_script_hermetic` | `false` | On Unix, run cached build scripts with `OUT_DIR` in a shared directory named by their inputs, so a run is shared across target directories. See [Build scripts](/docs/how-it-works/build-scripts). |
 | `KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME` | `cache.build_script_omit_cargo_source_dir_mtime` | `false` | Omit directory timestamps for declared inputs resolved inside this Cargo home's `registry/src` or `git/checkouts`. Enable only when scripts do not read those timestamps; Kache cannot detect that read. File contents/times and symlink referent times remain keyed. Applies to normal and hermetic runs. See [Build scripts](/docs/how-it-works/build-scripts). |
+| `KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE` | `cache.build_script_out_dir_max_size` | `5GiB` | Largest build-script output kache stores: the files in `OUT_DIR` plus the target files the script names. A larger run is not cached and runs again. Must be greater than zero. A run this large uploads to a remote only when `cache.remote_upload_memory_bytes` covers its compressed size. |
 | `KACHE_BUILD_SCRIPT_CACHE` | none | `true` on Linux and macOS | Cache build-script runs: restore `OUT_DIR` and the script's output instead of running it when its binary, Cargo environment and declared `rerun-if-*` inputs match a recorded run. See [Build scripts](/docs/how-it-works/build-scripts). |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
@@ -647,6 +666,19 @@ propagate_to_dependents = true
 ```
 
 Workspace rules are accepted only from the `.kache.toml` beside the active Cargo workspace manifest. After adding a declaration to a target Cargo already considers fresh, rebuild that package once.
+
+## Tool output in the workspace
+
+Kache reuses a workspace crate's recorded inputs only while the workspace holds what the recording build saw (see [Rust key inputs](/docs/how-it-works/cache-key#rust-key-inputs)). Tools that write into the tree, such as pnpm installing `node_modules`, leave files that differ between checkouts. A new worktree then runs dependency discovery for every workspace crate, even when each crate then restores from the cache.
+
+Use it only for directories that nothing reads while Rust compiles: no proc macro, build script or `include_str!`-style macro opens, lists or scans anything in them. List such a directory in the `.kache.toml` at the workspace root:
+
+```toml title=".kache.toml"
+[workspace]
+guard_exclude = ["node_modules"]
+```
+
+Each entry is a directory name, left out at any depth below the workspace root and matched without ASCII case. Kache cannot check that the directory is unread. If something does read it, a change there can go unseen and a crate can restore a result built from the old files. For example, a proc macro that reads a config file in the directory without reporting it, and picks which other files to include from it, keeps its old result when that config file changes. A crate whose recorded inputs name a file in a left-out directory keeps running dependency discovery, but most reads are not recorded that way. Kache ignores the whole list when any entry is not a single name, such as `web/node_modules`.
 
 ## Remote settings
 
@@ -809,6 +841,7 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_OUT_DIR_ALIAS_ROOT` | `cache.out_dir_alias_root` | `<cache>/out-dirs` | Absolute path to a shared alias root, independent of the local store. Use the same path on each fleet host to keep proc-macro bytes and dependent keys stable across stores. Kache creates it if missing; it must be owned by the build user, forbid writes by other users, and sit outside the checkout and target directories. An unsafe root disables aliasing. |
 | `KACHE_DEFERRED_DURABILITY` | `cache.deferred_durability` | `true` | Store a miss or a downloaded entry without an fsync and let a background worker flush it a moment later; a hit on an entry not yet flushed verifies its bytes first. Set to `0` to flush every entry inside the compile or download that stored it. |
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
+| `KACHE_KEEP_INDEX_RESIDENT` | none | on (Linux) | Every 30 seconds the daemon reads pages of `index.db` and its WAL that left the page cache back in, up to 1 GiB a pass, and reads one byte of each page still cached so it stays there. A hit then reads the index from memory instead of from a disk busy with build writes. It runs only while available memory is at least 8 times the index and at least 16 GiB, and waits longer between passes, up to 8 minutes, while what it read back keeps leaving. Set to `0` to turn it off. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
 | `KACHE_LOG` | none | CLI: `kache=warn`; wrapper: off | Stderr tracing filter |
 | `KACHE_LOG_FILE` | none | CLI/daemon: `kache=info`; wrapper: off | File tracing filter and wrapper opt-in. The file is `~/Library/Logs/kache/kache.log` on macOS and `kache.log` in the default store directory elsewhere, even when `KACHE_CACHE_DIR` or `cache.local_store` moves the store. A process that starts while it is over 5 MiB truncates it |
@@ -838,7 +871,7 @@ ignore_env = true
 
 It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`, S3 and OCI credentials, logging, progress, or other environment-only controls. It does suppress `KACHE_PLANNER_TOKEN`, which has a TOML key. Kache warns when it ignores a set variable.
 
-The daemon reads configuration at startup and watches the active config file and the host config. When either changes, the daemon drains and exits, and the next start loads the new settings. Other settings come from the environment the daemon started with. A daemon started by a build, `kache daemon start` or `kache daemon restart` drops the variables that select the remote (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT` and `KACHE_LOCAL_ONLY`), so set those in the config file, or run `kache daemon run` from that environment. An installed service uses its service definition, not your current shell. See [Updates and config changes](/docs/daemon/lifecycle#updates-and-config-changes).
+The daemon reads configuration at startup and watches the active config file and the host config. When either changes, the daemon waits until no request is running, then drains and exits, and the next start loads the new settings. Other settings come from the environment the daemon started with. A daemon started by a build, `kache daemon start` or `kache daemon restart` drops the variables that select the remote (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT` and `KACHE_LOCAL_ONLY`), so set those in the config file, or run `kache daemon run` from that environment. An installed service uses its service definition, not your current shell. See [Updates and config changes](/docs/daemon/lifecycle#updates-and-config-changes).
 
 ### Shared empty OUT_DIRs across stores
 

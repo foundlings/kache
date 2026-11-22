@@ -2,7 +2,7 @@
 name = "kache"
 default-run = "kache"
 autobins = false
-version = "2.1.1"
+version = "2.3.0"
 edition = "2024"
 description = "Compiler cache for Rust, C/C++ and CUDA, with S3, GCS, shared-filesystem and OCI remotes."
 license = "Apache-2.0"
@@ -61,16 +61,16 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
-kache-client = { version = "2.1.1", path = "crates/kache-client" }
-kache-config = { version = "2.1.1", path = "crates/kache-config" }
-kache-protocol = { version = "2.1.1", path = "crates/kache-protocol" }
-kache-ipc = { version = "2.1.1", path = "crates/kache-ipc", features = ["async"] }
+kache-client = { version = "2.3.0", path = "crates/kache-client" }
+kache-config = { version = "2.3.0", path = "crates/kache-config" }
+kache-protocol = { version = "2.3.0", path = "crates/kache-protocol" }
+kache-ipc = { version = "2.3.0", path = "crates/kache-ipc", features = ["async"] }
 foldhash = "0.2"
 kunobi-daemon = { version = "0.10.3", features = ["wire-async", "local-async", "launch"] }
-kache-format = { version = "2.1.1", path = "crates/kache-format" }
-kache-fs = { version = "2.1.1", path = "crates/kache-fs" }
-kache-store = { version = "2.1.1", path = "crates/kache-store" }
-kache-shims = { version = "2.1.1", path = "crates/kache-shims" }
+kache-format = { version = "2.3.0", path = "crates/kache-format" }
+kache-fs = { version = "2.3.0", path = "crates/kache-fs" }
+kache-store = { version = "2.3.0", path = "crates/kache-store" }
+kache-shims = { version = "2.3.0", path = "crates/kache-shims" }
 blake3 = "1"
 bytes = "1"
 # OpenDAL publishes its modules as separate crates. Depending on only the
@@ -93,7 +93,7 @@ reqsign-aws-v4 = { version = "=3.3.1", default-features = false }
 reqsign-core = { version = "=3.3.2", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-kache-core = { version = "2.1.1", path = "crates/kache-core", default-features = false, features = ["planning"] }
+kache-core = { version = "2.3.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -104,7 +104,7 @@ toml = "1"
 toml_edit = "0.25"
 clap = { version = "4", features = ["derive", "string"] }
 clap_complete = "4"
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 ratatui = "0.30"
 crossterm = "0.29"
 filetime = "0.2"
@@ -115,7 +115,7 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 zstd = "0.14"
 bytesize = "2"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = "0.2.46"
 dirs = "7"
 home = "0.5.12"
 tar = "0.4"
@@ -133,10 +133,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `kache login` and planner bearer sessions. The -core features keep reqwest
 # on `rustls-no-provider`, so ring stays the only TLS provider (no aws-lc).
 kunobi-auth = { version = "1.1.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
-interprocess = { version = "2.4.7", features = ["tokio"] }
-# Unicode tables affect persisted cache-key bytes. Keep Unicode 17 until
-# normalization changes have a reviewed cache-key compatibility migration.
-unicode-normalization = "=0.1.25"
+interprocess = { version = "2.4.8", features = ["tokio"] }
+unicode-normalization = "0.1.26"
 # Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC
 # flag classifier). The `regex` crate is linear-time by construction
 # (no backtracking, no lookarounds) — matters because the wrapper runs
@@ -170,10 +168,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-kache-config = { version = "2.1.1", path = "crates/kache-config", features = ["test-support"] }
-kache-protocol = { version = "2.1.1", path = "crates/kache-protocol", features = ["test-support"] }
-kache-store = { version = "2.1.1", path = "crates/kache-store", features = ["test-support"] }
-kache-fs = { version = "2.1.1", path = "crates/kache-fs", features = ["testing"] }
+kache-config = { version = "2.3.0", path = "crates/kache-config", features = ["test-support"] }
+kache-protocol = { version = "2.3.0", path = "crates/kache-protocol", features = ["test-support"] }
+kache-store = { version = "2.3.0", path = "crates/kache-store", features = ["test-support"] }
+kache-fs = { version = "2.3.0", path = "crates/kache-fs", features = ["testing"] }
 assert_cmd = "2"
 axum = "0.8"
 predicates = "3"

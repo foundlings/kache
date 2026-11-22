@@ -1134,6 +1134,36 @@ fn unused_unit_cleanup_defaults_to_thirty_days() {
 }
 
 #[test]
+fn superseded_executable_cleanup_is_off_by_default() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let name = "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES";
+    let _missing = NamedEnvGuard::remove(name);
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 0);
+    std::fs::write(
+        &config_path,
+        "[cache]\nauto_clean_superseded_executables = 2\n",
+    )
+    .unwrap();
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 2);
+    let _env = NamedEnvGuard::set(name, "3");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 3);
+    drop(_env);
+    let _garbage = NamedEnvGuard::set(name, "many");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 2);
+    drop(_garbage);
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nauto_clean_superseded_executables = 1\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set(name, "9");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 1);
+}
+
+#[test]
 fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3356,9 +3386,11 @@ fn test_file_config_roundtrip() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             build_script_omit_cargo_source_dir_mtime: None,
+            build_script_out_dir_max_size: None,
             gc_evict_shared: None,
             count_held_in_max_size: None,
             storage_layout_advice: None,
@@ -4027,9 +4059,11 @@ fn test_config_store_dir() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4126,9 +4160,11 @@ fn test_config_index_db_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4221,9 +4257,11 @@ fn test_config_event_log_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4335,9 +4373,11 @@ fn test_config_socket_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -5085,9 +5125,11 @@ fn test_save_and_load_file_config() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             build_script_omit_cargo_source_dir_mtime: None,
+            build_script_out_dir_max_size: None,
             gc_evict_shared: None,
             count_held_in_max_size: None,
             storage_layout_advice: None,
@@ -5424,6 +5466,39 @@ fn protected_branch_push_keeps_configured_writable() {
         !config.remote_readonly,
         "a protected-branch push must keep the configured write mode"
     );
+}
+
+#[test]
+fn protected_branch_schedule_respects_readonly_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let load_readonly = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            ("KACHE_CONFIG", config_path.to_str().unwrap()),
+            ("KACHE_HOST_CONFIG", ""),
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", "schedule"),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("GITHUB_REF_PROTECTED", "true"),
+        ];
+        vars.extend_from_slice(extra);
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(dir.path().into()),
+            Some(dir.path().into()),
+            dir.path().into(),
+        );
+        Config::load_for(&invocation).unwrap().remote_readonly
+    };
+
+    let opt_in = ("KACHE_GITHUB_SCHEDULE_WRITES", "1");
+    assert!(load_readonly(&[("KACHE_REMOTE_READONLY", "0")]));
+    assert!(load_readonly(&[("KACHE_GITHUB_SCHEDULE_WRITES", "0")]));
+    assert!(!load_readonly(&[opt_in]));
+    assert!(load_readonly(&[opt_in, ("KACHE_REMOTE_READONLY", "1")]));
+
+    std::fs::write(&config_path, "[cache]\nremote_readonly = true\n").unwrap();
+    assert!(load_readonly(&[opt_in]));
 }
 
 #[test]
@@ -6762,6 +6837,59 @@ fn cargo_source_directory_time_omission_requires_its_own_explicit_opt_in() {
     )
     .unwrap();
     assert!(load(&[(env, "0")]));
+}
+
+#[test]
+fn build_script_output_limit_defaults_to_five_gib_and_rejects_zero() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(".kache.toml");
+    let load = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+        ];
+        vars.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(root.path().into()),
+            Some(root.path().into()),
+            root.path().into(),
+        );
+        Config::load_for(&invocation)
+            .unwrap()
+            .build_script_out_dir_max_size
+    };
+    const GIB: u64 = 1 << 30;
+    let env = "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE";
+    assert_eq!(load(&[]), 5 * GIB);
+    assert_eq!(load(&[(env, "8GiB")]), 8 * GIB);
+    assert_eq!(load(&[(env, "0")]), 5 * GIB, "zero is ignored");
+    assert_eq!(load(&[(env, "lots")]), 5 * GIB);
+    std::fs::write(&path, "[cache]\nbuild_script_out_dir_max_size = \"2GiB\"\n").unwrap();
+    assert_eq!(load(&[]), 2 * GIB);
+    assert_eq!(load(&[(env, "3GiB")]), 3 * GIB, "the environment wins");
+    assert_eq!(
+        load(&[(env, "0")]),
+        2 * GIB,
+        "a zero falls back to the file"
+    );
+    std::fs::write(
+        &path,
+        "[cache]\nignore_env = true\nbuild_script_out_dir_max_size = \"2GiB\"\n",
+    )
+    .unwrap();
+    assert_eq!(load(&[(env, "3GiB")]), 2 * GIB, "ignore_env keeps the file");
+    std::fs::write(&path, "[cache]\nbuild_script_out_dir_max_size = \"lots\"\n").unwrap();
+    assert_eq!(load(&[]), 5 * GIB);
+    std::fs::write(&path, "[cache]\nbuild_script_out_dir_max_size = 0\n").unwrap();
+    assert_eq!(load(&[]), 5 * GIB);
 }
 
 #[test]

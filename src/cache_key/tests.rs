@@ -839,6 +839,254 @@ fn a_new_linker_behind_the_same_driver_changes_the_native_link_key() {
     assert_ne!(key(), old, "an upgraded linker must re-key the link");
 }
 
+/// Two wrapper scripts that `-C linker` names answer `--version` and place
+/// the CRT objects as the compiler they wrap does, but link differently (one
+/// adds `-no-pie`, one asks for RELR relocations): their links key apart, by
+/// the wrappers' bytes. A link through the `cc` on PATH folds no driver
+/// bytes, so its key stays what it was.
+#[cfg(unix)]
+#[test]
+fn a_wrapper_named_by_linker_keys_its_links_by_its_own_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    for file in ["crt1.o", "crti.o", "libc.so"] {
+        std::fs::write(root.join("lib").join(file), file).unwrap();
+    }
+    let compiler = |extra: &str| {
+        format!(
+            r#"#!/bin/sh
+# {extra}
+case "$1" in
+    --version) echo "cc (GCC) 15.2.0" ;;
+    -print-search-dirs) printf 'libraries: =%s/lib\n' "$PWD" ;;
+    -print-file-name=*)
+        name=${{1#-print-file-name=}}
+        if [ -f "$PWD/lib/$name" ]; then printf '%s\n' "$PWD/lib/$name"; else printf '%s\n' "$name"; fi ;;
+esac
+"#
+        )
+    };
+    kache_fs::testutil::write_executable(&bin.join("cc"), compiler("the compiler"));
+    let no_pie = root.join("cc-no-pie");
+    let relr = root.join("cc-relr");
+    kache_fs::testutil::write_executable(&no_pie, compiler("adds -no-pie"));
+    kache_fs::testutil::write_executable(&relr, compiler("adds -Wl,-z,pack-relative-relocs"));
+    let env = InvocationEnv::from_parts(
+        [("PATH", bin.to_str().unwrap())],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let memo = root.join("probes");
+    let hash = |path: &Path| -> Result<String> {
+        Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
+    };
+    let objects = |driver: &Path| native_linux_link_objects_for(&memo, driver, hash, &env).unwrap();
+
+    assert_eq!(objects(&no_pie)["crt1.o"], objects(&relr)["crt1.o"]);
+    assert_ne!(
+        objects(&no_pie),
+        objects(&relr),
+        "two wrappers with one banner must not share a link key"
+    );
+    let through_cc = objects(&bin.join("cc"));
+    assert_eq!(
+        through_cc,
+        crate::native_link_key::probe_linux_crt_objects_memoized_for(
+            &memo,
+            &bin.join("cc"),
+            hash,
+            &env
+        )
+        .unwrap(),
+        "a link through the PATH's cc keeps its key"
+    );
+    let alias = root.join("gcc");
+    std::os::unix::fs::symlink(bin.join("cc"), &alias).unwrap();
+    assert_eq!(
+        objects(&alias),
+        through_cc,
+        "a symlink to the PATH's cc is that cc"
+    );
+}
+
+/// The SDK identity the macOS link tests start from.
+#[cfg(unix)]
+const MACOS_SDK_IDENTITY: &str = "15.0 (24A348)";
+
+/// A temporary root whose `bin`, the snapshot PATH, holds a `cc`. Nothing
+/// runs it: the key reads the drivers' bytes only.
+#[cfg(unix)]
+fn macos_link_fixture() -> (tempfile::TempDir, PathBuf, InvocationEnv) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    kache_fs::testutil::write_executable(
+        &bin.join("cc"),
+        "#!/bin/sh\necho 'Apple clang version 17.0.0'\n",
+    );
+    let env = InvocationEnv::from_parts(
+        [("PATH", bin.to_str().unwrap())],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    (directory, root, env)
+}
+
+#[cfg(unix)]
+fn content_hash(path: &Path) -> Result<String> {
+    Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
+}
+
+/// What a native macOS link of a bin crate folds as its SDK identity, with
+/// `-C linker` naming `linker` when given.
+#[cfg(unix)]
+fn macos_link_identity(linker: Option<&str>, env: &InvocationEnv) -> Result<String> {
+    let mut argv = ["rustc", "--crate-name", "app", "--crate-type", "bin"]
+        .map(String::from)
+        .to_vec();
+    argv.push("src/main.rs".to_string());
+    if let Some(linker) = linker {
+        argv.push(format!("-Clinker={linker}"));
+    }
+    let args = RustcArgs::parse_for(&argv, env).unwrap();
+    native_macos_link_identity_for(MACOS_SDK_IDENTITY.to_string(), &args, content_hash, env)
+}
+
+/// The case in #1966: two wrappers that `-C linker` names answer `--version`
+/// as the `cc` they run does and differ only in what they pass it, one making
+/// clang run a linker that does not exist. Their links key apart from each
+/// other and from a link through `cc`, by the wrappers' bytes.
+#[cfg(unix)]
+#[test]
+fn a_wrapper_named_by_linker_keys_its_macos_links_by_its_own_bytes() {
+    let (_directory, root, env) = macos_link_fixture();
+    let bin = root.join("bin");
+    kache_fs::testutil::write_executable(
+        &bin.join("cc-bogus"),
+        "#!/bin/sh\nexec cc --ld-path=/nonexistent/ld \"$@\"\n",
+    );
+    kache_fs::testutil::write_executable(&bin.join("cc-plain"), "#!/bin/sh\nexec cc \"$@\"\n");
+
+    let bogus = macos_link_identity(Some("cc-bogus"), &env).unwrap();
+    let plain = macos_link_identity(Some("cc-plain"), &env).unwrap();
+    assert_eq!(
+        bogus,
+        format!(
+            "{MACOS_SDK_IDENTITY}\nlink_driver={}",
+            content_hash(&bin.join("cc-bogus")).unwrap()
+        ),
+        "the wrapper's bytes follow the SDK identity"
+    );
+    assert_ne!(
+        bogus, plain,
+        "two wrappers with one banner must not share a link key"
+    );
+    assert_ne!(
+        plain, MACOS_SDK_IDENTITY,
+        "a wrapper must not key as the cc it runs"
+    );
+}
+
+/// A link without `-C linker` runs the `cc` on PATH and folds the SDK
+/// identity alone, as it did before #1966, so no macOS link key changes.
+#[cfg(unix)]
+#[test]
+fn a_macos_link_through_the_path_cc_keeps_its_sdk_identity() {
+    let (_directory, _root, env) = macos_link_fixture();
+    assert_eq!(macos_link_identity(None, &env).unwrap(), MACOS_SDK_IDENTITY);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_the_path_cc_keeps_the_macos_sdk_identity() {
+    let (_directory, root, env) = macos_link_fixture();
+    let alias = root.join("clang");
+    std::os::unix::fs::symlink(root.join("bin").join("cc"), &alias).unwrap();
+    assert_eq!(
+        macos_link_identity(Some(alias.to_str().unwrap()), &env).unwrap(),
+        MACOS_SDK_IDENTITY,
+        "a symlink to the PATH's cc is that cc"
+    );
+}
+
+/// A driver the key cannot read passes the link through: a path that names
+/// no file, or a name the client's PATH does not hold.
+#[cfg(unix)]
+#[test]
+fn a_macos_link_through_a_missing_driver_is_not_keyed() {
+    let (_directory, root, env) = macos_link_fixture();
+    let missing = root.join("cc-missing");
+    let error = macos_link_identity(Some(missing.to_str().unwrap()), &env).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("hashing the native macOS link driver"),
+        "{error:#}"
+    );
+    let error = macos_link_identity(Some("cc-missing"), &env).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no cc/linker driver"),
+        "{error:#}"
+    );
+}
+
+/// The whole key on a Mac, with the real SDK: `compute_key_into` hands the
+/// SDK identity through `native_macos_link_identity_for`, so the #1966
+/// wrapper keys apart from a link through `cc` and from another wrapper,
+/// and naming the PATH's `cc` keys as a link without `-C linker` does.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_bin_keys_a_linker_wrapper_by_its_bytes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    std::fs::write(&source, b"fn main() {}").unwrap();
+    let bogus = dir.path().join("cc-bogus");
+    let plain = dir.path().join("cc-plain");
+    kache_fs::testutil::write_executable(
+        &bogus,
+        "#!/bin/sh\nexec cc --ld-path=/nonexistent/ld \"$@\"\n",
+    );
+    kache_fs::testutil::write_executable(&plain, "#!/bin/sh\nexec cc \"$@\"\n");
+    let invocation = client_invocation(dir.path(), &[]);
+    let fh = FileHasher::new_for(&invocation);
+    let pn = PathNormalizer::empty();
+    let key = |linker: Option<&str>| {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "app".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+        ];
+        argv.extend(linker.map(|linker| format!("-Clinker={linker}")));
+        let mut parsed = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        parsed.source_file = None;
+        compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default()).unwrap()
+    };
+    let through_cc = key(None);
+    assert_eq!(
+        key(Some("cc")),
+        through_cc,
+        "naming the PATH's cc keeps the key"
+    );
+    let bogus = key(Some(bogus.to_str().unwrap()));
+    assert_ne!(
+        bogus, through_cc,
+        "a wrapper must not key as the cc it runs"
+    );
+    assert_ne!(
+        bogus,
+        key(Some(plain.to_str().unwrap())),
+        "two wrappers with one banner must not share a link key"
+    );
+}
+
 #[test]
 fn cross_target_and_library_outputs_place_no_linker() {
     for args in [
@@ -1043,6 +1291,65 @@ fn native_windows_msvc_ignores_unrelated_generic_cc_identity() {
         Some("actual generic linker".into())
     });
     assert_ne!(generic.finalize(), fold("anything"));
+}
+
+/// Run `f` under a subscriber that records every level, and return its
+/// result with the log text.
+fn with_key_trace<R>(f: impl FnOnce() -> R) -> (R, String) {
+    // While the capture is the only live dispatcher, tracing registers a
+    // callsite against the default of whichever thread reaches it first. A
+    // parallel test thread with no subscriber then caches it as disabled,
+    // and the capture loses its events. A second dispatcher, kept for the
+    // whole run, makes registration ask every dispatcher, this one included.
+    static PEER: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    PEER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    (result, log)
+}
+
+/// The key trace shows the linker banner a linked output folds, and no
+/// banner for a native MSVC link, which does not fold it.
+#[test]
+fn generic_linker_identity_is_traced_as_folded() {
+    let bin = parsed_crate_type("bin", None);
+    let banner = "Apple clang version 17.0.0 (clang-1700.0.13.5)";
+    let trace = |native_windows_msvc: bool| {
+        with_key_trace(|| {
+            fold_generic_linker_identity(
+                &mut blake3::Hasher::new(),
+                &bin,
+                native_windows_msvc,
+                |_| Some(banner.to_string()),
+            )
+        })
+        .1
+    };
+    let log = trace(false);
+    assert!(
+        log.contains(&format!("[key:probe] linker={banner}")),
+        "{log}"
+    );
+    let log = trace(true);
+    assert!(!log.contains("linker="), "{log}");
 }
 
 /// The probe gets the linker `-C linker` names, the MSVC architecture and
@@ -1815,6 +2122,27 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
         first,
         "reverting recovers the old key"
     );
+    // The same resource in another target directory (a new worktree's
+    // `<OUT_DIR>/resource.res`): only its bytes and place are keyed.
+    let moved_arg = if cfg!(windows) {
+        dir.path().join("other-target").join("first.res")
+    } else {
+        PathBuf::from("C:/other-target/first.res")
+    };
+    let moved_res = file_hasher.resolve_path(&moved_arg).unwrap();
+    std::fs::create_dir_all(moved_res.parent().unwrap()).unwrap();
+    std::fs::copy(&first_res, &moved_res).unwrap();
+    assert_eq!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "a resource keys by its bytes, not its directory"
+    );
+    std::fs::write(&moved_res, windows_test_resource(b"resource v3")).unwrap();
+    assert_ne!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "the moved resource's bytes still reach the key"
+    );
     for argument in [
         "C:/extra.obj",
         "/MANIFESTINPUT:app.xml",
@@ -2088,7 +2416,7 @@ fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
         assert!(!input.stamp_settled());
         assert!(
             hasher
-                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .memo_input_is_unchanged(&input, &|_| vec![path.clone()], &|_| None,)
                 .is_none()
         );
         assert!(hasher.hash_static_lib(&path).is_ok());
@@ -6309,9 +6637,13 @@ fn an_out_dir_suffix_keeps_a_parent_component_that_stays_inside() {
     );
     assert_eq!(suffix("/o/x/../../y.rs", "/o"), None);
     assert_eq!(
-        suffix("/o/x\\y/../../z.rs", "/o"),
-        None,
-        "on Unix `x\\y` is one level, so this leaves `/o`"
+        suffix("/o/x\\y/../../z.rs", "/o").as_deref(),
+        if cfg!(windows) {
+            Some("/x\\y/../../z.rs")
+        } else {
+            None
+        },
+        "on Unix `x\\y` is one level, so this leaves `/o`; on Windows it is two"
     );
     assert_eq!(
         suffix("/o/x\\..\\..\\y.rs", "/o"),
@@ -6394,6 +6726,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
         vendored_package: None,
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     }
 }
 
@@ -6634,16 +6967,24 @@ fn a_flight_waiter_digests_the_tree_again() {
 }
 
 /// Checkouts of one workspace share a unit's discovery flight. A checkout
-/// whose tree differs from the owner's cannot use the owner's record, and
-/// must not keep the flight through its own compile: every other checkout
-/// would then wait for that compile too, one checkout at a time. A checkout
-/// with the owner's tree still waits for the owner and uses its record.
+/// whose tree differs from the owner's cannot use the owner's record: it
+/// neither waits for the owner's whole compile nor takes the flight, but
+/// keys without it once the short grace for a small unit has passed. When
+/// the owner releases within the grace, the other tree takes the flight,
+/// finds the owner's record unusable and releases it rather than keeping it
+/// through its own compile. A checkout with the owner's tree still waits for
+/// the owner and uses its record.
 #[test]
-fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
+fn a_checkout_on_another_tree_keys_without_waiting_for_the_owner() {
     let _lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
     }
+    another_tree_joins_the_flight(false);
+    another_tree_joins_the_flight(true);
+}
+
+fn another_tree_joins_the_flight(release_within_grace: bool) {
     let base = tempfile::tempdir().unwrap();
     let db = base.path().join("index.db");
     let flights = base.path().join("cache");
@@ -6696,15 +7037,18 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
     };
     let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
 
+    let released = std::sync::atomic::AtomicBool::new(false);
     let (waiting, observed) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let wait = |name: &'static str, source: &'static str| {
             let waiting = waiting.clone();
+            let released = &released;
             scope.spawn(move || {
                 let (root, env, args) = checkout(name, source);
                 let hasher = hasher(&env);
                 crate::scheduler::observe_next_discovery_wait_for_test(waiting);
                 let (result, outputs) = resolve(&args, &hasher);
+                let before_release = !released.load(std::sync::atomic::Ordering::SeqCst);
                 let deferred = result
                     .as_ref()
                     .is_err_and(|error| error.is::<DeferredDiscovery>());
@@ -6715,31 +7059,54 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
                     outputs.used_prediction,
                     deferred,
                     held,
+                    before_release,
                 )
             })
         };
         let other_tree = wait("b", "pub fn value() -> u32 { 2 }\n");
-        let same_tree = wait("c", "pub fn value() -> u32 { 1 }\n");
+        // Within the grace, the owner releases as soon as the other tree
+        // waits: a second checkout's set-up could outlast the grace.
+        let same_tree = (!release_within_grace).then(|| wait("c", "pub fn value() -> u32 { 1 }\n"));
         // Publish only after each waiter has found no usable record and
         // failed its first lock attempt. Starting a thread proves neither.
-        let both_waiting = observed
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .and_then(|()| observed.recv_timeout(std::time::Duration::from_secs(30)));
+        let waiters = if release_within_grace { 1 } else { 2 };
+        let all_waiting = (0..waiters)
+            .try_for_each(|_| observed.recv_timeout(std::time::Duration::from_secs(30)));
+        // Another tree's wait ends after the grace. Bounded here: a waiter
+        // that kept waiting would sit until the owner releases.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !release_within_grace
+            && !other_tree.is_finished()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         owner.record_portable_prediction(&identity, Some("kt"), &record);
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
         drop(owner.take_discovery_flight());
         // Release before asserting so a failed handshake cannot leave the
         // scoped workers blocked behind the owner's lock during unwinding.
-        both_waiting.expect("both checkouts must observe the held discovery flight");
+        all_waiting.expect("each checkout must observe the held discovery flight");
 
-        let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
+        let (_, inputs, predicted, deferred, held, before_release) = other_tree.join().unwrap();
+        assert_eq!(
+            before_release, !release_within_grace,
+            "another tree does not wait for the owner's whole compile, \
+             and takes the flight when the owner releases within the grace"
+        );
         assert!(
             !deferred && !held,
-            "another tree keys without the flight instead of compiling under it"
+            "another tree keys without the flight instead of compiling under it \
+             (released within the grace: {release_within_grace})"
         );
         assert!(!predicted);
         assert!(inputs.is_some(), "the pre-pass found the closure");
 
-        let (root, inputs, predicted, deferred, held) = same_tree.join().unwrap();
+        let Some(same_tree) = same_tree else {
+            return;
+        };
+        let (root, inputs, predicted, deferred, held, before_release) = same_tree.join().unwrap();
+        assert!(!before_release, "the owner's tree waits for the owner");
         assert!(!deferred);
         assert!(predicted, "the owner's tree uses the owner's record");
         assert!(held, "and keeps the flight until it publishes");
@@ -7187,6 +7554,15 @@ fn a_relative_source_must_stay_in_the_workspace() {
         None,
         "a Windows walk that leaves, which a `/` split alone would miss"
     );
+    // rustc on Windows spells an include in a module's subdirectory with
+    // both separators. There `\` separates, so it stays inside; on Unix
+    // `kt\src\media\..` is one name and the walk leaves.
+    let mixed = "kt\\src\\media\\../../../assets/a.txt";
+    assert_eq!(
+        source(mixed, &roots),
+        if cfg!(windows) { kept(mixed) } else { None },
+        "a walk read the way this system reads it"
+    );
     roots.cwd = "/kt".to_string();
     assert_eq!(source("../assets/a.txt", &roots), kept("../assets/a.txt"));
     assert_eq!(source("../../outside.txt", &roots), None);
@@ -7267,6 +7643,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         out_dir: Some(out.clone()),
         vendored_package: None,
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -7303,17 +7680,19 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         );
     }
     let mut entered = HashMap::new();
-    assert!(walk_reaches(&root, "/top.txt", true, &mut entered));
+    assert!(walk_reaches(&root, "/top.txt", true, &[], &mut entered));
     assert!(walk_reaches(
         &root,
         "/kt/src/../src/lib.rs",
         true,
+        &[],
         &mut entered
     ));
     assert!(!walk_reaches(
         &root,
         "/../w/kt/src/lib.rs",
         true,
+        &[],
         &mut entered
     ));
 }
@@ -7405,6 +7784,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
         vendored_package: None,
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7460,6 +7840,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         out_dir: Some(out.clone()),
         vendored_package: None,
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -7480,6 +7861,196 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
     let before = registry();
     write_file(&package.join("stale/debug/a"), "");
     assert_ne!(registry(), before, "a registry package is read whole");
+}
+
+/// Untracked tool output, such as the state file pnpm writes into
+/// `node_modules` with the checkout's path and a timestamp, keeps two
+/// checkouts of one commit from sharing workspace records
+/// (kunobi-ninja/kache#1912). Directories the project names in
+/// `[workspace] guard_exclude` are left out at any depth.
+#[test]
+fn guard_exclude_leaves_named_directories_out_of_the_workspace_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = |name: &str, installed_at: Option<&str>| {
+        let (root, _) = workspace_invocation(dir.path(), name, "kt");
+        write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+        write_file(&root.join("web/package.json"), "{}");
+        if let Some(installed_at) = installed_at {
+            let state = format!("{{\"root\":\"{}\",\"at\":{installed_at}}}", root.display());
+            write_file(
+                &root.join("node_modules/.pnpm-workspace-state-v1.json"),
+                &state,
+            );
+            write_file(&root.join("web/node_modules/x/index.js"), installed_at);
+        }
+        root
+    };
+    let roots_of = |root: &Path| {
+        let name = root.file_name().unwrap().to_str().unwrap();
+        let (_, args) = workspace_invocation(dir.path(), name, "kt");
+        workspace_roots_in(&args, &manifest_vars(&root.join("kt")), root).unwrap()
+    };
+    let hasher = FileHasher::new();
+    let digest = |root: &Path| workspace_tree_digest(&roots_of(root), &hasher).unwrap();
+    let [a, b, c] = [
+        checkout("a", Some("1")),
+        checkout("b", Some("2")),
+        checkout("c", None),
+    ];
+    assert_ne!(digest(&a), digest(&b), "without the setting");
+
+    for root in [&a, &b, &c] {
+        write_file(
+            &root.join(".kache.toml"),
+            "[workspace]\nguard_exclude = [\"node_modules\"]\n",
+        );
+    }
+    let shared = digest(&a);
+    assert_eq!(digest(&b), shared, "another install");
+    assert_eq!(digest(&c), shared, "no install");
+    let mut plain = roots_of(&c);
+    assert_eq!(plain.guard_excluded, ["node_modules"]);
+    plain.guard_excluded.clear();
+    assert_ne!(
+        workspace_tree_digest(&plain, &hasher).unwrap(),
+        shared,
+        "the names are part of the digest"
+    );
+
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots_of(&a), &hasher)).unwrap();
+    write_file(&a.join("web/node_modules/x/index.js"), "reinstalled");
+    assert!(taken.held(), "an install while the unit compiles");
+    write_file(&a.join("assets/new.txt"), "macro input");
+    assert!(!taken.held());
+    assert_ne!(digest(&a), shared, "the rest of the tree still counts");
+    std::fs::remove_dir_all(a.join("assets")).unwrap();
+    write_file(&a.join("kt/node_modules"), "a file, not a directory");
+    assert_ne!(digest(&a), shared, "only directories are left out");
+    std::fs::remove_file(a.join("kt/node_modules")).unwrap();
+    assert_eq!(digest(&a), shared);
+
+    // On a case-sensitive filesystem a differently cased directory is
+    // another directory; the guard leaves it out all the same.
+    write_file(&a.join("tools/Node_Modules/y.js"), "1");
+    let roots_a = roots_of(&a);
+    let cased = tree_guard_of(&hasher, || workspace_tree_digest(&roots_a, &hasher)).unwrap();
+    write_file(&a.join("tools/Node_Modules/y.js"), "2");
+    write_file(&a.join("tools/Node_Modules/z.js"), "");
+    assert!(cased.held(), "a differently cased name");
+    assert_eq!(
+        workspace_tree_digest(&roots_a, &hasher).unwrap(),
+        cased.digest,
+        "a differently cased name"
+    );
+}
+
+/// The guard leaves out the target directory and `.git` at the workspace
+/// root only. Entries with those names deeper in the tree still count, in
+/// the digest and in the stat walk behind the guard.
+#[test]
+fn a_skipped_path_leaves_out_only_itself_not_its_name_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("target/debug/libx.rlib"), "");
+    write_file(&root.join(".git/HEAD"), "ref");
+    write_file(&root.join("assets/target/a.txt"), "");
+    write_file(&root.join("vendor/.git/HEAD"), "");
+    let canonical_root = root.canonicalize().unwrap();
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root,
+        target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        guard_excluded: Vec::new(),
+    };
+    let hasher = FileHasher::new();
+    for nested in ["assets/target/b.txt", "vendor/.git/index"] {
+        let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+        write_file(&root.join(nested), "x");
+        assert!(!taken.held(), "{nested}");
+        assert_ne!(
+            workspace_tree_digest(&roots, &hasher).unwrap(),
+            taken.digest,
+            "{nested}"
+        );
+    }
+}
+
+/// A closure that names a file in a left-out directory keeps no guard: a
+/// macro listing that directory could find a new file the guard never sees.
+#[test]
+fn a_closure_reading_a_guard_excluded_directory_keeps_no_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    for file in [
+        "kt/src/lib.rs",
+        "node_modules/x/a.js",
+        "web/Node_Modules/y.js",
+    ] {
+        write_file(&root.join(file), "");
+    }
+    let canonical_root = root.canonicalize().unwrap();
+    let mut roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root,
+        target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        guard_excluded: Vec::new(),
+    };
+    let sources = |files: &[&str]| files.iter().map(|file| root.join(file)).collect::<Vec<_>>();
+    let lib = sources(&["kt/src/lib.rs"]);
+    let bundled = sources(&["kt/src/lib.rs", "node_modules/x/a.js"]);
+    let other_case = sources(&["kt/src/lib.rs", "web/Node_Modules/y.js"]);
+    assert!(guard_covers(&bundled, &roots));
+    assert!(guard_covers(&other_case, &roots));
+    roots.guard_excluded = vec!["node_modules".into()];
+    assert!(guard_covers(&lib, &roots));
+    assert!(!guard_covers(&bundled, &roots));
+    assert!(
+        !guard_covers(&other_case, &roots),
+        "a case-insensitive filesystem"
+    );
+}
+
+/// The setting is used only when every entry is one directory name; anything
+/// else leaves the whole tree under the guard.
+#[test]
+fn guard_exclude_accepts_only_plain_directory_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let excluded = |config: &str| {
+        std::fs::write(dir.path().join(".kache.toml"), config).unwrap();
+        workspace_guard_excluded(dir.path())
+    };
+    assert_eq!(
+        excluded(
+            "[cache]\nlocal_max_size = \"1GiB\"\n[workspace]\nguard_exclude = [\"node_modules\", \".vite-hooks\"]\n"
+        ),
+        vec![
+            std::ffi::OsString::from("node_modules"),
+            ".vite-hooks".into()
+        ]
+    );
+    for config in [
+        "[workspace]\nguard_exclude = [\"node_modules\", \"web/node_modules\"]\n",
+        "[workspace]\nguard_exclude = [\"..\"]\n",
+        "[workspace]\nguard_exclude = [\".\"]\n",
+        "[workspace]\nguard_exclude = [\"\"]\n",
+        "[workspace]\nguard_exclude = [\"a\\\\b\"]\n",
+        "[workspace]\nguard_exclude = \"node_modules\"\n",
+        "[workspace\n",
+        "",
+    ] {
+        assert!(excluded(config).is_empty(), "{config}");
+    }
+    std::fs::remove_file(dir.path().join(".kache.toml")).unwrap();
+    assert!(workspace_guard_excluded(dir.path()).is_empty());
 }
 
 #[test]
@@ -7504,6 +8075,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         out_dir: Some(root.join("target/debug/build/foo-1/out")),
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -7580,6 +8152,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -7624,6 +8197,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     }
 }
 
@@ -7736,6 +8310,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7845,6 +8420,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         out_dir: None,
         vendored_package: None,
         guard: GuardScope::Workspace,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -9862,6 +10438,39 @@ fn cache_key_ignores_linker_path() {
     assert_eq!(a, b, "linker path must not affect the cache key");
 }
 
+#[test]
+fn a_resource_path_keeps_its_spelling_off_a_native_msvc_link() {
+    // Only a native MSVC link keys a lone `.res` link-arg by its bytes; a
+    // unit that does not link there still keys the path as spelled.
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let key = |resource: &str| {
+        let argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            format!("-Clink-arg={resource}"),
+        ];
+        compute_cache_key(
+            &RustcArgs::parse(&argv).unwrap(),
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        key(r"C:\one\resource.res"),
+        key(r"C:\two\resource.res"),
+        "off a native MSVC link the resource path stays in the key"
+    );
+}
+
 /// Shared base argv for the flag-keying regression tests below.
 fn flag_base(source: &Path, extra: &[&str]) -> Vec<String> {
     let mut v = vec![
@@ -11215,6 +11824,41 @@ fn apple_dylib_and_framework_install_names_bind_link_keys() {
         .unwrap();
         assert_ne!(before, fold(), "{}", file.display());
         std::fs::remove_file(file).unwrap();
+    }
+}
+
+/// The key trace shows each install name entry the link key folds, with the
+/// search directory's index, under the unit's crate name.
+#[test]
+fn apple_install_names_are_traced_as_folded() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    std::fs::write(
+        tree.elsewhere.join("libfoo.dylib"),
+        apple_install_name::tests::dylib("/target/one/libfoo.dylib", false, true),
+    )
+    .unwrap();
+    let bundle = tree.out.join("Foo.framework");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("Foo"),
+        apple_install_name::tests::dylib("@rpath/Foo.framework/Foo", false, true),
+    )
+    .unwrap();
+    let argv = unit_args("bin", &tree.deps, &[]);
+    let native = [tree.out.clone(), tree.elsewhere.clone()];
+    let (folded, log) =
+        with_key_trace(|| fold_inputs(&argv, &native, std::slice::from_ref(&tree.out), &context));
+    folded.unwrap();
+    for line in [
+        "[key:mylib] apple_install_name:1/libfoo.dylib=/target/one/libfoo.dylib".to_string(),
+        format!(
+            "[key:mylib] apple_install_name:0/{}=@rpath/Foo.framework/Foo",
+            Path::new("Foo.framework").join("Foo").display()
+        ),
+    ] {
+        assert!(log.contains(&line), "{line}\n{log}");
     }
 }
 
@@ -13154,6 +13798,55 @@ fn unstable_flag_changes_key() {
     );
 }
 
+/// `-Z threads` sets front-end parallelism and does not change the output,
+/// so it is not key material. Every other `-Z` flag stays keyed.
+#[test]
+fn threads_unstable_flag_does_not_change_key() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+    let base = key_of_flags(&flag_base(&source, &[]));
+    let attached = key_of_flags(&flag_base(&source, &["-Zthreads=1"]));
+    let separated = key_of_flags(&flag_base(&source, &["-Z", "threads=8"]));
+    let bare = key_of_flags(&flag_base(&source, &["-Z", "threads"]));
+    assert_eq!(base, attached, "-Zthreads must not change the key");
+    assert_eq!(
+        attached, separated,
+        "both spellings of -Z threads share a key"
+    );
+    assert_eq!(base, bare, "a valueless -Z threads must not change the key");
+
+    let share = key_of_flags(&flag_base(&source, &["-Zshare-generics=off"]));
+    assert_ne!(base, share, "-Zshare-generics must change the key");
+    let share_and_threads = key_of_flags(&flag_base(
+        &source,
+        &["-Zthreads=8", "-Zshare-generics=off"],
+    ));
+    assert_eq!(
+        share, share_and_threads,
+        "adding -Zthreads beside another -Z flag must not change the key"
+    );
+
+    let near_name = key_of_flags(&flag_base(&source, &["-Zthreads-count=8"]));
+    assert_ne!(
+        base, near_name,
+        "a -Z flag whose name is not exactly threads must change the key"
+    );
+    let suffix = key_of_flags(&flag_base(&source, &["-Z", "not-threads=1"]));
+    assert_ne!(
+        base, suffix,
+        "a -Z flag whose name is not exactly threads must change the key"
+    );
+    let value_mentions_threads = key_of_flags(&flag_base(&source, &["-Zshare-generics=threads"]));
+    assert_ne!(
+        base, value_mentions_threads,
+        "mentioning threads in another flag's value must still change the key"
+    );
+    assert_ne!(share, value_mentions_threads);
+}
+
 /// A `--target` value can be a path to a custom target JSON spec (Firefox /
 /// embedded toolchains). Its file CONTENT — data-layout, target features,
 /// linker, panic strategy — must be folded into the key, so the same path
@@ -13328,6 +14021,54 @@ fn named_codegen_backend_is_keyed_by_its_library() {
         rebuilt,
         key("kachetest").unwrap(),
         "the release-suffixed library is one rustc loads too"
+    );
+}
+
+/// Under `cargo clippy` the outer compiler is `clippy-driver`, whose
+/// `--version --verbose` has no `host:` line. A named backend is still keyed,
+/// with the host and sysroot of the inner rustc (#1944).
+#[cfg(unix)]
+#[test]
+fn named_codegen_backend_is_keyed_under_clippy_driver() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let driver = dir.path().join("clippy-driver");
+    kache_fs::testutil::write_executable(
+        &driver,
+        "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+    );
+    let sysroot = dir.path().join("sysroot");
+    let library = sysroot_codegen_backends(&sysroot).join(backend_library("kachetest", ""));
+    let key = || {
+        let mut args = vec![driver.to_string_lossy().into_owned()];
+        args.extend(flag_base(
+            &source,
+            &[
+                "--sysroot",
+                &sysroot.to_string_lossy(),
+                "-Zcodegen-backend=kachetest",
+            ],
+        ));
+        let mut parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.is_clippy_chain());
+        parsed.source_file = None;
+        compute_cache_key(
+            &parsed,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+    };
+
+    std::fs::write(&library, b"v1").unwrap();
+    let first = key().unwrap();
+    std::fs::write(&library, b"v2 rebuilt").unwrap();
+    assert_ne!(
+        first,
+        key().unwrap(),
+        "a rebuilt backend must change the key"
     );
 }
 
@@ -15723,6 +16464,13 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
             + kache_store::file_hash::HASH_SETTLE_NS;
     }
     first.cc_preprocess_memo_record_if_unchanged("memo", &"a".repeat(64), &inputs, &no_mapping);
+    // The include-shadowing derivation rides on the row it was set for.
+    first.cc_preprocess_memo_set_shadowing("memo", &"b".repeat(64), "other row");
+    first.cc_preprocess_memo_set_shadowing("memo", &"a".repeat(64), "derived");
+    let (_, _, shadowing) = FileHasher::persistent(&db)
+        .cc_preprocess_memo_lookup_shadowing("memo", no_remap, &no_mapping)
+        .unwrap();
+    assert_eq!(shadowing.as_deref(), Some("derived"));
     let warm = FileHasher::persistent(&db);
     let (_, satisfied) = warm
         .cc_preprocess_memo_lookup("memo", no_remap, &no_mapping)
@@ -15871,7 +16619,10 @@ fn assembler_scans_are_memoised_by_content() {
     let inputs = hasher
         .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &no_mapping)
         .unwrap();
-    assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
+    assert_eq!(
+        hasher.cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false),
+        None
+    );
     assert_eq!(scans.get(), 1, "twins share one scan");
     let later = FileHasher::persistent(&db);
     let inputs = later
@@ -15879,7 +16630,7 @@ fn assembler_scans_are_memoised_by_content() {
         .unwrap();
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin")
     );
@@ -15890,7 +16641,7 @@ fn assembler_scans_are_memoised_by_content() {
     );
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin"),
         "the construct verdict is memoised too"
@@ -15901,11 +16652,11 @@ fn assembler_scans_are_memoised_by_content() {
     gone[0].fingerprint.path = dir.path().join("absent.h").to_string_lossy().into_owned();
     gone[0].content = "c".repeat(64);
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
@@ -16489,7 +17240,7 @@ fn an_assembler_verdict_on_other_bytes_is_never_learned() {
 
     assert_eq!(
         hasher
-            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save)
+            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save, &|_| false)
             .as_deref(),
         Some(CC_INPUT_CHANGED_WHILE_SCANNED)
     );
@@ -17122,7 +17873,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
 
     assert!(tree_digest_memoised(roots(), &hasher, 4, &memo, now).is_none());
     assert_eq!(hasher.stats().bytes_hashed, 0, "no file is read");
-    assert!(oversized_tree_marker(&memo, &tree, 4).exists());
+    assert!(oversized_tree_marker(&memo, &tree, &[], 4).exists());
     assert!(
         tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_some(),
         "the marker is per budget"
@@ -17138,7 +17889,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
         tree_digest_memoised(roots(), &hasher, 4, &memo, half_an_hour).is_none(),
         "still remembered half an hour on"
     );
-    let marked = std::fs::metadata(oversized_tree_marker(&memo, &tree, 4))
+    let marked = std::fs::metadata(oversized_tree_marker(&memo, &tree, &[], 4))
         .and_then(|metadata| metadata.modified())
         .unwrap();
     assert!(
@@ -17181,8 +17932,8 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
         ]
     };
     assert!(tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none());
-    assert!(!oversized_tree_marker(&memo, &first, 5).exists());
-    assert!(!oversized_tree_marker(&memo, &second, 5).exists());
+    assert!(!oversized_tree_marker(&memo, &first, &[], 5).exists());
+    assert!(!oversized_tree_marker(&memo, &second, &[], 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
 
     std::fs::remove_file(second.join("f2")).unwrap();
@@ -17547,10 +18298,34 @@ fn a_root_read_after_the_stamps_spends_what_the_others_leave() {
     assert!(tree_digest_memoised(roots(), &hasher, 3, &memo, settled).is_some());
 }
 
+/// Gives a path its mode back when a test ends, so its directory can be
+/// removed.
+#[cfg(unix)]
+struct Mode(PathBuf, u32);
+
+#[cfg(unix)]
+impl Mode {
+    fn set(path: PathBuf, mode: u32, restored: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self(path, restored)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
 /// What the tree guard cannot read counts as unreadable instead of
 /// withholding the digest: a proc macro the build starts cannot read it
-/// either. A file it cannot read keeps the digest out of the memo, since only
-/// a change time would show the file becoming readable.
+/// either. A directory it cannot list stays in the memo, as the stamp walk
+/// could not list it either and the stamp changes once it can. A file it
+/// cannot read keeps the digest out, since only a change time would show the
+/// file becoming readable.
 #[cfg(unix)]
 #[test]
 fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
@@ -17561,12 +18336,6 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     write_file(&tree.join("src/lib.rs"), "");
     write_file(&tree.join("pgdata/PG_VERSION"), "16");
     write_file(&tree.join("secret.env"), "A=1");
-    struct Mode(PathBuf, u32);
-    impl Drop for Mode {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
-        }
-    }
     let _pgdata = Mode(tree.join("pgdata"), 0o755);
     let _secret = Mode(tree.join("secret.env"), 0o644);
     let mode = |path: &str, mode| {
@@ -17577,19 +18346,21 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     let settled = || std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
     let digest = || tree_digest_memoised(roots(), &hasher, 10, &memo, settled());
     let readable = digest().unwrap();
+    let file = tree_digest_memo(&memo, &roots()[0]);
 
     mode("pgdata", 0o000);
     if std::fs::read_dir(tree.join("pgdata")).is_ok() {
         eprintln!("skipped: this user reads past permissions");
         return;
     }
+    let _ = std::fs::remove_file(&file);
     let unlisted = digest().expect("a directory it cannot list");
     assert_ne!(unlisted, readable);
+    assert!(file.exists(), "memoised: the stamp walk could not list it");
     mode("pgdata", 0o755);
     assert_eq!(digest().as_ref(), Some(&readable));
 
     mode("secret.env", 0o000);
-    let file = tree_digest_memo(&memo, &roots()[0]);
     let _ = std::fs::remove_file(&file);
     let unread = digest().expect("a file it cannot read");
     assert_ne!(unread, readable);
@@ -17613,7 +18384,10 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
         crate_tree_fold(
             root,
             &gone,
-            &[],
+            GuardSkips {
+                paths: &[],
+                dir_names: &[],
+            },
             false,
             &GuardFileHashes {
                 hasher: &hasher,
@@ -17623,8 +18397,127 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
             &mut budget,
         )
     };
-    assert_eq!(fold(dir.path()), Some(true), "a directory below the root");
+    let unlisted = Unread {
+        entries: 1,
+        files: 0,
+    };
+    assert_eq!(
+        fold(dir.path()),
+        Some(unlisted),
+        "a directory below the root"
+    );
     assert_eq!(fold(&gone), None, "the root");
+}
+
+/// The content fold counts the directories it cannot list and the entries it
+/// cannot stat as the stamp walk does, at any depth. The files it cannot
+/// read it counts apart: a stamp walk opens none.
+#[cfg(unix)]
+#[test]
+fn the_tree_fold_counts_what_it_cannot_read_as_the_stamp_walk_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "");
+    write_file(&tree.join("deep/unlisted/a"), "");
+    write_file(&tree.join("deep/listed/a"), "");
+    write_file(&tree.join("deep/listed/b"), "");
+    write_file(&tree.join("deep/secret.env"), "A=1");
+    let _unlisted = Mode::set(tree.join("deep/unlisted"), 0o000, 0o755);
+    // Listed, but its entries cannot be stat'ed.
+    let _listed = Mode::set(tree.join("deep/listed"), 0o444, 0o755);
+    let _secret = Mode::set(tree.join("deep/secret.env"), 0o000, 0o644);
+    if std::fs::read_dir(tree.join("deep/unlisted")).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let root = TreeRoot::new(tree.clone(), b"workspace", &[]);
+    let stamp = stamp_root(&root.walked(), 20).unwrap();
+    let hasher = FileHasher::new();
+    let mut budget = 20;
+    let unread = crate_tree_fold(
+        &tree,
+        &tree,
+        GuardSkips {
+            paths: &[],
+            dir_names: &[],
+        },
+        false,
+        &GuardFileHashes {
+            hasher: &hasher,
+            memoised: HashMap::new(),
+        },
+        &mut blake3::Hasher::new(),
+        &mut budget,
+    );
+    let expected = Unread {
+        entries: 3,
+        files: 1,
+    };
+    assert_eq!(unread, Some(expected), "`unlisted` and what `listed` holds");
+    assert_eq!(stamp.unreadable, 3);
+}
+
+/// A failure the content fold alone met keeps its digest out of the memo:
+/// the stamp walks before and after it read that entry, so the stamp cannot
+/// show it. Here the root is a link that names another directory while the
+/// fold stats `src/m.txt`. That directory holds the same two other files and
+/// no `m.txt`, and the tree itself is never touched.
+#[cfg(unix)]
+#[test]
+fn a_failure_only_the_tree_fold_met_keeps_its_digest_out_of_the_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    let tree = dir.path().join("tree");
+    for name in ["a.txt", "m.txt", "z.txt"] {
+        write_file(&real.join("src").join(name), name);
+    }
+    std::fs::create_dir_all(other.join("src")).unwrap();
+    for name in ["src/a.txt", "src/z.txt"] {
+        std::fs::hard_link(real.join(name), other.join(name)).unwrap();
+    }
+    let point_at = {
+        let tree = tree.clone();
+        move |target: &Path| {
+            let _ = std::fs::remove_file(&tree);
+            std::os::unix::fs::symlink(target, &tree).unwrap();
+        }
+    };
+    point_at(&real);
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let file = tree_digest_memo(&memo, &roots()[0]);
+    let stamp = || stamp_root(&roots()[0].walked(), 10).unwrap().digest;
+    let stamped = stamp();
+    // Only a hasher with a memo reads through the hook.
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
+
+    // From the read of `a.txt` to the read of `z.txt`.
+    let elsewhere = {
+        let (real, other, point_at) = (real.clone(), other.clone(), point_at.clone());
+        move |path: &Path| {
+            point_at(if path.ends_with("a.txt") {
+                &other
+            } else {
+                &real
+            })
+        }
+    };
+    set_before_read(Some(Box::new(elsewhere)));
+    let digest = tree_digest_memoised(roots(), &hasher, 10, &memo, settled);
+    set_before_read(None);
+    assert!(digest.is_some(), "the unit still has its digest");
+    assert_eq!(hasher.stats().cache_misses, 2, "both other files were read");
+    assert_eq!(stamp(), stamped, "and the tree kept its stamp");
+    assert!(!file.exists(), "the stamp walk had read `m.txt`");
+
+    assert_ne!(
+        tree_digest_memoised(roots(), &hasher, 10, &memo, settled),
+        digest
+    );
+    assert!(file.exists(), "every entry read");
 }
 
 /// A digest is memoised only while the tree still has the stamp it had
@@ -17669,6 +18562,234 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     assert_eq!(
         crate::tree_stamp::memoised_digest(&file, stamp.memo_key()),
         Some(digest)
+    );
+}
+
+/// A guard's check asks for the walk a unit stamping the root asks for, so
+/// the two share walks: behind a walk that is under way, both wait for the
+/// next one.
+#[test]
+fn a_guard_check_and_a_unit_wait_for_the_same_stamp_walk() {
+    let patience = std::time::Duration::from_secs(10);
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("src/lib.rs"), "");
+    let root = TreeRoot::new(dir.path().to_path_buf(), b"workspace", &[]).walked();
+    let guard = GuardWalk {
+        root: root.clone(),
+        max_entries: 10,
+        stamp: stamp_root(&root, 10).unwrap().digest,
+    };
+    let key = (root.clone(), 10);
+    let (walking, wait_walking) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    // A walk of the root, held under way until it is released or the test
+    // has failed.
+    let held = std::thread::spawn({
+        let (key, root) = (key.clone(), root.clone());
+        move || {
+            STAMP_WALKS.run(&key, || {
+                walking.send(()).unwrap();
+                let _ = wait_release.recv();
+                walk_one_root(&root, 10)
+            })
+        }
+    });
+    wait_walking
+        .recv_timeout(patience)
+        .expect("the walk starts");
+    let (answered, wait_answered) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let answered = answered.clone();
+        move || answered.send(guard.holds())
+    });
+    std::thread::spawn({
+        let root = root.clone();
+        move || answered.send(stamp_roots(&[root], 10).is_ok())
+    });
+    let deadline = std::time::Instant::now() + patience;
+    while STAMP_WALKS.parked(&key) != 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check and the unit never waited for one walk"
+        );
+        std::thread::yield_now();
+    }
+    release.send(()).unwrap();
+    for _ in 0..2 {
+        assert_eq!(wait_answered.recv_timeout(patience), Ok(true));
+    }
+    assert!(held.join().unwrap().is_ok());
+}
+
+/// What a [`tree_unit`] gave: its digest, and how many files it read.
+#[cfg(unix)]
+struct TreeUnit(std::sync::mpsc::Receiver<(Option<String>, u64)>);
+
+#[cfg(unix)]
+impl TreeUnit {
+    /// A timeout, not a join: a unit left waiting on a fold must fail the
+    /// test, not hang it.
+    fn finish(self) -> (Option<String>, u64) {
+        self.0
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the unit was left waiting")
+    }
+}
+
+/// One unit's digest of `tree`, taken on its own thread with its own memo
+/// database, and how many files it read for it. A unit given `hold` says
+/// when its fold is about to read its first file, and waits there until it
+/// is released.
+///
+/// Unix only, as are the tests that use it: elsewhere the guard does not
+/// read every file through the hook this holds a fold with.
+#[cfg(unix)]
+fn tree_unit(
+    tree: &Path,
+    memo: &Path,
+    now: std::time::SystemTime,
+    hold: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> TreeUnit {
+    let (tree, memo) = (tree.to_path_buf(), memo.to_path_buf());
+    let (finished, wait_finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let mut hold = hold;
+        set_before_read(Some(Box::new(move |_| {
+            if let Some((reading, release)) = hold.take() {
+                reading.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        })));
+        let roots = vec![TreeRoot::new(tree, b"workspace", &[])];
+        let digest = tree_digest_memoised(roots, &hasher, 10, &memo, now);
+        set_before_read(None);
+        finished.send((digest, hasher.stats().cache_misses))
+    });
+    TreeUnit(wait_finished)
+}
+
+/// Wait until `units` units are in one fold of `tree`: the unit reading it
+/// and the units waiting for that.
+#[cfg(unix)]
+fn wait_for_units_in_one_fold(tree: &Path, memo: &Path, units: usize) {
+    let root = TreeRoot::new(tree.to_path_buf(), b"workspace", &[]);
+    let stamp = stamp_root(&root.walked(), 10).unwrap();
+    let fold = (
+        tree_digest_memo(memo, &root),
+        stamp.memo_key().to_owned(),
+        10,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while TREE_FOLDS.callers(&fold) != units {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the units never met in one fold"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// A unit that reads `tree` and is held at its first file, and the channels
+/// that say it got there and release it.
+#[cfg(unix)]
+fn held_tree_unit(
+    tree: &Path,
+    memo: &Path,
+    now: std::time::SystemTime,
+) -> (TreeUnit, std::sync::mpsc::Sender<()>) {
+    let (reading, wait_reading) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    let unit = tree_unit(tree, memo, now, Some((reading, wait_release)));
+    wait_reading
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the unit reads the tree");
+    (unit, release)
+}
+
+/// Units of one workspace that miss the tree memo together share one fold: a
+/// unit that arrives while another reads the tree waits for it, and takes
+/// the digest the memo recorded without reading a file.
+#[cfg(unix)]
+#[test]
+fn units_that_miss_a_settled_tree_together_share_one_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("src/lib.rs"), "pub fn a() {}\n");
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, read) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(read, 1);
+    assert_eq!(waiter.finish(), (digest, 0), "took the fold under way");
+}
+
+/// A fold of a tree that moved while it was read is the reading unit's
+/// alone. A name that came and went directly under the root leaves every
+/// entry as it was, so a unit that stamps the tree afterwards waits on that
+/// fold. The memo refuses its digest, and the unit reads the tree itself.
+#[cfg(unix)]
+#[test]
+fn a_unit_reads_a_tree_itself_when_it_moved_under_the_fold_it_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("a.txt"), "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(tree.join("a.txt"), old).unwrap();
+    filetime::set_file_mtime(&tree, old).unwrap();
+    // Settled for the unit that stamps the root after the name went, too.
+    let settled = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    write_file(&tree.join("transient.txt"), "t");
+    std::fs::remove_file(tree.join("transient.txt")).unwrap();
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, _) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(waiter.finish(), (digest, 1), "the same bytes, read again");
+}
+
+/// A fold that could not read a file is its unit's alone too: only a change
+/// time would show the file becoming readable, so the memo refuses the
+/// digest, and a unit that waited on the fold reads the tree itself.
+#[cfg(unix)]
+#[test]
+fn a_unit_reads_a_tree_itself_when_the_fold_it_waited_for_could_not_read_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("a.txt"), "a");
+    let secret = tree.join("secret.env");
+    write_file(&secret, "A=1");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&secret).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, read) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(read, 1, "all but the file it cannot read");
+    assert_eq!(
+        waiter.finish(),
+        (digest, 1),
+        "the same marker, from its own read"
     );
 }
 
@@ -17766,7 +18887,7 @@ fn guard_stamp_collection_respects_kinds_exclusions_and_build_tags() {
     let root = TreeRoot::new(dir.path().to_path_buf(), b"workspace", &["excluded"])
         .skipping_build_dirs()
         .walked();
-    let stamped = stamp_roots(std::slice::from_ref(&root), 20, true)
+    let stamped = stamp_roots(std::slice::from_ref(&root), 20)
         .unwrap()
         .pop()
         .unwrap();
@@ -17792,15 +18913,8 @@ fn guard_stamp_collection_respects_kinds_exclusions_and_build_tags() {
     } else {
         assert!(collected.is_empty());
     }
-    let default = stamp_roots(std::slice::from_ref(&root), 20, false)
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(default.small_files.is_empty());
-    assert_eq!(stamped.stamp.digest, default.stamp.digest);
-    assert_eq!(stamped.entries, default.entries);
     assert!(matches!(
-        stamp_roots(&[root], 1, true),
+        stamp_roots(&[root], 1),
         Err(StampRefusal::TooLarge(0))
     ));
 }
@@ -17831,11 +18945,7 @@ fn guard_file_memos_do_not_merge_lossy_path_spellings() {
     write_file(&paths[0], "first");
     write_file(&paths[1], "other");
     let roots = [TreeRoot::new(dir.path().to_path_buf(), b"workspace", &[]).walked()];
-    assert!(
-        stamp_roots(&roots, 10, true).unwrap()[0]
-            .small_files
-            .is_empty()
-    );
+    assert!(stamp_roots(&roots, 10).unwrap()[0].small_files.is_empty());
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
@@ -21599,6 +22709,35 @@ mod build_script_target_paths {
         );
     }
 
+    /// The key trace shows the profile-relative OUT_DIR an rlib's own native
+    /// search path folds as, in place of its `link_search:` line.
+    #[cfg(unix)]
+    #[test]
+    fn own_out_dir_native_search_is_traced_as_folded() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let target = unit.workspace.join("target");
+        let out = Unit::out_dir(&target);
+        let (_, log) = with_key_trace(|| {
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&out)],
+                "rlib",
+                &[],
+                None,
+            )
+        });
+        assert!(
+            log.contains(
+                "[key:mylib] link_search_native_out_dir:build/foo-sys-0123456789abcdef/out"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("[key:mylib] link_search:"), "{log}");
+    }
+
     #[test]
     fn native_rlib_search_reuses_only_identical_bundled_archives() {
         let _lock = key_test_lock();
@@ -22081,6 +23220,149 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
 }
 
 #[test]
+fn debug_bundle_layout_namespace_covers_only_macos_debug_executables() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let parse = |extra: &[&str]| {
+        let argv = ["rustc", "src/main.rs"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
+    let apple = Some("aarch64-apple-darwin");
+    let bin_g = parse(&["--crate-type=bin", "-g"]);
+    assert!(macos_debug_bundle_admission(&bin_g, apple));
+    assert!(macos_debug_bundle_admission(
+        &parse(&["--test", "-Cdebuginfo=line-tables-only"]),
+        Some("x86_64-apple-darwin")
+    ));
+    assert!(macos_debug_bundle_admission(
+        &parse(&["--crate-type=bin", "-g", "-Csplit-debuginfo=packed"]),
+        apple
+    ));
+    assert!(!macos_debug_bundle_admission(
+        &bin_g,
+        Some("x86_64-unknown-linux-gnu")
+    ));
+    assert!(!macos_debug_bundle_admission(&bin_g, None));
+    for args in [
+        &["--crate-type=rlib", "-g"][..],
+        &["--crate-type=bin", "-g", "--emit=metadata"][..],
+        &["--crate-type=bin"][..],
+        &["--crate-type=bin", "-g", "-Csplit-debuginfo=off"][..],
+    ] {
+        assert!(
+            !macos_debug_bundle_admission(&parse(args), apple),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn a_macos_debug_executable_key_carries_the_bundle_layout_namespace() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let invocation = client_invocation(&workspace, &[("OUT_DIR", None)]);
+    for (debug, expected) in [("-Cdebuginfo=2", true), ("-Cdebuginfo=0", false)] {
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                "--crate-type=bin".into(),
+                "--target=aarch64-apple-darwin".into(),
+                debug.into(),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let (key, output) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        );
+        key.unwrap();
+        assert_eq!(
+            output.fields.unwrap().contains_key("debug_bundle_layout"),
+            expected,
+            "{debug}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_native_msvc_link_keys_its_resource_alike_in_every_target_directory() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let invocation = client_invocation(&workspace, &[("OUT_DIR", None)]);
+    let version = get_rustc_version_for(Path::new("rustc"), &invocation).unwrap();
+    let target = rustc_host_triple(&version).unwrap().to_string();
+    // winresource's `<OUT_DIR>/resource.res` in two target directories.
+    let first = dir.path().join("a").join("resource.res");
+    let moved = dir.path().join("b").join("resource.res");
+    for resource in [&first, &moved] {
+        std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        std::fs::write(resource, windows_test_resource(b"icon")).unwrap();
+    }
+    let key = |resource: &Path| {
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                "--crate-type=bin".into(),
+                format!("--target={target}"),
+                format!("-Clink-arg={}", resource.display()),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        compute_cache_key(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        key(&first),
+        key(&moved),
+        "the same resource bytes key alike in another target directory"
+    );
+    std::fs::write(&moved, windows_test_resource(b"other icon")).unwrap();
+    assert_ne!(
+        key(&first),
+        key(&moved),
+        "other resource bytes change the key"
+    );
+}
+
+#[test]
 fn custom_target_full_keys_keep_the_pdb_admission_namespace() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -22242,6 +23524,7 @@ fn package_scope_roots(root: &Path, scope: fn(PathBuf) -> GuardScope) -> Workspa
         out_dir: None,
         vendored_package: None,
         guard: scope(root.join("kt")),
+        guard_excluded: Vec::new(),
     }
 }
 
@@ -22451,4 +23734,1257 @@ fn an_in_place_same_size_edit_with_restored_mtime_moves_the_ancestor_digest() {
     write_file(&root.join("clippy.toml"), "msrv = \"1.81\"\n");
     set_old("clippy.toml");
     assert_ne!(digest(), first, "same size, same mtime, different bytes");
+#[test]
+fn a_units_own_source_is_scanned_but_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let paths: Vec<_> = ["unit.c", "shared.h"]
+        .iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    std::fs::write(&paths[0], "int unit;\n").unwrap();
+    std::fs::write(&paths[1], "int shared;\n").unwrap();
+    let scan = |path: &Path| -> anyhow::Result<CcScannedHeader> {
+        let bytes = std::fs::read(path)?;
+        Ok((
+            blake3::hash(&bytes).to_hex().to_string(),
+            "scan".into(),
+            Vec::new(),
+        ))
+    };
+    let hasher = FileHasher::persistent(&db);
+    let scanned = hasher
+        .cc_header_scans_except(&paths, 1, &mut |_| false, &scan, &|path| path == paths[0])
+        .unwrap();
+    assert!(
+        scanned
+            .iter()
+            .all(|(_, scan)| scan.as_deref() == Some("scan"))
+    );
+    let cache = kache_store::file_hash::FileHashCache::open(&db).unwrap();
+    let contents: Vec<&str> = scanned
+        .iter()
+        .map(|(content, _)| content.as_str())
+        .collect();
+    let stored = cache.get_cc_header_scans(1, &contents).unwrap();
+    assert!(
+        !stored.contains_key(contents[0]),
+        "the source is not stored"
+    );
+    assert!(stored.contains_key(contents[1]), "a header is");
+}
+
+/// Keying a compile-first unit selects the hashes its capture took, which
+/// the read-set digest names, instead of reading the inputs again.
+#[test]
+fn keying_selects_the_hashes_the_capture_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.h");
+    std::fs::write(&path, "int a;\n").unwrap();
+    let observed = ObservedFingerprint::from_path(&path).unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("idx.sqlite"));
+    hasher.adopt_observed(&[CcPreprocessMemoInput {
+        name: "a.h".into(),
+        fingerprint: observed.fingerprint,
+        content: "captured".into(),
+        mapped: String::new(),
+        observed_ns: observed.observed_ns,
+    }]);
+    assert_eq!(
+        hasher
+            .cc_input_contents(std::slice::from_ref(&path))
+            .unwrap(),
+        ["captured"]
+    );
+    assert_eq!(hasher.stats().cache_misses, 0, "nothing was read");
+}
+
+#[test]
+fn a_forgotten_memo_row_is_not_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let source = dir.path().join("unit.c");
+    let header = dir.path().join("shared.h");
+    std::fs::write(&source, vec![b'a'; 70_000]).unwrap();
+    std::fs::write(&header, vec![b'b'; 70_000]).unwrap();
+    let first = FileHasher::persistent(&db);
+    let named =
+        [source.clone(), header.clone()].map(|path| (path.to_string_lossy().into_owned(), path));
+    first
+        .cc_preprocess_fingerprints(&named, "", &|path| {
+            let bytes = std::fs::read(path).ok()?;
+            Some(content_hashes(&bytes, &bytes))
+        })
+        .unwrap();
+    first.forget_pending_memo(&|path| path == source);
+    first.flush_memo_as_if_settled();
+    let next = FileHasher::persistent(&db);
+    next.hash(&header).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the header's row was written");
+    next.hash(&source).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the source's row was not");
+}
+
+#[test]
+fn registry_source_separators_agree_only_without_build_script() {
+    let manifest = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4");
+    let slash = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4/src/lib.rs");
+    let back = PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\lib.rs");
+    let normalizer = PathNormalizer::empty();
+    let no_types: &[String] = &[];
+    let no_externs: &[crate::args::ExternDep] = &[];
+
+    fn unit<'a>(
+        name: Option<&'a str>,
+        types: &'a [String],
+        externs: &'a [crate::args::ExternDep],
+        sources: &'a [PathBuf],
+        manifest: Option<&'a Path>,
+        out_dir: Option<&'a Path>,
+        skip: bool,
+    ) -> UnitClosure<'a> {
+        UnitClosure {
+            crate_name: name,
+            crate_types: types,
+            externs,
+            sources,
+            manifest_dir: manifest,
+            out_dir,
+            skip_remap: skip,
+        }
+    }
+
+    let clean_sources = [slash.clone(), back.clone()];
+    let clean = unit(
+        Some("memchr"),
+        no_types,
+        no_externs,
+        &clean_sources,
+        Some(&manifest),
+        None,
+        false,
+    );
+    let root = applicable_host_neutral_root(false, true, &clean);
+    assert!(root.is_some());
+    let slash_mat = keyed_source_path(&slash, root.as_deref(), &normalizer).unwrap();
+    let back_mat = keyed_source_path(&back, root.as_deref(), &normalizer).unwrap();
+    assert_eq!(slash_mat, back_mat);
+    assert_eq!(slash_mat, b"registry-src/index/memchr-2.7.4/src/lib.rs");
+
+    let build = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4/build.rs");
+    let build_sources = [slash.clone(), build.clone()];
+    let with_build = unit(
+        Some("memchr"),
+        no_types,
+        no_externs,
+        &build_sources,
+        Some(&manifest),
+        None,
+        false,
+    );
+    let build_root = applicable_host_neutral_root(false, true, &with_build);
+    assert!(build_root.is_none());
+    assert_ne!(
+        keyed_source_path(&slash, build_root.as_deref(), &normalizer).unwrap(),
+        keyed_source_path(&back, build_root.as_deref(), &normalizer).unwrap()
+    );
+    assert!(source_carries_build_script(&build));
+    assert!(!source_carries_build_script(&slash));
+
+    let proc_types = ["proc-macro".to_string()];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                &proc_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let rlib_types = ["rlib".to_string()];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                &rlib_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_some()
+    );
+
+    let dylib = [crate::args::ExternDep {
+        name: "macros".to_string(),
+        path: Some(PathBuf::from("libmacros.so")),
+    }];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                &dylib,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let rlib_extern = [crate::args::ExternDep {
+        name: "dep".to_string(),
+        path: Some(PathBuf::from("libdep.rlib")),
+    }];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                &rlib_extern,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_some()
+    );
+
+    let out = PathBuf::from("C:/target/debug/build/memchr/out");
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                Some(&out),
+                false,
+            ),
+        )
+        .is_none()
+    );
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                true,
+            ),
+        )
+        .is_none()
+    );
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("build_script_build"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let empty: [PathBuf; 0] = [];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &empty,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let workspace = PathBuf::from("/work/crates/memchr");
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&workspace),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let relative = [PathBuf::from("src/lib.rs")];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &relative,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let outside = [PathBuf::from("C:/other/src/lib.rs")];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &outside,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+
+    let pkg = PathBuf::from("C:/Users/u/.cargo/registry/src/index/pkg");
+    let two = [PathBuf::from("C:/Users/u/.cargo/registry/src/index/lib.rs")];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &two,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    let three = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &three,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    let dotted = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/./lib.rs",
+    )];
+    let parent = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/src/../lib.rs",
+    )];
+    let doubled = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index//pkg/lib.rs",
+    )];
+    for sources in [&dotted, &parent, &doubled] {
+        assert!(
+            host_neutral_registry_root(&unit(
+                Some("pkg"),
+                no_types,
+                no_externs,
+                sources,
+                Some(&pkg),
+                None,
+                false,
+            ))
+            .is_none(),
+            "{sources:?}"
+        );
+    }
+    let adjacent = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src2/index/pkg/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &adjacent,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    let registry_root = PathBuf::from("C:/Users/u/.cargo/registry/src");
+    let root_only = keyed_source_path(&registry_root, Some(&registry_root), &normalizer).unwrap();
+    assert!(!root_only.starts_with(b"registry-src/"));
+
+    let build_out = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/build/out/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &build_out,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    assert!(source_carries_build_script(&build_out[0]));
+    let build_only = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/build/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &build_only,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    assert!(!source_carries_build_script(&build_only[0]));
+    assert!(source_carries_build_script(Path::new(
+        "registry/src/index/pkg/build/mid/out/file.rs"
+    )));
+    assert!(source_carries_build_script(Path::new("build/out/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("build/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("out/build/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("build")));
+    assert!(!source_carries_build_script(Path::new(
+        "build/build/lib.rs"
+    )));
+    let out_then_build = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/out/build/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &out_then_build,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    let named_build = PathBuf::from("C:/Users/u/.cargo/registry/src/index/build-0.1.0");
+    let named_build_src = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/build-0.1.0/src/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("build"),
+            no_types,
+            no_externs,
+            &named_build_src,
+            Some(&named_build),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+
+    assert!(applicable_host_neutral_root(true, true, &clean).is_none());
+    assert!(applicable_host_neutral_root(false, false, &clean).is_none());
+    assert!(applicable_host_neutral_root(true, false, &clean).is_none());
+    assert!(unit_can_publish_remaps(
+        Some("memchr"),
+        Some(Path::new("lib.rs"))
+    ));
+    assert!(!unit_can_publish_remaps(None, Some(Path::new("lib.rs"))));
+    assert!(!unit_can_publish_remaps(Some("memchr"), None));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"C:/Users/u/.cargo/registry/src/index/pkg/\xff.rs");
+        assert!(!source_carries_build_script(Path::new(raw)));
+        assert!(registry_directory_remaps(Path::new(raw), &three, '\\').is_empty());
+    }
+
+    let version = "rustc 1.99.0 (abc)\n host: x86_64-pc-windows-msvc\nhost-extra: kept\nHOST: not-a-host\nhost: second\n";
+    assert_eq!(rustc_version_key_text(version, false), version);
+    let text = rustc_version_key_text(version, true);
+    assert!(!text.contains("host:"), "{text}");
+    assert!(text.contains("host-extra: kept\n"), "{text}");
+    assert!(text.contains("HOST: not-a-host\n"), "{text}");
+    assert!(text.starts_with("rustc 1.99.0 (abc)\n"), "{text}");
+    assert_eq!(host_neutral_version_flags(false, true), (false, true));
+    assert_eq!(host_neutral_version_flags(true, false), (true, true));
+    assert_eq!(host_neutral_version_flags(false, false), (false, false));
+    assert_eq!(host_neutral_version_flags(true, true), (true, true));
+
+    let digest = |drop_host: bool, namespace: bool| {
+        let mut hasher = blake3::Hasher::new();
+        hash_rustc_version_for_unit(&mut hasher, version, drop_host, namespace);
+        hasher.finalize()
+    };
+    let manual = |drop_host: bool, namespace: bool| {
+        let mut hasher = blake3::Hasher::new();
+        let folded = rustc_version_key_text(version, drop_host);
+        hasher.update(b"rustc_version:");
+        hasher.update(folded.as_bytes());
+        hasher.update(b"\n");
+        if namespace {
+            fold_field(&mut hasher, b"host_neutral_sources.v2:", b"1");
+        }
+        hasher.finalize()
+    };
+    assert_eq!(digest(false, false), manual(false, false));
+    assert_eq!(digest(true, true), manual(true, true));
+    assert_eq!(digest(false, true), manual(false, true));
+    assert_eq!(digest(true, false), manual(true, false));
+    assert_ne!(digest(false, false), digest(true, true));
+    assert_ne!(digest(false, false), digest(false, true));
+    assert_ne!(digest(false, true), digest(true, true));
+    assert_ne!(digest(true, false), digest(true, true));
+
+    let reg_root = PathBuf::from("C:/Users/u/.cargo/registry/src");
+    let lib_win = PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\lib.rs");
+    let sibling =
+        PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\foo\mod.rs");
+    let remaps = registry_directory_remaps(
+        &reg_root,
+        &[lib_win.clone(), sibling, lib_win.clone()],
+        '\\',
+    );
+    assert!(remaps.windows(2).all(|pair| {
+        let from = |arg: &String| {
+            arg.strip_prefix("--remap-path-prefix=")
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .0
+                .len()
+        };
+        from(&pair[0]) <= from(&pair[1])
+    }));
+    assert!(remaps.iter().any(|arg| arg.contains("src\\foo\\")));
+    for arg in &remaps {
+        let body = arg.strip_prefix("--remap-path-prefix=").unwrap();
+        let (from, to) = body.split_once('=').unwrap();
+        assert!(from.contains('\\') && from.ends_with('\\'), "{arg}");
+        assert!(
+            to.starts_with("/kache/.cargo/registry/src/") && to.ends_with('/'),
+            "{arg}"
+        );
+        assert!(!to.contains('\\') && !to.contains("lib.rs"), "{arg}");
+        assert!(!from.contains("lib.rs"), "{arg}");
+    }
+    assert_eq!(
+        registry_directory_remaps(&reg_root, std::slice::from_ref(&lib_win), '\\'),
+        registry_directory_remaps(&reg_root, &[lib_win.clone(), lib_win.clone()], '\\')
+    );
+    assert!(registry_directory_remaps(&reg_root, &[], '\\').is_empty());
+    assert!(
+        registry_directory_remaps(Path::new("/"), &[PathBuf::from("/index/pkg/lib.rs")], '/')
+            .is_empty()
+    );
+    let slash_remaps = registry_directory_remaps(&reg_root, &[lib_win], '/');
+    assert!(slash_remaps.iter().all(|arg| {
+        let from = arg
+            .strip_prefix("--remap-path-prefix=")
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .0;
+        !from.contains('\\') && from.ends_with('/')
+    }));
+
+    let base = vec![
+        "--remap-path-prefix=C:\\rustlib\\src\\rust=/rustc/abc".to_string(),
+        "--remap-path-prefix=/rustlib/src/rust=/rustc/abc".to_string(),
+        "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+        "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+        "--remap-path-prefix=/home/u/proj=/proc/self/cwd".to_string(),
+        "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
+        "--remap-path-prefix=noseparator".to_string(),
+        "--cfg=foo".to_string(),
+    ];
+    let registry_flag =
+        ["--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string()];
+    let listed = host_neutral_remap_list(base.clone(), &registry_flag);
+    assert_eq!(
+        listed,
+        vec![
+            "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+            "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/home/u/proj=/proc/self/cwd".to_string(),
+            "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
+            "--remap-path-prefix=noseparator".to_string(),
+            "--cfg=foo".to_string(),
+            "--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string(),
+        ]
+    );
+    assert_eq!(
+        rustc_remap_args(true, base.clone(), Some(&registry_flag)),
+        Vec::<String>::new()
+    );
+    assert_eq!(rustc_remap_args(false, base.clone(), None), base);
+    assert_eq!(rustc_remap_args(false, base, Some(&registry_flag)), listed);
+    assert_eq!(
+        rustc_remap_args(
+            false,
+            vec!["--remap-path-prefix=/rustlib/src/rust=/rustc/abc".to_string()],
+            Some(&[]),
+        ),
+        vec!["--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string()]
+    );
+
+    clear_host_neutral_decision();
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("memchr".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    let plan = vec!["--remap-path-prefix=a/=/kache/.cargo/registry/src/a/".to_string()];
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Unknown
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    let mut other = args.clone();
+    other.crate_name = Some("other".to_string());
+    assert_eq!(
+        take_host_neutral_decision(&other),
+        HostNeutralDecision::Unknown
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    let mut nameless = args.clone();
+    nameless.source_file = None;
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(
+        take_host_neutral_decision(&nameless),
+        HostNeutralDecision::Unknown
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, None);
+    assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    publish_host_neutral_decision(&RustcArgs::default(), Some(vec!["x".to_string()]));
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(take_execute_remaps(&args, true), None);
+    assert_eq!(take_execute_remaps(&args, false), Some(plan.clone()));
+    assert_eq!(host_neutral_extra_remaps(HostNeutralDecision::Off), None);
+    assert_eq!(
+        host_neutral_extra_remaps(HostNeutralDecision::Unknown),
+        None
+    );
+    assert_eq!(
+        host_neutral_extra_remaps(HostNeutralDecision::Remaps(plan.clone())),
+        Some(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    clear_host_neutral_decision();
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Unknown
+    );
+    clear_host_neutral_decision();
+}
+
+fn registry_package(root: &Path) -> PathBuf {
+    let package = root.join("registry/src/index/lanepkg-1.0.0");
+    std::fs::create_dir_all(package.join("src/inner")).unwrap();
+    std::fs::create_dir_all(package.join("tests/data")).unwrap();
+    std::fs::write(package.join("src/lib.rs"), "mod inner;\npub fn f() {}\n").unwrap();
+    std::fs::write(package.join("src/inner/mod.rs"), "pub fn g() {}\n").unwrap();
+    package
+}
+
+#[test]
+fn a_compile_first_registry_unit_keys_like_a_key_first_one() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanepkg".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+    let emitted_key = || {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone(), package.join("src/inner/mod.rs")],
+                env_deps: vec![],
+            },
+            None,
+        );
+        compute_cache_key(&args, &hasher, &normalizer, &env).unwrap()
+    };
+
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    let unremapped = emitted_key();
+    assert_ne!(unremapped, key_first);
+
+    let remaps = take_execute_remaps(&args, false).unwrap();
+    let registry = root.join("registry/src");
+    for dir in [
+        "",
+        "index/lanepkg-1.0.0/src/inner/",
+        "index/lanepkg-1.0.0/tests/data/",
+    ] {
+        let remap = format!(
+            "--remap-path-prefix={}{sep}{}={}",
+            registry.display(),
+            dir.replace('/', std::path::MAIN_SEPARATOR_STR),
+            format_args!("/kache/.cargo/registry/src/{dir}"),
+            sep = std::path::MAIN_SEPARATOR,
+        );
+        assert!(remaps.contains(&remap), "{remap}: {remaps:?}");
+    }
+    assert!(applied_registry_remaps(&args).is_some());
+    assert_eq!(emitted_key(), key_first);
+    assert_eq!(take_execute_remaps(&args, false), Some(remaps));
+
+    // A source in another package took a remap the walk did not cover.
+    let foreign = root.join("registry/src/index/other-1.0.0/src/x.rs");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, "pub fn x() {}\n").unwrap();
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign.clone()],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    record_compiled_remaps(&args, None);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed_unremapped = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    assert_ne!(mixed, key_first);
+    assert_ne!(mixed, mixed_unremapped);
+}
+
+#[test]
+fn a_compile_that_applied_no_registry_remaps_keeps_the_ordinary_key() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("lanepkg_off".to_string());
+    args.source_file = Some(package.join("src/lib.rs"));
+    publish_host_neutral_decision(&args, None);
+    assert_eq!(take_execute_remaps(&args, false), None);
+    assert!(applied_registry_remaps(&args).is_none());
+    assert_eq!(take_execute_remaps(&args, true), None);
+
+    publish_host_neutral_decision(&args, Some(vec!["--remap-path-prefix=a/=b/".to_string()]));
+    assert!(take_execute_remaps(&args, false).is_some());
+    assert!(applied_registry_remaps(&args).is_some());
+    assert_eq!(take_execute_remaps(&args, true), None);
+    assert!(applied_registry_remaps(&args).is_none());
+}
+
+#[test]
+fn applied_remaps_must_cover_every_source_directory() {
+    let registry = PathBuf::from("/home/u/.cargo/registry/src");
+    let own = registry.join("index/a-1.0.0/src/lib.rs");
+    let other = registry.join("index/b-1.0.0/src/x.rs");
+    let applied = registry_directory_remaps(
+        &registry,
+        std::slice::from_ref(&own),
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(
+        &registry,
+        std::slice::from_ref(&own),
+        &applied
+    ));
+    assert!(!remaps_cover_closure(
+        &registry,
+        &[own.clone(), other.clone()],
+        &applied
+    ));
+    let both = registry_directory_remaps(
+        &registry,
+        &[own.clone(), other.clone()],
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(&registry, &[own, other], &both));
+}
+
+#[test]
+fn provisional_registry_remaps_need_a_plain_registry_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let parse = |extra: &[&str], vars: &[(&str, Option<&std::ffi::OsStr>)]| {
+        let invocation = client_invocation(&package, vars);
+        let mut argv: Vec<String> = vec![
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanepkg".into(),
+            source.to_str().unwrap().into(),
+        ];
+        argv.extend(extra.iter().map(|arg| arg.to_string()));
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
+    let manifest = ("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+    let no_out = ("OUT_DIR", None);
+    assert!(
+        provisional_registry_remaps(&parse(&["--crate-type=rlib"], &[manifest, no_out])).is_some()
+    );
+    let out = root.join("out");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[manifest, ("OUT_DIR", Some(out.as_os_str()))]
+        ))
+        .is_none()
+    );
+    assert!(
+        provisional_registry_remaps(&parse(&["--crate-type=proc-macro"], &[manifest, no_out]))
+            .is_none()
+    );
+    let dylib = root.join("libm.so");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--extern", &format!("m={}", dylib.display())],
+            &[manifest, no_out]
+        ))
+        .is_none()
+    );
+    let workspace = root.join("work");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[("CARGO_MANIFEST_DIR", Some(workspace.as_os_str())), no_out]
+        ))
+        .is_none()
+    );
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[no_out, ("CARGO_MANIFEST_DIR", None)]
+        ))
+        .is_none()
+    );
+    let mut script = parse(&["--crate-type=bin"], &[manifest, no_out]);
+    script.crate_name = Some("build_script_build".to_string());
+    assert!(provisional_registry_remaps(&script).is_none());
+    let mut unnormalized = parse(&["--crate-type=rlib"], &[manifest, no_out]);
+    unnormalized.path_normalize_disabled = true;
+    assert!(provisional_registry_remaps(&unnormalized).is_none());
+}
+
+#[test]
+fn package_directories_stop_at_their_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    // Entries: src, tests, src/lib.rs, src/inner, tests/data, src/inner/mod.rs.
+    let found = package_directories(&package, 6).unwrap();
+    assert_eq!(found.len(), 5);
+    assert!(package_directories(&package, 5).is_none());
+    assert!(package_directories(&root.join("missing"), 6).is_none());
+}
+
+#[test]
+fn a_registry_unit_outside_the_neutral_closure_keys_alike_in_both_lanes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    std::fs::write(package.join("README.md"), "docs\n").unwrap();
+    let source = package.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "#![doc = include_str!(\"../README.md\")]\nmod inner;\npub fn f() {}\n",
+    )
+    .unwrap();
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanereadme".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    // The closure names `src/../README.md`, so it is not host-neutral, yet the
+    // compile still takes the package's remaps.
+    let HostNeutralDecision::Remaps(plan) = take_host_neutral_decision(&args) else {
+        panic!("a registry unit compiles with remaps");
+    };
+    assert!(!plan.is_empty());
+
+    // No plan and no earlier compile: the compile-first lane.
+    let remaps = take_execute_remaps(&args, false);
+    assert!(remaps.is_some());
+    let mut readme = package.join("src");
+    readme.push("..");
+    readme.push("README.md");
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), readme, package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    assert_eq!(
+        compute_cache_key(&args, &hasher, &normalizer, &env).unwrap(),
+        key_first
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_package_that_cannot_be_walked_keys_without_remaps_in_both_lanes() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanelocked".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+    let walked = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+
+    let locked = package.join("tests/data");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env);
+    let decision = take_host_neutral_decision(&args);
+    let compiled = take_execute_remaps(&args, false);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let emitted = compute_cache_key(&args, &hasher, &normalizer, &env);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(decision, HostNeutralDecision::Off);
+    assert_eq!(compiled, None);
+    let key_first = key_first.unwrap();
+    assert_eq!(emitted.unwrap(), key_first);
+    assert_ne!(key_first, walked);
+}
+
+#[test]
+fn an_invocation_starts_without_an_earlier_compile_record() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("scoped".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    {
+        let _scope = InvocationKeyScope::enter();
+        assert_eq!(compiled_remaps(&args), None);
+        record_compiled_remaps(&args, None);
+        assert_eq!(compiled_remaps(&args), Some(None));
+    }
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
+    record_compiled_remaps(&args, None);
+}
+
+#[test]
+fn a_compile_record_belongs_to_one_crate_and_source() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("owner".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    let _scope = InvocationKeyScope::enter();
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    let mut other_source = args.clone();
+    other_source.source_file = Some(PathBuf::from("main.rs"));
+    let mut other_crate = args.clone();
+    other_crate.crate_name = Some("other".to_string());
+    assert_eq!(compiled_remaps(&other_source), None);
+    assert_eq!(compiled_remaps(&other_crate), None);
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
+}
+
+/// On Windows a small source's hash is memoised too: the next process
+/// takes it from the memo by the file's stamp, without reading the file.
+#[cfg(windows)]
+#[test]
+fn a_small_windows_source_is_hashed_from_the_memo_in_the_next_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let db = dir.path().join("index.db");
+    let first = FileHasher::persistent(&db);
+    let hash = first.hash(&source).unwrap();
+    first.flush_memo_as_if_settled();
+    assert_eq!(first.stats().cache_misses, 1);
+    let next = FileHasher::persistent(&db);
+    assert_eq!(next.hash(&source).unwrap(), hash);
+    assert_eq!(
+        (next.stats().cache_hits, next.stats().cache_misses),
+        (1, 0),
+        "the memo row answers"
+    );
+    // An edit changes the stamp: the file is read again. It changes the
+    // size too, so it can't share the first write's timestamp tick unseen.
+    std::fs::write(&source, "pub fn gg() {}\n").unwrap();
+    let edited = FileHasher::persistent(&db);
+    assert_ne!(edited.hash(&source).unwrap(), hash);
+    assert_eq!(edited.stats().cache_misses, 1);
+}
+
+/// A crate that embeds a folder with rust-embed (the canonical
+/// `\\?\C:\…\a.svg`) and also includes each file through
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "/…/a.svg")` (`C:\…/a.svg`) names it
+/// twice on Windows: the file is read once and both spellings get its hash.
+#[cfg(windows)]
+#[test]
+fn a_windows_file_named_twice_in_one_closure_is_read_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("icons").join("bot.svg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"<svg/>").unwrap();
+    let changed = dir.path().join("icons").join("changed.svg");
+    std::fs::write(&changed, b"<svg/>").unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let spellings = |name: &str| {
+        let verbatim = std::fs::canonicalize(dir.path().join("icons").join(name)).unwrap();
+        let plain = PathBuf::from(format!(
+            "{}/icons/{name}",
+            root.to_str().unwrap().trim_start_matches(r"\\?\")
+        ));
+        assert_ne!(verbatim, plain, "two spellings of one file");
+        (verbatim, plain)
+    };
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"));
+    // Only a settled stamp carries a hash to another spelling, as for a memo
+    // row: a file written just now is read under each spelling.
+    let fresh = dir.path().join("icons").join("fresh.svg");
+    std::fs::write(&fresh, b"<svg/>").unwrap();
+    let (fresh_verbatim, fresh_plain) = spellings("fresh.svg");
+    hasher.hash(&fresh_verbatim).unwrap();
+    hasher.hash(&fresh_plain).unwrap();
+    assert_eq!(
+        hasher.stats().cache_misses,
+        2,
+        "an unsettled stamp carries no hash"
+    );
+    // Std cannot set NTFS's change time back, so wait the settling out.
+    std::thread::sleep(std::time::Duration::from_nanos(
+        u64::try_from(HASH_SETTLE_NS).unwrap() + 100_000_000,
+    ));
+    let (verbatim, plain) = spellings("bot.svg");
+    let first = hasher.hash(&verbatim).unwrap();
+    assert_eq!(hasher.hash(&plain).unwrap(), first);
+    assert_eq!(
+        hasher.stats().cache_misses,
+        3,
+        "the second spelling reuses the first read"
+    );
+    // Each spelling keeps a stamp under its own path, which the env-use scan
+    // and the checks after the compile stat again: the first one's would
+    // read as a changed file there.
+    for spelling in [&verbatim, &plain] {
+        let recent = hasher
+            .recent_hashes
+            .borrow()
+            .get(spelling)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            recent.fingerprint,
+            Some(FileFingerprint::from_path(spelling).unwrap())
+        );
+    }
+    hasher
+        .env_dep_use(&plain, "OUT_DIR")
+        .expect("the second spelling scans as unchanged");
+    // Another file is still read.
+    let other = dir.path().join("icons").join("other.svg");
+    std::fs::write(&other, b"<svg/>").unwrap();
+    hasher.hash(&other).unwrap();
+    assert_eq!(hasher.stats().cache_misses, 4);
+    // A file written after its first spelling was read is read again under
+    // the second, which gets the new contents' hash.
+    let (changed_verbatim, changed_plain) = spellings("changed.svg");
+    let before = hasher.hash(&changed_verbatim).unwrap();
+    std::fs::write(&changed, b"<svg></svg>").unwrap();
+    let after = hasher.hash(&changed_plain).unwrap();
+    assert_ne!(after, before, "the second spelling reads the new contents");
+    assert_eq!(hasher.stats().cache_misses, 6);
+}
+
+#[test]
+fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
+    let stamp = |path: &str, inode| FileFingerprint {
+        path: path.to_string(),
+        size: 12,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode,
+    };
+    let first = |inode, observed_ns| ObservedFingerprint {
+        fingerprint: stamp(r"C:\a\b.rs", inode),
+        observed_ns,
+    };
+    let settled = first(7, 1 + HASH_SETTLE_NS);
+    let other = stamp("c:/a/b.rs", 7);
+    assert!(may_carry_over(&settled, &other, true));
+    assert!(
+        !may_carry_over(&first(7, HASH_SETTLE_NS), &other, true),
+        "the first read had not settled"
+    );
+    assert!(
+        !may_carry_over(&settled, &stamp(r"C:\a\b.rs", 7), true),
+        "the same spelling is the memo's question"
+    );
+    for moved in [
+        FileFingerprint {
+            size: 13,
+            ..other.clone()
+        },
+        FileFingerprint {
+            mtime_ns: 2,
+            ..other.clone()
+        },
+        FileFingerprint {
+            ctime_ns: 2,
+            ..other.clone()
+        },
+        FileFingerprint {
+            inode: 8,
+            ..other.clone()
+        },
+    ] {
+        assert!(!may_carry_over(&settled, &moved, true), "{moved:?}");
+    }
+    let anonymous = first(0, 1 + HASH_SETTLE_NS);
+    let anonymous_other = stamp("c:/a/b.rs", 0);
+    assert!(
+        !may_carry_over(&anonymous, &anonymous_other, true),
+        "no file index where one is required"
+    );
+    assert!(may_carry_over(&anonymous, &anonymous_other, false));
 }

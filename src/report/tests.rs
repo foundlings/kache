@@ -1,5 +1,4 @@
 use super::*;
-use chrono::Utc;
 
 #[test]
 fn reports_distinguish_fixed_prediction_bugs_and_keep_raw_details() {
@@ -71,10 +70,10 @@ fn fixed_prediction_variants_use_one_top_reason_slot() {
     assert_eq!(bypass.reasons[1].reason, "unsupported|real compile problem");
 }
 
-fn write_gc_stats(dir: &std::path::Path, last_run: chrono::DateTime<Utc>) {
+fn write_gc_stats(dir: &std::path::Path, last_run: jiff::Timestamp) {
     let persisted = format!(
         r#"{{"last_run":"{}","entries_evicted":3,"bytes_freed":4096,"blobs_removed":5,"duration_ms":12}}"#,
-        last_run.to_rfc3339()
+        kache_protocol::time::rfc3339(last_run)
     );
     std::fs::write(dir.join("gc_stats.json"), persisted).unwrap();
 }
@@ -98,27 +97,25 @@ fn a_blaze_command_is_separate_from_uncached_compiler_invocations() {
 #[test]
 fn load_gc_summary_includes_a_run_exactly_at_the_cutoff() {
     let dir = tempfile::tempdir().unwrap();
-    let last_run = Utc::now() - chrono::Duration::hours(3);
+    let last_run = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(3);
     write_gc_stats(dir.path(), last_run);
     // The fixture writes an RFC 3339 string, so compare against the value
     // that string parses back to rather than the original instant.
     let persisted: GcStatsPersisted =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("gc_stats.json")).unwrap())
             .unwrap();
-    let written = chrono::DateTime::parse_from_rfc3339(&persisted.last_run)
-        .unwrap()
-        .with_timezone(&Utc);
+    let written = kache_protocol::time::parse_rfc3339(&persisted.last_run).unwrap();
 
     assert!(
         load_gc_summary(dir.path(), written).is_some(),
         "a run at the cutoff is within the window"
     );
     assert!(
-        load_gc_summary(dir.path(), written - chrono::Duration::seconds(1)).is_some(),
+        load_gc_summary(dir.path(), written - jiff::SignedDuration::from_secs(1)).is_some(),
         "a run after the cutoff is within the window"
     );
     assert!(
-        load_gc_summary(dir.path(), written + chrono::Duration::seconds(1)).is_none(),
+        load_gc_summary(dir.path(), written + jiff::SignedDuration::from_secs(1)).is_none(),
         "a run before the cutoff is outside it"
     );
 }
@@ -126,9 +123,15 @@ fn load_gc_summary_includes_a_run_exactly_at_the_cutoff() {
 #[test]
 fn load_gc_summary_returns_recent_run_within_window() {
     let dir = tempfile::tempdir().unwrap();
-    write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(1));
-    let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
-        .expect("recent gc run is within the 24h window");
+    write_gc_stats(
+        dir.path(),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
+    );
+    let gc = load_gc_summary(
+        dir.path(),
+        SinceWindow::DEFAULT.cutoff(jiff::Timestamp::now()),
+    )
+    .expect("recent gc run is within the 24h window");
     assert_eq!(gc.entries_evicted, 3);
     assert_eq!(gc.bytes_freed, 4096);
     assert_eq!(gc.blobs_removed, 5);
@@ -137,9 +140,16 @@ fn load_gc_summary_returns_recent_run_within_window() {
 #[test]
 fn load_gc_summary_drops_run_older_than_window() {
     let dir = tempfile::tempdir().unwrap();
-    write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(48));
+    write_gc_stats(
+        dir.path(),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48),
+    );
     assert!(
-        load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none(),
+        load_gc_summary(
+            dir.path(),
+            SinceWindow::DEFAULT.cutoff(jiff::Timestamp::now())
+        )
+        .is_none(),
         "a run 48h ago must fall outside the 24h window"
     );
 }
@@ -147,14 +157,26 @@ fn load_gc_summary_drops_run_older_than_window() {
 #[test]
 fn load_gc_summary_absent_when_no_stats_file() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
+    assert!(
+        load_gc_summary(
+            dir.path(),
+            SinceWindow::DEFAULT.cutoff(jiff::Timestamp::now())
+        )
+        .is_none()
+    );
 }
 
 #[test]
 fn load_gc_summary_absent_on_malformed_stats_file() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("gc_stats.json"), b"not json").unwrap();
-    assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
+    assert!(
+        load_gc_summary(
+            dir.path(),
+            SinceWindow::DEFAULT.cutoff(jiff::Timestamp::now())
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -167,9 +189,7 @@ fn load_gc_summary_all_sums_unique_stores_and_selects_latest_instant() {
         max_size: Some(1000),
     };
     config.volume_stores = vec![shard.clone(), shard.clone()];
-    let cutoff = DateTime::parse_from_rfc3339("2026-09-28T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let cutoff = kache_protocol::time::parse_rfc3339("2026-09-28T00:00:00Z").unwrap();
     assert!(load_gc_summary_all(&config, cutoff).is_none());
     for (path, time, n) in [
         (&config.cache_dir, "2026-09-28T10:00:00+02:00", 2),
@@ -263,7 +283,7 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records.len(), 2, "{log}");
-    assert!(chrono::DateTime::parse_from_rfc3339(&records[0].ts).is_ok());
+    assert!(kache_protocol::time::parse_rfc3339(&records[0].ts).is_some());
     assert_eq!(
         records[0],
         GcRunRecord {
@@ -473,8 +493,11 @@ fn gc_stats_with_totals_from_an_earlier_version_still_parses() {
 
     let raw = std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap();
     assert!(!raw.contains("totals"), "{raw}");
-    let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
-        .expect("the recorded run is inside the window");
+    let gc = load_gc_summary(
+        dir.path(),
+        SinceWindow::DEFAULT.cutoff(jiff::Timestamp::now()),
+    )
+    .expect("the recorded run is inside the window");
     assert_eq!(gc.entries_evicted, 5);
 }
 
@@ -487,7 +510,7 @@ fn test_event(
     cache_key: &str,
 ) -> BuildEvent {
     BuildEvent {
-        ts: Utc::now(),
+        ts: jiff::Timestamp::now(),
         session_id: String::new(),
         demands: Vec::new(),
         rebuilt_package: None,
@@ -542,6 +565,7 @@ fn test_event(
         store_error: String::new(),
         store_handed_off: false,
         incremental_seed: String::new(),
+        incremental_seed_attempt: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -558,6 +582,7 @@ fn test_event(
         miss_reason: crate::events::MissReason::None,
         object_output: String::new(),
         package: String::new(),
+        readonly_store: false,
     }
 }
 
@@ -600,7 +625,7 @@ fn test_transfer(
         blobs_skipped: 0,
         blobs_total: 2,
         ok,
-        timestamp: Utc::now().timestamp() as u64,
+        timestamp: jiff::Timestamp::now().as_second() as u64,
     }
 }
 
@@ -672,10 +697,12 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -911,6 +938,48 @@ fn store_failures_are_visible_without_leaving_the_miss_accounting() {
             .ends_with(" | not cached: refusing to cache zero-byte artifact: liblint.rmeta"),
         "the miss row should carry the reason: {text}"
     );
+}
+
+/// A hit from the read-only store stays a local hit, so totals and the hit
+/// rate do not move, and is also counted on its own.
+#[test]
+fn readonly_store_hits_are_counted_inside_local_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    assert_eq!(report.summary.readonly_hits, 0);
+    assert!(text_row(&format_text(&report), "Read-only").is_none());
+    assert!(!format_markdown(&report).contains("Read-only"));
+    let (local, hits, rate) = (
+        report.summary.local_hits,
+        report.summary.total_hits(),
+        report.summary.hit_rate_pct,
+    );
+
+    let own = test_event("own", EventResult::LocalHit, 5, 300, 1024, "aaa111");
+    let mut host = test_event("host", EventResult::LocalHit, 5, 300, 1024, "bbb222");
+    host.readonly_store = true;
+    events::log_event(&config.event_log_path(), &own).unwrap();
+    events::log_event(&config.event_log_path(), &host).unwrap();
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+
+    assert_eq!(report.summary.readonly_hits, 1);
+    assert_eq!(report.summary.local_hits, local + 2);
+    assert_eq!(report.summary.total_hits(), hits + 2);
+    assert!(report.summary.hit_rate_pct > rate);
+    assert_eq!(
+        text_row(&format_text(&report), "Read-only").as_deref(),
+        Some(
+            format!(
+                "Read-only | 1 | of {} local hits from the read-only store",
+                local + 2
+            )
+            .as_str()
+        ),
+    );
+    assert!(format_markdown(&report).contains("| Read-only store hits | 1 (included in local) |"));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["summary"]["readonly_hits"], 1);
 }
 
 #[test]
@@ -1283,7 +1352,7 @@ fn report_window_narrows_events_and_labels_itself() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_test_events(dir.path());
     let mut stale = test_event("ancient", EventResult::Miss, 5000, 4800, 1024, "old");
-    stale.ts = Utc::now() - chrono::Duration::hours(3);
+    stale.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(3);
     events::log_event(&config.event_log_path(), &stale).unwrap();
 
     let wide = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
@@ -1333,7 +1402,7 @@ fn session_event(root: &str, session: &str, second: i64, elapsed_ms: u64) -> Bui
     let mut event = test_event("fixture", EventResult::Miss, elapsed_ms, 10, 100, "key");
     event.root = root.to_string();
     event.session_id = session.to_string();
-    event.ts = DateTime::from_timestamp(1_700_000_000 + second, 0).unwrap();
+    event.ts = jiff::Timestamp::from_second(1_700_000_000 + second).unwrap();
     event
 }
 
@@ -1353,8 +1422,8 @@ fn last_build_selects_recorded_root_and_id_by_timestamp() {
     assert!(!session.inferred);
     assert_eq!(session.inactivity_secs, 300);
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].ts.timestamp(), 1_700_000_900);
-    assert_eq!(events[1].ts.timestamp(), 1_700_000_000);
+    assert_eq!(events[0].ts.as_second(), 1_700_000_900);
+    assert_eq!(events[1].ts.as_second(), 1_700_000_000);
     assert!(session.description().contains("recorded new; root: /repo"));
 }
 
@@ -1375,8 +1444,8 @@ fn last_build_infers_local_activity_with_idle_and_recorded_boundaries() {
         assert!(session.session_id.is_empty());
         assert_eq!(session.inactivity_secs, 300);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].ts.timestamp(), 1_700_000_300);
-        assert_eq!(events[2].ts.timestamp(), 1_700_001_199);
+        assert_eq!(events[0].ts.as_second(), 1_700_000_300);
+        assert_eq!(events[2].ts.as_second(), 1_700_001_199);
         assert!(
             session
                 .description()
@@ -1427,7 +1496,7 @@ fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
     let lines =
         [&hit, &miss, &bypass, &old, &other].map(|event| serde_json::to_string(event).unwrap());
     std::fs::write(config.event_log_path(), lines.join("\n") + "\n").unwrap();
-    write_gc_stats(dir.path(), Utc::now());
+    write_gc_stats(dir.path(), jiff::Timestamp::now());
 
     let report = generate_report_with_filter(
         &config,
@@ -1580,10 +1649,10 @@ fn assign_trace_lanes_packs_concurrent_events() {
     // `event_start` = ts - elapsed_ms, so set ts (the end) to place each
     // slice on the timeline. Two overlapping events must get distinct lanes;
     // a later non-overlapping event reuses lane 0 instead of a fresh one.
-    let base = Utc::now();
+    let base = jiff::Timestamp::now();
     let mk = |name: &str, result, key: &str, start_off_ms: i64, dur_ms: u64| {
         let mut e = test_event(name, result, dur_ms, 0, 0, key);
-        e.ts = base + chrono::Duration::milliseconds(start_off_ms + dur_ms as i64);
+        e.ts = base + jiff::SignedDuration::from_millis(start_off_ms + dur_ms as i64);
         e
     };
     let a = mk("a", EventResult::LocalHit, "k1", 0, 100); // [0, 100)
@@ -1599,7 +1668,7 @@ fn assign_trace_lanes_packs_concurrent_events() {
 /// A miss with every phase set, values chosen so no two offsets coincide.
 fn phase_heavy_miss(lane: u32) -> TraceEvent {
     let mut e = test_event("m", EventResult::Miss, 140, 100, 0, "k-miss");
-    e.ts = Utc::now();
+    e.ts = jiff::Timestamp::now();
     e.startup_ms = 1;
     e.key_ms = 10;
     e.dep_info_ms = 4;
@@ -1694,7 +1763,7 @@ fn trace_phase_events_nest_in_wrapper_order_on_the_parent_lane() {
 #[test]
 fn trace_phase_events_skip_empty_phases_and_never_draw_a_hit_compile() {
     let mut e = test_event("h", EventResult::LocalHit, 20, 250, 0, "k-hit");
-    e.ts = Utc::now();
+    e.ts = jiff::Timestamp::now();
     e.key_ms = 10;
     e.lookup_ms = 2;
     e.restore_ms = 5;
@@ -1714,7 +1783,7 @@ fn trace_phase_events_clamp_to_the_parent_and_drop_what_follows() {
     // Phases sum to 24 ms inside a 10 ms parent: key fills [0, 8), lookup
     // is cut to [8, 10), restore has no room and is dropped.
     let mut e = test_event("c", EventResult::LocalHit, 10, 0, 0, "k-clamp");
-    e.ts = Utc::now();
+    e.ts = jiff::Timestamp::now();
     e.key_ms = 8;
     e.lookup_ms = 8;
     e.restore_ms = 8;
@@ -1737,7 +1806,7 @@ fn trace_phase_events_keep_dep_info_inside_key() {
     // Inconsistent event: dep-info time without key time. The nested
     // slice needs a key slice to live in, so it is clamped away.
     let mut e = test_event("d", EventResult::LocalHit, 10, 0, 0, "k-dep");
-    e.ts = Utc::now();
+    e.ts = jiff::Timestamp::now();
     e.dep_info_ms = 5;
     e.dep_info_runs = 1;
     e.lookup_ms = 1;
@@ -1761,7 +1830,7 @@ fn trace_phase_events_keep_dep_info_inside_key() {
 #[test]
 fn trace_phase_events_are_empty_for_a_zero_length_parent() {
     let mut e = test_event("z", EventResult::Miss, 0, 0, 0, "k-zero");
-    e.ts = Utc::now();
+    e.ts = jiff::Timestamp::now();
     e.key_ms = 3;
     let parent = to_trace_event(&e, 0);
     assert!(trace_phase_events(&parent).is_empty());
@@ -2177,10 +2246,12 @@ fn test_missing_transfer_data() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -2296,10 +2367,12 @@ fn test_suggestion_high_miss_share() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -2414,10 +2487,12 @@ fn test_suggestion_high_hit_overhead() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -2533,10 +2608,12 @@ fn test_suggestion_network_download_failures_and_fanout() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -2657,10 +2734,12 @@ fn test_suggestion_network_latency_thresholds() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -2743,7 +2822,7 @@ fn test_suggestion_network_latency_thresholds() {
         blobs_skipped: 0,
         blobs_total: 2,
         ok: true,
-        timestamp: Utc::now().timestamp() as u64,
+        timestamp: jiff::Timestamp::now().as_second() as u64,
     };
     events::log_transfer(&config.transfer_log_path(), &slow).unwrap();
 
@@ -3184,10 +3263,12 @@ fn test_empty_report() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -3684,10 +3765,12 @@ fn report_counts_each_download_transfer_format() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
+        build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4677,10 +4760,10 @@ fn average_ms_prints_a_decimal_only_below_ten() {
 fn local_time_keeps_an_unparsed_input() {
     assert_eq!(local_time("not-a-time"), "not-a-time");
     let stamp = "2026-09-30T12:34:00Z";
-    let expected = chrono::DateTime::parse_from_rfc3339(stamp)
+    let expected = kache_protocol::time::parse_rfc3339(stamp)
         .unwrap()
-        .with_timezone(&chrono::Local)
-        .format("%b %d %H:%M")
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%b %d %H:%M")
         .to_string();
     assert_eq!(local_time(stamp), expected);
     assert_ne!(local_time(stamp), "xyzzy");
@@ -5159,7 +5242,8 @@ fn legacy_scheduler_waits_keep_timings_without_invented_outcomes() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_test_events(dir.path());
     events::clear_events(&config.event_log_path()).unwrap();
-    let raw = serde_json::json!({"ts":Utc::now(),"crate_name":"old","result":"miss","elapsed_ms":31000,"size":0,"schema":17,"permit_wait_ms":30002,"flight_wait_ms":0});
+    let raw = serde_json::json!({"ts":kache_protocol::time::rfc3339_z(jiff::Timestamp::now()),
+"crate_name":"old","result":"miss","elapsed_ms":31000,"size":0,"schema":17,"permit_wait_ms":30002,"flight_wait_ms":0});
     let event: BuildEvent = serde_json::from_value(raw).unwrap();
     assert!(event.scheduler_decisions.is_empty());
     events::log_event(&config.event_log_path(), &event).unwrap();
@@ -5302,4 +5386,87 @@ fn a_seeded_compile_names_the_checkout_its_state_came_from() {
     event.incremental_seed.clear();
     let detail = to_bypass_detail(&event);
     assert_eq!(bypass_detail_words(&detail, "seeded".to_string()), "seeded");
+}
+
+#[test]
+fn seed_summary_counts_attempts_and_times_successful_compiles() {
+    let event = |attempt: &str, exit: Option<i32>, compile_ms: u64| {
+        let mut event = test_event(
+            "unit",
+            EventResult::Passthrough,
+            compile_ms,
+            compile_ms,
+            0,
+            "",
+        );
+        event.passthrough_reason = "adaptive seed".into();
+        event.incremental_seed_attempt = attempt.into();
+        event.exit_code = exit;
+        event
+    };
+    let events = [
+        event("imported", Some(0), 1_000),
+        event("imported", Some(1), 9_000),
+        event("no-donor", Some(0), 4_000),
+        event("unportable", Some(0), 6_000),
+        event("", Some(0), 50_000),
+        event("imported", None, 7_000),
+        event("no-donor", Some(1), 8_000),
+        event("unportable", None, 8_000),
+    ];
+    assert_eq!(
+        seed_summary(&events),
+        SeedSummary {
+            imported: 3,
+            no_donor: 2,
+            unportable: 2,
+            seeded_compiles: 1,
+            seeded_compile_ms: 1_000,
+            unseeded_compiles: 2,
+            unseeded_compile_ms: 10_000,
+        }
+    );
+    assert_eq!(build_bypass_analysis(&events, 10).seeds.looked(), 7);
+}
+
+#[test]
+fn seed_summary_line_shows_rate_and_both_averages_only() {
+    assert_eq!(format_seed_summary(&SeedSummary::default()), None);
+    let only_unseeded = SeedSummary {
+        no_donor: 1,
+        unseeded_compiles: 1,
+        unseeded_compile_ms: 4_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_seed_summary(&only_unseeded),
+        Some(("0 of 1".into(), "seeded from another checkout".into()))
+    );
+    let only_seeded = SeedSummary {
+        imported: 1,
+        seeded_compiles: 1,
+        seeded_compile_ms: 2_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_seed_summary(&only_seeded),
+        Some(("1 of 1".into(), "seeded from another checkout".into()))
+    );
+    let both = SeedSummary {
+        imported: 1,
+        no_donor: 1,
+        unportable: 2,
+        seeded_compiles: 2,
+        seeded_compile_ms: 2_000,
+        unseeded_compiles: 3,
+        unseeded_compile_ms: 9_000,
+    };
+    assert_eq!(
+        format_seed_summary(&both),
+        Some((
+            "1 of 4".into(),
+            "seeded from another checkout, 2 not portable; mean successful compile 1.0 s seeded (n=2), 3.0 s without (n=3)"
+                .into()
+        ))
+    );
 }
