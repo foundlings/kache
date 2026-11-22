@@ -7965,6 +7965,7 @@ fn a_skipped_path_leaves_out_only_itself_not_its_name_elsewhere() {
         target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
@@ -8002,6 +8003,7 @@ fn a_closure_reading_a_guard_excluded_directory_keeps_no_guard() {
         target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
     };
     let sources = |files: &[&str]| files.iter().map(|file| root.join(file)).collect::<Vec<_>>();
@@ -23734,6 +23736,8 @@ fn an_in_place_same_size_edit_with_restored_mtime_moves_the_ancestor_digest() {
     write_file(&root.join("clippy.toml"), "msrv = \"1.81\"\n");
     set_old("clippy.toml");
     assert_ne!(digest(), first, "same size, same mtime, different bytes");
+}
+
 #[test]
 fn a_units_own_source_is_scanned_but_not_recorded() {
     let dir = tempfile::tempdir().unwrap();
