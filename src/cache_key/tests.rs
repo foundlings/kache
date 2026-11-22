@@ -22356,3 +22356,37 @@ fn only_the_package_value_selects_the_package_scope() {
         "a package outside the workspace"
     );
 }
+
+/// Dot-directories at a workspace root (`.jj`, `.claude`, tool caches) differ
+/// between checkouts of one tree and are not macro input: a package-scoped
+/// guard ignores them, so two checkouts agree. `.sqlx`, which a macro reads,
+/// still counts, and a vendored package keeps digesting every dot-directory.
+#[test]
+fn a_package_scoped_guard_ignores_checkout_local_dot_directories_but_not_sqlx() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("a/w"), dir.path().join("b/w"));
+    for root in [&first, &second] {
+        package_scope_workspace(root);
+    }
+    write_file(&first.join(".jj/op_log"), "one");
+    write_file(&second.join(".jj/op_log"), "two");
+    write_file(&second.join(".claude/worktrees/x"), "");
+    write_file(&second.join(".mypy_cache/c"), "");
+    let hasher = FileHasher::new();
+    let package = |root: &Path| {
+        workspace_tree_digest(&package_scope_roots(root, GuardScope::Package), &hasher).unwrap()
+    };
+    assert_eq!(package(&first), package(&second));
+    write_file(&second.join(".sqlx/query-1.json"), "{}");
+    assert_ne!(package(&first), package(&second), ".sqlx is macro input");
+
+    let ancestors = |root: &Path, dot_dirs| {
+        vendored_package_digest(&root.join("kt"), None, root, dot_dirs, &hasher).unwrap()
+    };
+    assert_eq!(
+        ancestors(&first, DotDirs::Data),
+        ancestors(&first, DotDirs::All)
+    );
+    write_file(&first.join(".jj/op_log"), "changed");
+    assert_ne!(ancestors(&first, DotDirs::All), ancestors(&second, DotDirs::All));
+}

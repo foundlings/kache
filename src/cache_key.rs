@@ -2873,6 +2873,7 @@ fn workspace_tree_digest(
             package,
             workspace.out_dir.as_deref(),
             &workspace.root,
+            DotDirs::All,
             file_hasher,
         );
     }
@@ -2881,6 +2882,7 @@ fn workspace_tree_digest(
             package,
             workspace.out_dir.as_deref(),
             &workspace.root,
+            DotDirs::Data,
             file_hasher,
         );
     }
@@ -2944,6 +2946,7 @@ fn vendored_package_digest(
     package: &Path,
     out_dir: Option<&Path>,
     workspace_root: &Path,
+    dot_dirs: DotDirs,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
     let mut roots = vec![TreeRoot::new(
@@ -2963,17 +2966,47 @@ fn vendored_package_digest(
         fold_field(
             &mut hasher,
             b"ancestor:",
-            ancestor_top_digest(directory, file_hasher)?.as_bytes(),
+            ancestor_top_digest(directory, dot_dirs, file_hasher)?.as_bytes(),
         );
         ancestor = directory.parent();
     }
     Some(hasher.finalize().to_hex().to_string())
 }
 
+/// Which dot-directories at the top of an ancestor a guard digests.
+#[derive(Clone, Copy)]
+enum DotDirs {
+    /// All of them: a vendored package's lookups can land in any.
+    All,
+    /// Only the data directories a macro reads by convention. A workspace
+    /// root's other dot-directories (`.jj`, `.claude`, tool caches) differ
+    /// between checkouts of one tree and are not macro input; digesting them
+    /// made every workspace unit's guard checkout-specific.
+    Data,
+}
+
+/// Dot-directories a macro reads by convention (`sqlx` offline data).
+const DATA_DOT_DIRS: &[&str] = &[".sqlx"];
+
+impl DotDirs {
+    fn reads(self, name: &std::ffi::OsStr) -> bool {
+        match self {
+            Self::All => true,
+            Self::Data => DATA_DOT_DIRS
+                .iter()
+                .any(|data| name == std::ffi::OsStr::new(data)),
+        }
+    }
+}
+
 /// The files, symlinks and dot-directories (less `.git`, of either kind) at the top of
 /// `directory`, by name and content. A symlink to a file counts by its
 /// target and by the content read through it.
-fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
+fn ancestor_top_digest(
+    directory: &Path,
+    dot_dirs: DotDirs,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
     // The guard's walk of the files and symlinks read here, and of the
     // directory's own times, taken before the listing: a name that appears
     // after the stamp, or comes and goes before the record is written, moves
@@ -3043,7 +3076,8 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
             Ok(metadata)
                 if metadata.is_dir()
                     && name.as_encoded_bytes().starts_with(b".")
-                    && name != ".git" =>
+                    && name != ".git"
+                    && dot_dirs.reads(&name) =>
             {
                 let roots = vec![TreeRoot::new(path.clone(), b"dot_dir", &[])];
                 format!(
