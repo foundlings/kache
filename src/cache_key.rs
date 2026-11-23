@@ -3394,6 +3394,10 @@ pub(crate) struct WorkspaceRoots {
     /// Directory names the workspace guard leaves out at any depth
     /// ([`workspace_guard_excluded`]).
     pub(crate) guard_excluded: Vec<std::ffi::OsString>,
+    /// rustc runs under clippy-driver ([`RustcArgs::is_clippy_chain`]), whose
+    /// dep-info names the workspace manifest as a bare `Cargo.toml`
+    /// ([`is_clippy_tracked_manifest`]).
+    pub(crate) clippy_chain: bool,
 }
 
 /// What a workspace unit's tree guard digests ([`TREE_GUARD_SCOPE_ENV`]).
@@ -3405,10 +3409,13 @@ pub(crate) enum GuardScope {
     Workspace,
     /// The unit's package directory, its `OUT_DIR`, and the top-level files
     /// of each directory between the package and the workspace root, as for
-    /// a vendored package ([`vendored_package_digest`]). Sound for macros
-    /// that read the package, `OUT_DIR` or those files. A macro that lists
-    /// a directory outside them holding none of the closure's files is not
-    /// seen: that is why this scope is opt-in.
+    /// a vendored package ([`vendored_package_digest`]), less the root's
+    /// `Cargo.toml` and `Cargo.lock` and, on Unix, the directories' own times
+    /// ([`AncestorTop`]). Sound for macros that read the package, `OUT_DIR`
+    /// or those files. A macro that lists a directory outside them holding
+    /// none of the closure's files is not seen, nor one that reads the root
+    /// manifest or lockfile without reporting it
+    /// ([`PACKAGE_GUARD_ROOT_SKIPPED`]): that is why this scope is opt-in.
     Package(PathBuf),
 }
 
@@ -3516,6 +3523,7 @@ fn workspace_roots_in(
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
         guard_excluded: workspace_guard_excluded(&root),
+        clippy_chain: args.is_clippy_chain(),
         root,
         target,
     })
@@ -3733,10 +3741,11 @@ fn vendored_package_digest(
     fold_field(&mut hasher, b"package:", package_digest.as_bytes());
     let mut ancestor = package.parent();
     while let Some(directory) = ancestor.filter(|directory| directory.starts_with(workspace_root)) {
+        let top = AncestorTop::of(dot_dirs, directory == workspace_root);
         fold_field(
             &mut hasher,
             b"ancestor:",
-            ancestor_top_digest(directory, dot_dirs, file_hasher)?.as_bytes(),
+            ancestor_top_digest(directory, top, file_hasher)?.as_bytes(),
         );
         ancestor = directory.parent();
     }
@@ -3769,33 +3778,125 @@ impl DotDirs {
     }
 }
 
+/// The workspace root's files a package-scoped guard leaves out
+/// ([`AncestorTop::PackageRoot`]).
+///
+/// Why this is sound. The guard does not key content: every file a closure
+/// names is hashed into the cache key. It decides whether the closure an
+/// earlier dep-info pre-pass recorded may stand in for running it again, so
+/// it has to move when the set of files rustc reads could have changed.
+/// rustc never opens `Cargo.lock`, and it opens the workspace `Cargo.toml`
+/// only when the crate asks for it. Cargo turns both into the unit's
+/// invocation instead: the resolved graph into `--extern` paths and the
+/// `-C metadata` / `extra-filename` hashes of each unit, the manifest into
+/// `--cfg` features, edition, codegen and lint flags and the `CARGO_PKG_*`
+/// variables of inherited fields. Those are in the prediction identity and
+/// the key, and a changed dependency changes the rmeta the key hashes, so a
+/// lock or manifest change that matters to a unit already re-keys it, as
+/// Cargo's own fingerprint reruns it. A build script that reads either file
+/// writes what it found under `OUT_DIR`, which the guard digests.
+///
+/// A unit that reads either file itself (`include_str!`, `include_bytes!`,
+/// a macro reporting the path) lists it in its dep-info. Such a closure is
+/// not covered ([`package_scope_sees`]): the unit is never predicted, runs
+/// the pre-pass on every build and keys the file's whole content. Clippy's
+/// own bare `Cargo.toml` entry, which every Clippy unit carries
+/// ([`is_clippy_tracked_manifest`]), is the exception: Clippy adds it
+/// whatever the manifest says, and the key folds the lint tables Clippy
+/// reads from it.
+///
+/// What this cannot see: a proc macro that reads one of these files without
+/// reporting it and, from what it read, opens other files. The pre-pass
+/// path never keyed such a read either; the guard used to rediscover the
+/// closure after it. That is the assumption the opt-in package scope adds.
+const PACKAGE_GUARD_ROOT_SKIPPED: &[&str] = &["Cargo.toml", "Cargo.lock"];
+
+/// What a guard reads at the top of one directory between a package and the
+/// workspace root ([`ancestor_top_digest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AncestorTop {
+    /// Above a vendored package: every top-level file and dot-directory, and
+    /// the directory's own times.
+    Vendored,
+    /// Above a package-scoped unit, below the workspace root: the top-level
+    /// files and data dot-directories. On Unix not the directory's own times:
+    /// they move whenever a name is added beside the package's path (a new
+    /// sibling crate), which the package scope leaves out, while a file at
+    /// the top replaced or edited shows in its own entry (inode, change
+    /// time). Elsewhere a recreated name can keep its times, so the
+    /// directory's own times stay.
+    Package,
+    /// The workspace root above a package-scoped unit: as [`Self::Package`],
+    /// less [`PACKAGE_GUARD_ROOT_SKIPPED`].
+    PackageRoot,
+}
+
+impl AncestorTop {
+    fn of(dot_dirs: DotDirs, at_root: bool) -> Self {
+        match dot_dirs {
+            DotDirs::All => Self::Vendored,
+            DotDirs::Data if at_root => Self::PackageRoot,
+            DotDirs::Data => Self::Package,
+        }
+    }
+
+    fn dot_dirs(self) -> DotDirs {
+        match self {
+            Self::Vendored => DotDirs::All,
+            Self::Package | Self::PackageRoot => DotDirs::Data,
+        }
+    }
+
+    /// Names at the top the digest and the stamp leave out.
+    fn skipped(self) -> &'static [&'static str] {
+        match self {
+            Self::Vendored | Self::Package => &[],
+            Self::PackageRoot => PACKAGE_GUARD_ROOT_SKIPPED,
+        }
+    }
+
+    /// Does the stamp hold the directory's own times?
+    fn own_times(self) -> bool {
+        match self {
+            Self::Vendored => true,
+            Self::Package | Self::PackageRoot => cfg!(not(unix)),
+        }
+    }
+}
+
 /// The files, symlinks and dot-directories (less `.git`, of either kind) at the top of
-/// `directory`, by name and content. A symlink to a file counts by its
-/// target and by the content read through it.
+/// `directory`, by name and content, less what `top` skips. A symlink to a
+/// file counts by its target and by the content read through it.
 fn ancestor_top_digest(
     directory: &Path,
-    dot_dirs: DotDirs,
+    top: AncestorTop,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
+    let dot_dirs = top.dot_dirs();
+    let skipped = top.skipped();
     // The guard's walk of the files and symlinks read here, and of the
-    // directory's own times, taken before the listing: a name that appears
-    // after the stamp, or comes and goes before the record is written, moves
-    // those times. A dot-directory's own digest walks that directory.
-    let top = WalkedRoot {
+    // directory's own times where `top` keeps them, taken before the listing:
+    // a name that appears after the stamp, or comes and goes before the
+    // record is written, moves those times. A dot-directory's own digest
+    // walks that directory.
+    let walked = WalkedRoot {
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
-        excluded: vec![directory.join(".git")],
+        excluded: std::iter::once(".git")
+            .chain(skipped.iter().copied())
+            .map(|name| directory.join(name))
+            .collect(),
         excluded_dirs: Vec::new(),
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
-            root_metadata: true,
+            root_metadata: top.own_times(),
             unreadable_entries: true,
             top_files_only: true,
             unsearchable_dirs: false,
         },
     };
-    let stamp = stamp_root(&top, CRATE_TREE_MAX_ENTRIES)?;
+    let stamp = stamp_root(&walked, CRATE_TREE_MAX_ENTRIES)?;
     // The digest of the same top level is the same for every unit below this
     // directory, and the stamp shows when any of its entries moved. A data
     // dot-directory is a tree of its own that the stamp does not cover, so a
@@ -3806,12 +3907,12 @@ fn ancestor_top_digest(
             .any(|data| std::fs::symlink_metadata(directory.join(data)).is_ok()))
     .then(|| {
         let memo_dir = crate::config::probe_memo_dir_for(&file_hasher.invocation_env).ok()?;
-        let root = TreeRoot::new(directory.to_path_buf(), b"ancestor_top_data", &[]);
+        let root = TreeRoot::new(directory.to_path_buf(), b"ancestor_top_data", skipped);
         Some(tree_digest_memo(&memo_dir, &root))
     })
     .flatten();
     let walk = GuardWalk {
-        root: top,
+        root: walked,
         max_entries: CRATE_TREE_MAX_ENTRIES,
         stamp: stamp.digest.clone(),
     };
@@ -3837,7 +3938,7 @@ fn ancestor_top_digest(
         // A directory in a clone, a file naming the repository in a git
         // worktree: either way it is not what a macro reads, and it differs
         // between checkouts.
-        if name == ".git" {
+        if name == ".git" || skipped.iter().any(|skipped| name == OsStr::new(skipped)) {
             continue;
         }
         let path = entry.path();
@@ -8097,17 +8198,19 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
                 &[]
             };
             walk_reaches(root, &below, skips_build_dirs, excluded, &mut entered)
-                && package_scope_sees(root, &below, workspace)
+                && package_scope_sees(source, root, &below, workspace)
         })
     })
 }
 
-/// Under [`GuardScope::Package`], does the guard see the file `below` `root`?
-/// It sees a file under the package, one under `OUT_DIR`, and a file directly
-/// in a directory between the package and the workspace root. Any other
-/// source leaves the unit on the pre-pass. Always true for
+/// Under [`GuardScope::Package`], does the guard see the file `below` `root`,
+/// which the closure spells `source`? It sees a file under the package, one
+/// under `OUT_DIR`, and a file directly in a directory between the package
+/// and the workspace root, but not the root's `Cargo.toml` or `Cargo.lock`
+/// ([`PACKAGE_GUARD_ROOT_SKIPPED`]) unless `source` is Clippy's own manifest
+/// entry. Any other source leaves the unit on the pre-pass. Always true for
 /// [`GuardScope::Workspace`], whose walk [`walk_reaches`] already checked.
-fn package_scope_sees(root: &Path, below: &str, workspace: &WorkspaceRoots) -> bool {
+fn package_scope_sees(source: &Path, root: &Path, below: &str, workspace: &WorkspaceRoots) -> bool {
     let GuardScope::Package(package) = &workspace.guard else {
         return true;
     };
@@ -8132,6 +8235,15 @@ fn package_scope_sees(root: &Path, below: &str, workspace: &WorkspaceRoots) -> b
     }
     if path.starts_with(package) {
         return true;
+    }
+    if path.parent() == Some(workspace.root.as_path())
+        && path.file_name().is_some_and(|name| {
+            PACKAGE_GUARD_ROOT_SKIPPED
+                .iter()
+                .any(|skipped| name == OsStr::new(skipped))
+        })
+    {
+        return workspace.clippy_chain && is_clippy_tracked_manifest(source);
     }
     path.parent().is_some_and(|directory| {
         directory.starts_with(&workspace.root) && package.starts_with(directory)

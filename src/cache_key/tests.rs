@@ -6727,6 +6727,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     }
 }
 
@@ -7644,6 +7645,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -7785,6 +7787,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7841,6 +7844,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -7967,6 +7971,7 @@ fn a_skipped_path_leaves_out_only_itself_not_its_name_elsewhere() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     for nested in ["assets/target/b.txt", "vendor/.git/index"] {
@@ -8005,6 +8010,7 @@ fn a_closure_reading_a_guard_excluded_directory_keeps_no_guard() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let sources = |files: &[&str]| files.iter().map(|file| root.join(file)).collect::<Vec<_>>();
     let lib = sources(&["kt/src/lib.rs"]);
@@ -8078,6 +8084,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -8155,6 +8162,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -8200,6 +8208,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     }
 }
 
@@ -8313,6 +8322,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         vendored_package: Some(root.join("third_party/rust/foo")),
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -8423,6 +8433,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         vendored_package: None,
         guard: GuardScope::Workspace,
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -23534,6 +23545,7 @@ fn package_scope_roots(root: &Path, scope: fn(PathBuf) -> GuardScope) -> Workspa
         vendored_package: None,
         guard: scope(root.join("kt")),
         guard_excluded: Vec::new(),
+        clippy_chain: false,
     }
 }
 
@@ -23613,10 +23625,154 @@ fn a_package_scoped_guard_covers_only_what_it_digests() {
         let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
         guard_covers(&sources, &roots)
     };
-    assert!(covers(&["kt/src/lib.rs", "kt/Cargo.toml", "Cargo.toml"]));
+    assert!(covers(&["kt/src/lib.rs", "kt/Cargo.toml", "clippy.toml"]));
     assert!(!covers(&["kt/src/lib.rs", "other/src/lib.rs"]));
     assert!(!covers(&["kt/../other/src/lib.rs"]));
     assert!(guard_covers(&[PathBuf::from("other/src/lib.rs")], &whole));
+}
+
+/// A package-scoped guard leaves out the workspace root's `Cargo.toml` and
+/// `Cargo.lock`: Cargo turns them into the unit's arguments, which the key
+/// already holds, so adding a member or bumping a dependency no longer sends
+/// every unit back to the pre-pass. Other files at the root still count,
+/// the whole-workspace scope still digests both, and so does a vendored
+/// package's walk up the tree.
+#[test]
+fn a_package_scoped_guard_leaves_out_the_root_manifest_and_lockfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    write_file(&root.join("Cargo.lock"), "version = 4\n");
+    let hasher = FileHasher::new();
+    let package = || {
+        workspace_tree_digest(&package_scope_roots(&root, GuardScope::Package), &hasher).unwrap()
+    };
+    let whole = || {
+        workspace_tree_digest(
+            &package_scope_roots(&root, |_| GuardScope::Workspace),
+            &hasher,
+        )
+        .unwrap()
+    };
+    let vendored =
+        || vendored_package_digest(&root.join("kt"), None, &root, DotDirs::All, &hasher).unwrap();
+    let (package_before, whole_before, vendored_before) = (package(), whole(), vendored());
+
+    write_file(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"kt\", \"other\"]\n",
+    );
+    write_file(&root.join("Cargo.lock"), "version = 4\n# bumped\n");
+    assert_eq!(package(), package_before, "the root manifest and lockfile");
+    assert_ne!(whole(), whole_before, "the contrast: the whole tree");
+    assert_ne!(vendored(), vendored_before, "a vendored package reads them");
+
+    write_file(&root.join("clippy.toml"), "msrv = \"1.80\"\n");
+    assert_ne!(package(), package_before, "another file at the root");
+}
+
+/// A closure that names the root's `Cargo.toml` or `Cargo.lock` itself
+/// (`include_str!`) is not covered by the package guard, which no longer
+/// digests them, so the unit keeps the pre-pass and keys the whole file.
+/// Clippy's bare `Cargo.toml`, which every Clippy unit lists, is covered:
+/// the key folds its lint tables and Clippy lists it whatever it says. The
+/// same bare spelling from plain rustc is not.
+#[test]
+fn a_closure_naming_the_root_manifest_or_lockfile_keeps_the_pre_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    write_file(&root.join("Cargo.lock"), "version = 4\n");
+    let rustc = package_scope_roots(&root, GuardScope::Package);
+    let clippy = WorkspaceRoots {
+        clippy_chain: true,
+        ..package_scope_roots(&root, GuardScope::Package)
+    };
+    let whole = package_scope_roots(&root, |_| GuardScope::Workspace);
+    let with = |extra: &Path| {
+        vec![
+            PathBuf::from("kt/src/lib.rs"),
+            PathBuf::from("kt/Cargo.toml"),
+            extra.to_path_buf(),
+        ]
+    };
+
+    assert!(guard_covers(&with(Path::new("kt/src/data.txt")), &rustc));
+    for embedded in [
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+        PathBuf::from("kt/src/../../Cargo.toml"),
+        PathBuf::from("Cargo.lock"),
+    ] {
+        let sources = with(&embedded);
+        assert!(!guard_covers(&sources, &rustc), "{}", embedded.display());
+        assert!(!guard_covers(&sources, &clippy), "{}", embedded.display());
+        assert!(guard_covers(&sources, &whole), "{}", embedded.display());
+    }
+    let bare = with(Path::new("Cargo.toml"));
+    assert!(guard_covers(&bare, &clippy), "Clippy's own manifest entry");
+    assert!(!guard_covers(&bare, &rustc), "the same spelling from rustc");
+    let both = vec![
+        PathBuf::from("kt/src/lib.rs"),
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("kt/src/../../Cargo.toml"),
+    ];
+    assert!(
+        !guard_covers(&both, &clippy),
+        "a Clippy unit that also embeds the manifest"
+    );
+}
+
+/// On Unix the package guard does not stamp an ancestor's own times: a new
+/// sibling crate directory, or a rewritten lockfile, while a unit compiles
+/// leaves its guard held, so the record is written. A new file at the top
+/// still moves it.
+#[cfg(unix)]
+#[test]
+fn a_package_scoped_guard_holds_across_a_new_sibling_and_a_lockfile_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    package_scope_workspace(&root);
+    write_file(&root.join("Cargo.lock"), "version = 4\n");
+    let hasher = FileHasher::new();
+    let roots = package_scope_roots(&root, GuardScope::Package);
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+    assert!(taken.held());
+
+    write_file(&root.join("newcrate/src/lib.rs"), "");
+    let replaced = root.join("Cargo.lock.tmp");
+    write_file(&replaced, "version = 4\n# rewritten\n");
+    std::fs::rename(&replaced, root.join("Cargo.lock")).unwrap();
+    assert!(taken.held(), "a sibling crate and a lockfile rewrite");
+    assert_eq!(
+        workspace_tree_digest(&roots, &hasher).unwrap(),
+        taken.digest
+    );
+
+    write_file(&root.join(".env"), "DATABASE_URL=x\n");
+    assert!(!taken.held(), "a new file at the top of the root");
+}
+
+/// The vendored-package walk keeps every top-level file and the directory's
+/// own times; only the package scope drops them, and only at the root.
+#[test]
+fn ancestor_tops_skip_the_cargo_files_only_at_a_package_scoped_root() {
+    assert_eq!(AncestorTop::of(DotDirs::All, true), AncestorTop::Vendored);
+    assert_eq!(AncestorTop::of(DotDirs::All, false), AncestorTop::Vendored);
+    assert_eq!(
+        AncestorTop::of(DotDirs::Data, true),
+        AncestorTop::PackageRoot
+    );
+    assert_eq!(AncestorTop::of(DotDirs::Data, false), AncestorTop::Package);
+    assert!(AncestorTop::Vendored.skipped().is_empty());
+    assert!(AncestorTop::Package.skipped().is_empty());
+    assert_eq!(
+        AncestorTop::PackageRoot.skipped(),
+        ["Cargo.toml", "Cargo.lock"]
+    );
+    assert!(AncestorTop::Vendored.own_times());
+    assert_eq!(AncestorTop::Package.own_times(), cfg!(not(unix)));
+    assert_eq!(AncestorTop::PackageRoot.own_times(), cfg!(not(unix)));
 }
 
 #[test]
@@ -23701,16 +23857,20 @@ fn an_ancestor_top_level_digest_is_memoised_by_stamp_and_follows_edits() {
             .unwrap();
     }
     let hasher = FileHasher::new();
-    let digest = |dot_dirs| ancestor_top_digest(&root, dot_dirs, &hasher).unwrap();
-    let first = digest(DotDirs::Data);
-    assert_eq!(digest(DotDirs::Data), first, "a memoised read");
+    let digest = |top| ancestor_top_digest(&root, top, &hasher).unwrap();
+    let first = digest(AncestorTop::Package);
+    assert_eq!(digest(AncestorTop::Package), first, "a memoised read");
     write_file(&root.join("Cargo.toml"), "[workspace]\n# edited\n");
-    assert_ne!(digest(DotDirs::Data), first, "an edit moves the stamp");
+    assert_ne!(
+        digest(AncestorTop::Package),
+        first,
+        "an edit moves the stamp"
+    );
     write_file(&root.join(".sqlx/q.json"), "1");
-    let with_sqlx = digest(DotDirs::Data);
+    let with_sqlx = digest(AncestorTop::Package);
     write_file(&root.join(".sqlx/q.json"), "2");
     assert_ne!(
-        digest(DotDirs::Data),
+        digest(AncestorTop::Package),
         with_sqlx,
         "`.sqlx` is read every time"
     );
@@ -23740,7 +23900,7 @@ fn an_in_place_same_size_edit_with_restored_mtime_moves_the_ancestor_digest() {
     write_file(&root.join("clippy.toml"), "msrv = \"1.80\"\n");
     set_old("clippy.toml");
     let hasher = FileHasher::new();
-    let digest = || ancestor_top_digest(&root, DotDirs::Data, &hasher).unwrap();
+    let digest = || ancestor_top_digest(&root, AncestorTop::Package, &hasher).unwrap();
     let first = digest();
     assert_eq!(digest(), first);
     write_file(&root.join("clippy.toml"), "msrv = \"1.81\"\n");
