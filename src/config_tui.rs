@@ -2183,6 +2183,7 @@ mod tests {
                 restore_max_size: None,
                 auto_recover_targets: None,
                 scheduler_memory_pressure: None,
+                scheduler_slots: None,
                 auto_clean_unused_units_days: None,
                 auto_clean_superseded_executables: None,
                 target_liveness: None,

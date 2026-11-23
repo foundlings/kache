@@ -1734,6 +1734,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
+        scheduler_slots: None,
         auto_clean_unused_units_days: 0,
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,

@@ -1776,6 +1776,7 @@ fn run_compiler_invocation_inner(
     let _pressure =
         scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
     let _scheduler_wait = config.scheduler.then(scheduler::InvocationWaitScope::enter);
+    let _slots = scheduler::InvocationPoolScope::enter(config.scheduler_slots);
     let _priority = scheduler::InvocationPriorityScope::enter(priority);
 
     if config.disabled {

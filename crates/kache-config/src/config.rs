@@ -644,6 +644,13 @@ pub struct Config {
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
     /// scheduler_memory_pressure = false` to disable.
     pub scheduler_memory_pressure: bool,
+    /// Permit slots in the miss-path scheduler's machine-wide pool. `None`
+    /// (unset or `0`) sizes the pool by `available_parallelism()`. Set it to
+    /// Cargo's `jobs` where Cargo runs more jobs than there are cores, or
+    /// compiles queue for a permit while cores sit idle. At most
+    /// [`MAX_SCHEDULER_SLOTS`]. Set via `KACHE_SCHEDULER_SLOTS` or `[cache]
+    /// scheduler_slots`.
+    pub scheduler_slots: Option<u32>,
     /// Let the daemon remove, from target directories still in use, build
     /// units no build has read for this many days (default `30`; `0`
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
@@ -1061,6 +1068,8 @@ pub struct CacheFileConfig {
     pub auto_recover_targets: Option<bool>,
     /// See [`Config::scheduler_memory_pressure`].
     pub scheduler_memory_pressure: Option<bool>,
+    /// See [`Config::scheduler_slots`].
+    pub scheduler_slots: Option<u32>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
     /// See [`Config::auto_clean_superseded_executables`].
@@ -1524,6 +1533,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
+    "KACHE_SCHEDULER_SLOTS",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES",
     "KACHE_SEED_NEW_TARGETS",
@@ -1545,6 +1555,11 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PREFETCH_MAX_BYTES",
     "KACHE_PREFETCH_DEADLINE_SECS",
 ];
+
+/// The largest `[cache] scheduler_slots`. The scheduler keeps one lock file
+/// per slot and scans them on every admission, so a typo such as `2400` must
+/// not become the pool.
+pub const MAX_SCHEDULER_SLOTS: u32 = 1024;
 
 /// Every file-backed `KACHE_*` variable and the config key it overrides, as
 /// config resolution reads them. `kache doctor` names overrides from here. A
@@ -1680,6 +1695,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_SCHEDULER_MEMORY_PRESSURE",
         "cache.scheduler_memory_pressure",
     ),
+    ("KACHE_SCHEDULER_SLOTS", "cache.scheduler_slots"),
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
@@ -2534,6 +2550,7 @@ impl Config {
         let auto_recover_targets = Self::auto_recover_targets_enabled_for(invocation, &file_config);
         let scheduler_memory_pressure =
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
+        let scheduler_slots = Self::scheduler_slots_for(invocation, &file_config)?;
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
         let auto_clean_superseded_executables =
@@ -2686,6 +2703,7 @@ impl Config {
             auto_recover_min_free_bytes,
             auto_recover_targets,
             scheduler_memory_pressure,
+            scheduler_slots,
             auto_clean_unused_units_days,
             auto_clean_superseded_executables,
             seed_new_targets,
@@ -3740,6 +3758,39 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.scheduler_memory_pressure)
             .unwrap_or(true)
+    }
+
+    /// Permit-pool size: `KACHE_SCHEDULER_SLOTS` (env wins), else `[cache]
+    /// scheduler_slots`, else `None` (`available_parallelism()`). `0` means
+    /// the default. A value that is not a whole number, or one above
+    /// [`MAX_SCHEDULER_SLOTS`], fails the load rather than leave the pool at
+    /// a size nobody asked for.
+    fn scheduler_slots_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> Result<Option<u32>> {
+        let configured = match env_or_ignored_for(
+            invocation,
+            "KACHE_SCHEDULER_SLOTS",
+            Self::ignore_env_enabled(file_config),
+        ) {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .context("KACHE_SCHEDULER_SLOTS must be a non-negative integer")?,
+            ),
+            Err(_) => file_config
+                .as_ref()
+                .ok()
+                .and_then(|config| config.cache.as_ref())
+                .and_then(|cache| cache.scheduler_slots),
+        };
+        anyhow::ensure!(
+            configured.is_none_or(|slots| slots <= MAX_SCHEDULER_SLOTS),
+            "cache.scheduler_slots must be at most {MAX_SCHEDULER_SLOTS}"
+        );
+        Ok(configured.filter(|slots| *slots != 0))
     }
 
     /// Idle-target cleanup age in days, `0` (off) by default.

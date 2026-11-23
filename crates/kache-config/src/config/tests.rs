@@ -1190,6 +1190,52 @@ fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
     assert!(Config::load().unwrap().scheduler_memory_pressure);
 }
 
+/// The permit pool keeps its core-count default until a size is set; the env
+/// wins over the file, `0` means the default, and a value that is not a
+/// count or exceeds the cap fails the load instead of sizing the pool.
+#[test]
+fn scheduler_slots_default_to_none_and_obey_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let name = "KACHE_SCHEDULER_SLOTS";
+    let _missing = NamedEnvGuard::remove(name);
+    assert_eq!(Config::load().unwrap().scheduler_slots, None);
+    std::fs::write(&config_path, "[cache]\nscheduler_slots = 24\n").unwrap();
+    assert_eq!(Config::load().unwrap().scheduler_slots, Some(24));
+    std::fs::write(&config_path, "[cache]\nscheduler_slots = 0\n").unwrap();
+    assert_eq!(
+        Config::load().unwrap().scheduler_slots,
+        None,
+        "0 is the default"
+    );
+    std::fs::write(&config_path, "[cache]\nscheduler_slots = 24\n").unwrap();
+    let _env = NamedEnvGuard::set(name, "32");
+    assert_eq!(
+        Config::load().unwrap().scheduler_slots,
+        Some(32),
+        "env wins"
+    );
+    drop(_env);
+    let _env = NamedEnvGuard::set(name, " 16 ");
+    assert_eq!(Config::load().unwrap().scheduler_slots, Some(16));
+    drop(_env);
+    for bad in ["many", "-1", "1025"] {
+        let _bad = NamedEnvGuard::set(name, bad);
+        assert!(Config::load().is_err(), "{bad} must not size the pool");
+    }
+    std::fs::write(&config_path, "[cache]\nscheduler_slots = 4096\n").unwrap();
+    assert!(Config::load().is_err(), "above the cap in the file");
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nscheduler_slots = 12\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set(name, "48");
+    assert_eq!(Config::load().unwrap().scheduler_slots, Some(12));
+}
+
 #[test]
 fn min_store_compile_is_opt_in_and_obeys_env_precedence() {
     let _lock = config_path_lock();
@@ -3385,6 +3431,7 @@ fn test_file_config_roundtrip() {
             restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
+            scheduler_slots: None,
             auto_clean_unused_units_days: None,
             auto_clean_superseded_executables: None,
             seed_new_targets: None,
@@ -4058,6 +4105,7 @@ fn test_config_store_dir() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
+        scheduler_slots: None,
         auto_clean_unused_units_days: 0,
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
@@ -4159,6 +4207,7 @@ fn test_config_index_db_path() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
+        scheduler_slots: None,
         auto_clean_unused_units_days: 0,
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
@@ -4256,6 +4305,7 @@ fn test_config_event_log_path() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
+        scheduler_slots: None,
         auto_clean_unused_units_days: 0,
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
@@ -4372,6 +4422,7 @@ fn test_config_socket_path() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
+        scheduler_slots: None,
         auto_clean_unused_units_days: 0,
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
@@ -5124,6 +5175,7 @@ fn test_save_and_load_file_config() {
             restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
+            scheduler_slots: None,
             auto_clean_unused_units_days: None,
             auto_clean_superseded_executables: None,
             seed_new_targets: None,

@@ -119,6 +119,8 @@ pub fn run(args: &[OsString]) -> i32 {
     }
     let env = TestEnv::capture();
     let config = crate::config::Config::load().ok();
+    let _slots =
+        scheduler::InvocationPoolScope::enter(config.as_ref().and_then(|c| c.scheduler_slots));
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
     let test_args = args[1..].iter().map(OsString::as_os_str);
     let target_use = match cache_dir
@@ -346,12 +348,8 @@ fn run_scheduled(
     key: &str,
     want: TestWant,
 ) -> i32 {
-    let lease = scheduler::acquire_test_lease(
-        cache_dir,
-        scheduler::default_pool_size(),
-        want,
-        wait_budget(env),
-    );
+    let lease =
+        scheduler::acquire_test_lease(cache_dir, scheduler::pool_size(), want, wait_budget(env));
     let mut command = test_command(args, marker);
     if let Some(lease) = &lease {
         command.envs(lease_env(want, lease.marker_path(), lease.held()));

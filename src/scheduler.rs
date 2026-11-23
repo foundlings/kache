@@ -11,8 +11,9 @@
 //! locks held sleeps until one is released, instead of scanning the pool at
 //! [`POLL_INTERVAL`].
 //!
-//! The permit pool size is [`default_pool_size`]:
-//! `std::thread::available_parallelism()`, with a floor of 1. Unmeasured
+//! The permit pool size is [`pool_size`]: `[cache] scheduler_slots`
+//! (`KACHE_SCHEDULER_SLOTS`) when set, else [`default_pool_size`],
+//! `std::thread::available_parallelism()` with a floor of 1. Unmeasured
 //! compiles occupy [`UNMEASURED_COMPILE_WEIGHT`] slots; unmeasured
 //! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile, Unix
 //! wrappers record the child's peak RSS by crate name; later invocations of
@@ -336,6 +337,51 @@ pub fn default_pool_size() -> u32 {
     available
 }
 
+thread_local! {
+    /// `[cache] scheduler_slots` of the request this thread serves; `None`
+    /// keeps [`default_pool_size`].
+    static INVOCATION_SLOTS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The configured pool size for one synchronous request, as
+/// [`pressure::InvocationPressureScope`] does for the pressure check: a
+/// daemon thread serving another client's request must not keep it.
+pub(crate) struct InvocationPoolScope {
+    previous: Option<u32>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationPoolScope {
+    pub(crate) fn enter(slots: Option<u32>) -> Self {
+        Self {
+            previous: INVOCATION_SLOTS.with(|slot| slot.replace(slots)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationPoolScope {
+    fn drop(&mut self) {
+        INVOCATION_SLOTS.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Number of permit slots this request schedules against: `[cache]
+/// scheduler_slots` (`KACHE_SCHEDULER_SLOTS`) when set, else
+/// [`default_pool_size`].
+///
+/// The pool is machine-wide and the slots are lock files `0..pool`, so
+/// requests configured with different sizes share the low slots and a larger
+/// one also uses the slots above. Cargo's `jobs` is the usual setting where
+/// Cargo runs more jobs than there are cores: below it, compiles that fit in
+/// memory queue for a permit while cores sit idle.
+pub fn pool_size() -> u32 {
+    INVOCATION_SLOTS
+        .with(std::cell::Cell::get)
+        .filter(|slots| *slots > 0)
+        .unwrap_or_else(default_pool_size)
+}
+
 /// Identity of a compile flight: the invocation's shape plus its cache key.
 ///
 /// Only a peer computing the same key can be served by the owner's result:
@@ -551,7 +597,7 @@ enum FlightJoin {
 
 impl Scheduler {
     fn open(cache_dir: &Path) -> Result<Self> {
-        Self::open_with(cache_dir, default_pool_size(), WAIT_TIMEOUT, POLL_INTERVAL)
+        Self::open_with(cache_dir, pool_size(), WAIT_TIMEOUT, POLL_INTERVAL)
     }
 
     fn open_with(
@@ -1090,7 +1136,7 @@ impl TestLease {
 }
 
 /// Take test slots for a test binary from a pool of `pool` slots, waiting at
-/// most `wait`. The runner passes [`default_pool_size`].
+/// most `wait`. The runner passes [`pool_size`].
 ///
 /// `None` means run without a lease: the scheduler directory is unusable,
 /// the pool has no slots above the reserve, the wait timed out, or a
@@ -1111,10 +1157,10 @@ pub fn acquire_test_lease(
 }
 
 /// The fewest slots a test binary takes: its last recorded peak RSS in the
-/// slots of the default pool, as a compile is weighed, or 1 with no sample.
-/// Callers clamp it to the pool.
+/// slots of this request's pool ([`pool_size`]), as a compile is weighed, or
+/// 1 with no sample. Callers clamp it to the pool.
 pub fn test_floor(cache_dir: &Path, key: &str) -> u32 {
-    let slot = slot_bytes(machine_memory(), default_pool_size());
+    let slot = slot_bytes(machine_memory(), pool_size());
     read_weight(&scheduler_root(cache_dir).join("weights"), key)
         .map_or(1, |rss| weight_in_slots(rss, u32::MAX, slot))
 }
@@ -3201,6 +3247,33 @@ mod tests {
             .unwrap_or(1);
         assert_eq!(default_pool_size(), expected);
         assert!(expected >= 1);
+    }
+
+    /// `[cache] scheduler_slots` sizes the pool for the request that set it,
+    /// so `jobs = 24` on a 10-core machine admits 24 compiles; `0` and no
+    /// setting keep the core count, and leaving the scope restores the
+    /// previous size for the next request this thread serves.
+    #[test]
+    fn a_configured_pool_size_holds_for_its_request_only() {
+        let cores = default_pool_size();
+        assert_eq!(pool_size(), cores, "no scope keeps the core count");
+        {
+            let _outer = InvocationPoolScope::enter(Some(24));
+            assert_eq!(pool_size(), 24);
+            let dir = temp_cache();
+            let scheduler = Scheduler::open(dir.path()).unwrap();
+            assert_eq!(scheduler.pool_size, 24, "the scheduler opens at that size");
+            {
+                let _zero = InvocationPoolScope::enter(Some(0));
+                assert_eq!(pool_size(), cores, "0 is the default");
+                let _unset = InvocationPoolScope::enter(None);
+                assert_eq!(pool_size(), cores);
+            }
+            assert_eq!(pool_size(), 24, "an inner request's scope is undone");
+            let other = std::thread::spawn(pool_size).join().unwrap();
+            assert_eq!(other, cores, "another thread serves another request");
+        }
+        assert_eq!(pool_size(), cores);
     }
 
     #[test]
