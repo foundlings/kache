@@ -22,7 +22,14 @@ from pathlib import Path
 FORK = Path(__file__).resolve().parents[1]
 BRANCH = "foundlings"
 STABLE_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
-KEY_TESTS = ("clippy_manifest", "only_the_bare_relative", "clippy_identity")
+KEY_TESTS = (
+    "clippy_manifest",
+    "only_the_bare_relative",
+    "clippy_identity",
+    "a_rerun_over_leftovers",
+    "the_switch_does_not_clear",
+    "clearing_out_dir_leftovers",
+)
 
 
 def run(*command: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:

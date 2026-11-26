@@ -220,7 +220,11 @@ a `passthrough` whose reason says `build-script cache bypassed` or
 
 - A script that prints an empty `cargo:rerun-if-changed=` (always rerun) or
   declares an input under `OUT_DIR`.
-- A run that started with a non-empty `OUT_DIR`, or during which a declared
+- A run that started with a non-empty `OUT_DIR` (Cargo leaves the previous
+  run's files there on a rerun) unless `KACHE_BUILD_SCRIPT_CLEAN_OUT_DIR=1`
+  is set: then Kache empties `OUT_DIR` first, as a hit does, and records the
+  run. Only a directory in Cargo's `build/<unit>/out` layout is emptied, and
+  links inside it are removed, never followed. Or a run during which a declared
   input changed. When the script itself wrote into its inputs, as a generator
   does when it creates its data directory on the first run, kache runs it once
   more on the tree it left and records that run instead; Cargo sees only the

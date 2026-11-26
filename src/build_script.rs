@@ -713,12 +713,20 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
 
     // Only a run that starts from an empty OUT_DIR produces a state worth
     // recording: a rerun over leftovers would snapshot the leftovers too.
-    let out_dir_was_empty = directory_is_empty(&run.environment.out_dir);
+    // A restore also starts from an empty OUT_DIR, so clearing the leftovers
+    // first (when enabled) records exactly what a later hit replays.
+    let start = prepare_out_dir(&run.environment.out_dir, clean_out_dir_enabled());
     let first = ScriptRun::start(real, argv, &run)?;
-    if !first.succeeded() || !out_dir_was_empty {
+    let kept = match &start {
+        OutDirStart::Kept(why) => Some(*why),
+        OutDirStart::Empty | OutDirStart::Cleared => None,
+    };
+    if !first.succeeded() || kept.is_some() {
         first.replay();
-        if first.succeeded() {
-            run.log_unrecorded("it ran over an existing OUT_DIR", first.compile_ms);
+        if first.succeeded()
+            && let Some(why) = kept
+        {
+            run.log_unrecorded(why, first.compile_ms);
         }
         return Ok(first.exit_code());
     }
@@ -2521,6 +2529,58 @@ fn detach_out_dir(out_dir: &Path) -> Result<()> {
         std::fs::create_dir(out_dir)?;
     }
     Ok(())
+}
+
+/// `KACHE_BUILD_SCRIPT_CLEAN_OUT_DIR=1` (or `true`) empties a non-empty
+/// `OUT_DIR` before a script run that would otherwise go unrecorded. Cargo
+/// leaves the previous run's files in place when it reruns a script.
+const CLEAN_OUT_DIR_ENV: &str = "KACHE_BUILD_SCRIPT_CLEAN_OUT_DIR";
+
+fn clean_out_dir_enabled() -> bool {
+    std::env::var_os(CLEAN_OUT_DIR_ENV).is_some_and(|value| value == "1" || value == "true")
+}
+
+const KEPT_OUT_DIR: &str = "it ran over an existing OUT_DIR (set KACHE_BUILD_SCRIPT_CLEAN_OUT_DIR=1 to record such runs from a cleared OUT_DIR)";
+const KEPT_OUT_DIR_OUTSIDE_LAYOUT: &str =
+    "it ran over an existing OUT_DIR that is outside Cargo's build layout, so it was not cleared";
+const KEPT_OUT_DIR_UNCLEARABLE: &str = "it ran over an existing OUT_DIR that could not be cleared";
+
+/// What `OUT_DIR` held when the script was about to run.
+#[derive(Debug, PartialEq, Eq)]
+enum OutDirStart {
+    /// Nothing: the run is recordable.
+    Empty,
+    /// Leftovers from an earlier run were removed: the run is recordable.
+    Cleared,
+    /// Leftovers remain, for the stated reason: the run is not recorded.
+    Kept(&'static str),
+}
+
+/// Make `OUT_DIR` ready for a run to be recorded, removing only what is
+/// inside it. A hit restores into an emptied `OUT_DIR`, so a run recorded
+/// from an emptied one is the state a hit replays. Links inside are removed,
+/// never followed. A directory outside Cargo's `build/<unit>/out` layout is
+/// never emptied.
+fn prepare_out_dir(out_dir: &Path, clean: bool) -> OutDirStart {
+    if directory_is_empty(out_dir) {
+        return OutDirStart::Empty;
+    }
+    if !clean {
+        return OutDirStart::Kept(KEPT_OUT_DIR);
+    }
+    if crate::cargo_layout::out_dir_profile(out_dir).is_none() {
+        return OutDirStart::Kept(KEPT_OUT_DIR_OUTSIDE_LAYOUT);
+    }
+    if std::fs::symlink_metadata(out_dir).is_ok_and(|meta| !meta.file_type().is_dir()) {
+        return OutDirStart::Kept(KEPT_OUT_DIR_OUTSIDE_LAYOUT);
+    }
+    match clear_directory(out_dir) {
+        Ok(()) => OutDirStart::Cleared,
+        Err(error) => {
+            tracing::debug!("cannot clear OUT_DIR {}: {error:#}", out_dir.display());
+            OutDirStart::Kept(KEPT_OUT_DIR_UNCLEARABLE)
+        }
+    }
 }
 
 fn directory_is_empty(directory: &Path) -> bool {
@@ -8172,5 +8232,151 @@ mod tests {
         );
         assert_eq!(store.entry_count().unwrap(), 1);
         assert_eq!(event_results(&cache), ["miss", "local_hit"]);
+    }
+
+    /// Cargo's own layout for a unit's `OUT_DIR` below `root`.
+    #[cfg(unix)]
+    fn cargo_out_dir(root: &Path) -> PathBuf {
+        root.join("target/debug/build/pkg-0123456789abcdef/out")
+    }
+
+    #[cfg(unix)]
+    fn event_reasons(cache: &Path) -> Vec<String> {
+        let path = cache.join("events.jsonl");
+        if !path.is_file() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|event| event["passthrough_reason"].as_str().map(str::to_owned))
+            .filter(|reason| !reason.is_empty())
+            .collect()
+    }
+
+    /// Cargo leaves the previous run's files in `OUT_DIR` on a rerun. With
+    /// the switch on, the run is recorded from an emptied `OUT_DIR`, the
+    /// leftovers are gone, and the next rerun restores instead of running.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_over_leftovers_records_from_a_cleared_out_dir_when_enabled() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        let (cache, config, out) = (root.join("cache"), root.join("k.toml"), cargo_out_dir(root));
+        write_reader_config(&config, &cache, None);
+        env.set(CLEAN_OUT_DIR_ENV, std::ffi::OsStr::new("1"));
+        for round in 1..=2 {
+            prepare_out(&out);
+            std::fs::write(out.join("stale"), "from an earlier run").unwrap();
+            let code = run_reader(
+                &mut env,
+                &config,
+                &out,
+                &fixture.package,
+                &fixture.script,
+                &fixture.sentinel,
+            );
+            assert_eq!(code, 0, "{:?}", event_reasons(&cache));
+            assert!(!out.join("stale").exists(), "round {round}: leftover kept");
+            assert_eq!(std::fs::read(out.join("marker")).unwrap(), b"from-script");
+        }
+        assert_eq!(event_results(&cache), ["miss", "local_hit"]);
+        assert_eq!(
+            std::fs::read(&fixture.sentinel).unwrap(),
+            b"x",
+            "the second rerun ran the script instead of restoring"
+        );
+        assert!(event_reasons(&cache).is_empty());
+    }
+
+    /// Without the switch the refusal stands, leftovers stay, and the reason
+    /// names the switch.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_over_leftovers_is_refused_with_the_switch_named_when_disabled() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        env.unset(CLEAN_OUT_DIR_ENV);
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        let (cache, config, out) = (root.join("cache"), root.join("k.toml"), cargo_out_dir(root));
+        write_reader_config(&config, &cache, None);
+        prepare_out(&out);
+        std::fs::write(out.join("stale"), "from an earlier run").unwrap();
+        let code = run_reader(
+            &mut env,
+            &config,
+            &out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(code, 0);
+        assert!(out.join("stale").exists());
+        let reasons = event_reasons(&cache);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].starts_with("refused|"), "{reasons:?}");
+        assert!(reasons[0].contains(CLEAN_OUT_DIR_ENV), "{reasons:?}");
+        let store = Store::open(&Config::load().unwrap()).unwrap();
+        assert_eq!(store.entry_count().unwrap(), 0);
+    }
+
+    /// The switch never empties a directory that is not Cargo's `OUT_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn the_switch_does_not_clear_a_directory_outside_cargos_layout() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        let (cache, config, out) = (root.join("cache"), root.join("k.toml"), root.join("out"));
+        write_reader_config(&config, &cache, None);
+        env.set(CLEAN_OUT_DIR_ENV, std::ffi::OsStr::new("1"));
+        prepare_out(&out);
+        std::fs::write(out.join("stale"), "keep me").unwrap();
+        let code = run_reader(
+            &mut env,
+            &config,
+            &out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(code, 0);
+        assert!(out.join("stale").exists());
+        let reasons = event_reasons(&cache);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("outside Cargo's build layout")),
+            "{reasons:?}"
+        );
+    }
+
+    /// Clearing removes links, never what they point at.
+    #[cfg(unix)]
+    #[test]
+    fn clearing_out_dir_leftovers_never_follows_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = cargo_out_dir(dir.path());
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, out.join("link")).unwrap();
+        std::fs::write(out.join("file"), "y").unwrap();
+        assert_eq!(prepare_out_dir(&out, true), OutDirStart::Cleared);
+        assert!(directory_is_empty(&out));
+        assert!(outside.join("precious").exists());
+        assert_eq!(prepare_out_dir(&out, true), OutDirStart::Empty);
+        std::fs::write(out.join("file"), "y").unwrap();
+        assert_eq!(
+            prepare_out_dir(&out, false),
+            OutDirStart::Kept(KEPT_OUT_DIR)
+        );
+        assert!(out.join("file").exists());
     }
 }
